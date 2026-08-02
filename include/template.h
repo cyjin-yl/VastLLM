@@ -57,7 +57,8 @@ namespace fastllm {
             JinjaTokenAssign, JinjaTokenNotEqual, JinjaTokenEqual, JinjaTokenLess, JinjaTokenLessEqual, JinjaTokenMore, JinjaTokenMoreEqual,
             JinjaTokenAdd, JinjaTokenSub, JinjaTokenMul, JinjaTokenDiv, JinjaTokenMod,
             JinjaTokenNot, JinjaTokenAnd, JinjaTokenOr,
-            JinjaTokenFilter, JinjaTokenNamespace, JinjaTokenSlice
+            JinjaTokenFilter, JinjaTokenNamespace, JinjaTokenSlice,
+            JinjaTokenMacro, JinjaTokenEndMacro, JinjaTokenConcat
         };
 
         JinjaToKenType type;
@@ -78,6 +79,7 @@ namespace fastllm {
             {'/', JinjaToken::JinjaToKenType::JinjaTokenDiv},
             {'%', JinjaToken::JinjaToKenType::JinjaTokenMod},
             {'|', JinjaToken::JinjaToKenType::JinjaTokenFilter},
+            {'~', JinjaToken::JinjaToKenType::JinjaTokenConcat},
             {',', JinjaToken::JinjaToKenType::JinjaTokenNamespace},
             {':', JinjaToken::JinjaToKenType::JinjaTokenSlice}
     };
@@ -102,7 +104,9 @@ namespace fastllm {
             {"and", JinjaToken::JinjaToKenType::JinjaTokenAnd},
             {"or", JinjaToken::JinjaToKenType::JinjaTokenOr},
             {"not", JinjaToken::JinjaToKenType::JinjaTokenNot},
-            {"namespace", JinjaToken::JinjaToKenType::JinjaTokenNamespace}
+            {"namespace", JinjaToken::JinjaToKenType::JinjaTokenNamespace},
+            {"macro", JinjaToken::JinjaToKenType::JinjaTokenMacro},
+            {"endmacro", JinjaToken::JinjaToKenType::JinjaTokenEndMacro}
     };
 
     // 一个Jinja块 
@@ -110,7 +114,7 @@ namespace fastllm {
         enum JinjaBlockType {
             JinjaBlockOriginal = 0, JinjaBlockEmpty, JinjaBlockVar, JinjaBlockFor, 
             JinjaBlockEndFor, JinjaBlockIf, JinjaBlockElseIf, JinjaBlockElse, JinjaBlockEndIf,
-            JinjaBlockSet
+            JinjaBlockSet, JinjaBlockMacro, JinjaBlockEndMacro
         };
 
         JinjaBlockType type = JinjaBlockType::JinjaBlockOriginal;
@@ -138,16 +142,27 @@ namespace fastllm {
 
     using JinjaFunction = std::function<JinjaVar(const JinjaVar &)>;
 
+    // 一个宏定义: 参数名列表(并行默认值,JinjaNone 表示无默认)与 body 块区间
+    struct JinjaMacro {
+        std::vector <std::string> argNames;
+        std::vector <JinjaVar> defaults;
+        int bodyStart = 0;
+        int bodyEnd = 0;
+    };
+
     // Jinja模板
     struct JinjaTemplate {
         std::string temp;
         std::vector <JinjaBlock> blocks;
+        std::map <std::string, JinjaMacro> macros;
 
         JinjaTemplate () {}
 
         JinjaTemplate (const std::string &temp);
 
         JinjaVar ComputeExpression(JinjaVar &local, std::vector <JinjaToken> tokens, int st, int end, JinjaVar *setValue = nullptr);
+
+        JinjaVar CallMacro(const std::string &name, const std::vector <JinjaVar> &args, JinjaVar &local);
 
         void Parse(int st, int end, JinjaVar &var, std::string &ret);
 

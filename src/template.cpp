@@ -14,6 +14,8 @@ namespace fastllm {
             return !this->stringValue.empty();
         } else if (this->type == JinjaArray) {
             return !this->arrayValue.empty();
+        } else if (this->type == JinjaDict) {
+            return !this->dictValue.empty();
         } else if (this->type == JinjaNone) {
             return false;
         }
@@ -230,6 +232,10 @@ namespace fastllm {
                         type = JinjaBlockType::JinjaBlockElse;
                     } else if (tokens[0].type == JinjaToken::JinjaTokenEndif) {
                         type = JinjaBlockType::JinjaBlockEndIf;
+                    } else if (tokens[0].type == JinjaToken::JinjaTokenMacro) {
+                        type = JinjaBlockType::JinjaBlockMacro;
+                    } else if (tokens[0].type == JinjaToken::JinjaTokenEndMacro) {
+                        type = JinjaBlockType::JinjaBlockEndMacro;
                     } else {
                         ErrorInFastLLM("Jinja parse failed (Unknown block type): " + value);
                     }
@@ -259,6 +265,8 @@ namespace fastllm {
             if (a.type == JinjaVar::JinjaInt && b.type == JinjaVar::JinjaInt) {
                 return a.intValue % b.intValue;
             }
+        } else if (op == JinjaToken::JinjaTokenConcat) {
+            return a.DirectValue() + b.DirectValue();
         } else if (op == JinjaToken::JinjaTokenIn) {
             if (b.type == JinjaVar::JinjaDict) {
                 return b.dictValue.find(a.stringValue) != b.dictValue.end();
@@ -271,8 +279,15 @@ namespace fastllm {
             if (b.type == JinjaVar::JinjaNone) {
                 if (b.stringValue == "defined")
                     return (a.type != JinjaVar::JinjaNone);
+                else if (b.stringValue == "undefined")
+                    return (a.type == JinjaVar::JinjaNone);
                 else if (b.stringValue == "string")
                     return (a.type == JinjaVar::JinjaString);
+                else if (b.stringValue == "iterable")
+                    return (a.type == JinjaVar::JinjaArray || a.type == JinjaVar::JinjaDict
+                            || a.type == JinjaVar::JinjaString);
+                else if (b.stringValue == "mapping")
+                    return (a.type == JinjaVar::JinjaDict);
             }
             if (a.type != b.type) {
                 return false;
@@ -335,8 +350,10 @@ namespace fastllm {
         } else if (type == JinjaToken::JinjaTokenEqual || type == JinjaToken::JinjaTokenNotEqual || type == JinjaToken::JinjaTokenIn
                 || type == JinjaToken::JinjaTokenLess || type == JinjaToken::JinjaTokenMore) {
             return 0;
-        } else if (type == JinjaToken::JinjaTokenAdd || type == JinjaToken::JinjaTokenSub) {
+        } else if (type == JinjaToken::JinjaTokenAdd || type == JinjaToken::JinjaTokenSub || type == JinjaToken::JinjaTokenConcat) {
             return 1;
+        } else if (type == JinjaToken::JinjaTokenMacro || type == JinjaToken::JinjaTokenEndMacro) {
+            return -5;
         } else if (type == JinjaToken::JinjaTokenMul || type == JinjaToken::JinjaTokenDiv || type == JinjaToken::JinjaTokenMod) {
             return 2;
         } else if (type == JinjaToken::JinjaTokenFilter || type == JinjaToken::JinjaTokenFUNC) {
@@ -430,6 +447,76 @@ namespace fastllm {
             return JinjaVar(string);
         };
         functionArgCount["strip"] = 2;
+        // JSON 序列化(供 tojson 过滤器)
+        functionMap["tojson"] = [](const JinjaVar &a) {
+            std::function<std::string(const JinjaVar&)> dump = [&](const JinjaVar &v) -> std::string {
+                if (v.type == JinjaVar::JinjaNone) {
+                    return "null";
+                } else if (v.type == JinjaVar::JinjaInt) {
+                    return std::to_string(v.intValue);
+                } else if (v.type == JinjaVar::JinjaFloat) {
+                    std::string s = std::to_string(v.floatValue);
+                    while (!s.empty() && s.back() == '0') s.pop_back();
+                    if (!s.empty() && s.back() == '.') s.pop_back();
+                    return s;
+                } else if (v.type == JinjaVar::JinjaString) {
+                    std::string out = "\"";
+                    for (char c : v.stringValue) {
+                        if (c == '"') out += "\\\"";
+                        else if (c == '\\') out += "\\\\";
+                        else if (c == '\n') out += "\\n";
+                        else if (c == '\r') out += "\\r";
+                        else if (c == '\t') out += "\\t";
+                        else out += c;
+                    }
+                    return out + "\"";
+                } else if (v.type == JinjaVar::JinjaArray) {
+                    std::string out = "[";
+                    for (size_t i = 0; i < v.arrayValue.size(); i++) {
+                        if (i) out += ", ";
+                        out += dump(v.arrayValue[i]);
+                    }
+                    return out + "]";
+                } else {
+                    std::string out = "{";
+                    bool first = true;
+                    for (auto &kv : v.dictValue) {
+                        if (!first) out += ", ";
+                        first = false;
+                        out += "\"" + kv.first + "\": " + dump(kv.second);
+                    }
+                    return out + "}";
+                }
+            };
+            return JinjaVar(dump(a));
+        };
+        functionArgCount["tojson"] = 1;
+        // dict -> [(key, value)] 数组(供 items 过滤器 + for 元组解包)
+        functionMap["items"] = [](const JinjaVar &a) {
+            std::vector <JinjaVar> pairs;
+            for (auto &kv : a.dictValue) {
+                pairs.push_back(JinjaVar(std::vector <JinjaVar> {JinjaVar(kv.first), kv.second}));
+            }
+            return JinjaVar(pairs);
+        };
+        functionArgCount["items"] = 1;
+        // 转字符串(供 string 过滤器)
+        functionMap["string"] = [](const JinjaVar &a) {
+            return JinjaVar(a.DirectValue());
+        };
+        functionArgCount["string"] = 1;
+        // safe 过滤器: 本引擎不做 HTML 转义, 原样返回
+        functionMap["safe"] = [](const JinjaVar &a) {
+            return a;
+        };
+        functionArgCount["safe"] = 1;
+        // raise_exception: 模板主动报错, 走上层 fallback
+        functionMap["raise_exception"] = [](const JinjaVar &a) {
+            ErrorInFastLLM("Jinja raise_exception: " +
+                (a.arrayValue.empty() ? std::string("") : a.arrayValue[0].stringValue));
+            return JinjaVar();
+        };
+        functionArgCount["raise_exception"] = 1;
     }
 
     JinjaTemplate::JinjaTemplate (const std::string &temp) {
@@ -481,6 +568,29 @@ namespace fastllm {
     }
 
     JinjaVar JinjaTemplate::ComputeExpression(JinjaVar &local, std::vector <JinjaToken> tokens, int st, int end, JinjaVar *setValue) {
+        // 三元表达式 "A if C else B" 预处理
+        {
+            int depth = 0, ifPos = -1, elsePos = -1;
+            for (int i = st; i < end; i++) {
+                if (tokens[i].type == JinjaToken::JinjaTokenLSB || tokens[i].type == JinjaToken::JinjaTokenLMB) {
+                    depth++;
+                } else if (tokens[i].type == JinjaToken::JinjaTokenRSB || tokens[i].type == JinjaToken::JinjaTokenRMB) {
+                    depth--;
+                } else if (depth == 0 && tokens[i].type == JinjaToken::JinjaTokenIf) {
+                    ifPos = i;
+                } else if (depth == 0 && tokens[i].type == JinjaToken::JinjaTokenElse && ifPos != -1) {
+                    elsePos = i;
+                }
+            }
+            if (ifPos != -1 && elsePos != -1) {
+                JinjaVar cond = ComputeExpression(local, tokens, ifPos + 1, elsePos);
+                if (cond.BoolValue()) {
+                    return ComputeExpression(local, tokens, st, ifPos);
+                } else {
+                    return ComputeExpression(local, tokens, elsePos + 1, end);
+                }
+            }
+        }
         std::vector <JinjaToken> suffixExp; // 后缀表达式
         std::vector <JinjaToken> ops; // 符号栈
 
@@ -530,6 +640,73 @@ namespace fastllm {
             } else if (tokens[i].type == JinjaToken::JinjaTokenFUNC) {
                 if (!ops.empty() && ops.back().type == JinjaToken::JinjaTokenDOT)
                     ops.pop_back();
+                if (this->macros.find(tokens[i].value) != this->macros.end()) {
+                    // 宏调用: 立即求值实参并展开为字符串字面量
+                    int depth = 0, closePos = -1;
+                    for (int j = i + 1; j < end; j++) {
+                        if (tokens[j].type == JinjaToken::JinjaTokenLSB || tokens[j].type == JinjaToken::JinjaTokenLMB) {
+                            depth++;
+                        } else if (tokens[j].type == JinjaToken::JinjaTokenRSB || tokens[j].type == JinjaToken::JinjaTokenRMB) {
+                            depth--;
+                            if (depth == 0) {
+                                closePos = j;
+                                break;
+                            }
+                        }
+                    }
+                    AssertInFastLLM(closePos != -1, "Jinja error: macro call brackets doesn't match.");
+                    std::vector <JinjaVar> argValues;
+                    std::vector <std::pair <std::string, JinjaVar> > kwValues;
+                    int argStart = i + 2;
+                    depth = 0;
+                    for (int j = i + 2; j <= closePos; j++) {
+                        bool split = (j == closePos);
+                        if (!split) {
+                            if (tokens[j].type == JinjaToken::JinjaTokenLSB || tokens[j].type == JinjaToken::JinjaTokenLMB) {
+                                depth++;
+                            } else if (tokens[j].type == JinjaToken::JinjaTokenRSB || tokens[j].type == JinjaToken::JinjaTokenRMB) {
+                                depth--;
+                            } else if (depth == 0 && tokens[j].type == JinjaToken::JinjaTokenNamespace) {
+                                split = true;
+                            }
+                        }
+                        if (split) {
+                            if (j > argStart) {
+                                // 识别 name=expr 关键字实参
+                                if (j - argStart >= 3 && tokens[argStart].type == JinjaToken::JinjaTokenID
+                                        && tokens[argStart + 1].type == JinjaToken::JinjaTokenAssign) {
+                                    kwValues.push_back({tokens[argStart].value,
+                                        ComputeExpression(local, tokens, argStart + 2, j)});
+                                } else {
+                                    argValues.push_back(ComputeExpression(local, tokens, argStart, j));
+                                }
+                            }
+                            argStart = j + 1;
+                        }
+                    }
+                    JinjaMacro &macro = this->macros[tokens[i].value];
+                    std::vector <JinjaVar> finalArgs(macro.argNames.size());
+                    for (size_t k = 0; k < argValues.size() && k < macro.argNames.size(); k++) {
+                        finalArgs[k] = argValues[k];
+                    }
+                    for (auto &kw : kwValues) {
+                        for (size_t k = 0; k < macro.argNames.size(); k++) {
+                            if (macro.argNames[k] == kw.first) {
+                                finalArgs[k] = kw.second;
+                            }
+                        }
+                    }
+                    for (size_t k = 0; k < macro.argNames.size(); k++) {
+                        if (finalArgs[k].type == JinjaVar::JinjaNone && finalArgs[k].stringValue.empty()
+                                && macro.defaults[k].type != JinjaVar::JinjaNone) {
+                            finalArgs[k] = macro.defaults[k];
+                        }
+                    }
+                    suffixExp.push_back(JinjaToken(JinjaToken::JinjaTokenSTRING,
+                        this->CallMacro(tokens[i].value, finalArgs, local).stringValue));
+                    i = closePos;
+                    continue;
+                }
                 while (ops.size() > 0 && GetOpLevel(ops.back().type) > GetOpLevel(tokens[i].type)) {
                     suffixExp.push_back(ops.back());
                     ops.pop_back();
@@ -541,6 +718,7 @@ namespace fastllm {
                         tokens[i].type == JinjaToken::JinjaTokenMul ||
                         tokens[i].type == JinjaToken::JinjaTokenDiv ||
                         tokens[i].type == JinjaToken::JinjaTokenMod ||
+                        tokens[i].type == JinjaToken::JinjaTokenConcat ||
                         tokens[i].type == JinjaToken::JinjaTokenEqual ||
                         tokens[i].type == JinjaToken::JinjaTokenNotEqual ||
                         tokens[i].type == JinjaToken::JinjaTokenLess ||
@@ -577,7 +755,7 @@ namespace fastllm {
             } else if (it.type == JinjaToken::JinjaTokenDOT) {
                 AssertInFastLLM(vars.size() > 1, "Jinja Error: expression error.");
                 JinjaVar a = vars[vars.size() - 2], b = vars.back();
-                if (a.type == JinjaVar::JinjaNone) {
+                if (a.type == JinjaVar::JinjaNone && !a.stringValue.empty()) {
                     if (setValue != nullptr)
                         local[a][b] = *setValue;
                     a = local[a];
@@ -586,14 +764,15 @@ namespace fastllm {
                 }
                 vars.pop_back();
                 vars.pop_back();
-                vars.push_back(a[b]);
+                // None 的属性访问返回 undefined(Jinja 语义), 而不是报错
+                vars.push_back(a.type == JinjaVar::JinjaNone ? JinjaVar() : a[b]);
             } else if (it.type == JinjaToken::JinjaTokenRMB) {
                 AssertInFastLLM(vars.size() > 1, "Jinja Error: expression error.");
                 JinjaVar a = vars[vars.size() - 2], b = vars.back();
-                if (b.type == JinjaVar::JinjaNone) {
+                if (b.type == JinjaVar::JinjaNone && !b.stringValue.empty()) {
                     b = local[b];
                 }
-                if (a.type == JinjaVar::JinjaNone) {
+                if (a.type == JinjaVar::JinjaNone && !a.stringValue.empty()) {
                     if (setValue != nullptr)
                         local[a][b] = *setValue;
                     a = local[a];
@@ -602,7 +781,7 @@ namespace fastllm {
                 }
                 vars.pop_back();
                 vars.pop_back();
-                vars.push_back(a[b]);
+                vars.push_back(a.type == JinjaVar::JinjaNone ? JinjaVar() : a[b]);
             } else if (it.type == JinjaToken::JinjaTokenNamespace) {
                 AssertInFastLLM(vars.size() > 1, "Jinja Error: expression error.");
                 JinjaVar last = vars.back();
@@ -690,6 +869,7 @@ namespace fastllm {
                         it.type == JinjaToken::JinjaTokenMul ||
                         it.type == JinjaToken::JinjaTokenDiv ||
                         it.type == JinjaToken::JinjaTokenMod ||
+                        it.type == JinjaToken::JinjaTokenConcat ||
                         it.type == JinjaToken::JinjaTokenAssign ||
                         it.type == JinjaToken::JinjaTokenEqual ||
                         it.type == JinjaToken::JinjaTokenNotEqual ||
@@ -703,7 +883,9 @@ namespace fastllm {
                 if (a.type == JinjaVar::JinjaNone && it.type != JinjaToken::JinjaTokenIn) {
                     a = local[a];
                 }
-                if (b.type == JinjaVar::JinjaNone && b.stringValue != "defined" && b.stringValue != "none" && b.stringValue != "string") {
+                if (b.type == JinjaVar::JinjaNone && b.stringValue != "defined" && b.stringValue != "none"
+                        && b.stringValue != "string" && b.stringValue != "undefined"
+                        && b.stringValue != "iterable" && b.stringValue != "mapping") {
                     b = local[b];
                 }
                 vars.pop_back();
@@ -748,11 +930,85 @@ namespace fastllm {
         return vars[0];
     }
 
+    JinjaVar JinjaTemplate::CallMacro(const std::string &name, const std::vector <JinjaVar> &args, JinjaVar &local) {
+        JinjaMacro &macro = this->macros[name];
+        // 在调用者作用域上绑定形参(宏内对全局 namespace 的修改需要可见), 返回后恢复
+        std::vector <JinjaVar> saved;
+        for (size_t k = 0; k < macro.argNames.size(); k++) {
+            saved.push_back(local[macro.argNames[k]]);
+            local[macro.argNames[k]] = args[k];
+        }
+        std::string out = "";
+        this->Parse(macro.bodyStart, macro.bodyEnd, local, out);
+        for (size_t k = 0; k < macro.argNames.size(); k++) {
+            local[macro.argNames[k]] = saved[k];
+        }
+        return JinjaVar(out);
+    }
+
     void JinjaTemplate::Parse(int st, int end, JinjaVar &var, std::string &ret) {
         for (int i = st; i < end; i++) {
             JinjaBlock &curBlock = blocks[i];
             if (curBlock.type == JinjaBlock::JinjaBlockType::JinjaBlockOriginal) {
                 ret += curBlock.value;
+            } else if (curBlock.type == JinjaBlock::JinjaBlockType::JinjaBlockMacro) {
+                // {% macro name(a, b=default) %} ... {% endmacro %}: 注册定义, 不产生输出
+                int cnt = 0;
+                int endPos = -1;
+                for (int j = i + 1; j < end; j++) {
+                    if (blocks[j].type == JinjaBlock::JinjaBlockType::JinjaBlockMacro) {
+                        cnt++;
+                    } else if (blocks[j].type == JinjaBlock::JinjaBlockType::JinjaBlockEndMacro) {
+                        if ((cnt--) == 0) {
+                            endPos = j;
+                            break;
+                        }
+                    }
+                }
+                AssertInFastLLM(endPos != -1, "Jinja error: no endmacro block for " + curBlock.value);
+                AssertInFastLLM(
+                    curBlock.tokens.size() >= 3 &&
+                    curBlock.tokens[1].type == JinjaToken::JinjaTokenFUNC &&
+                    curBlock.tokens[2].type == JinjaToken::JinjaTokenLSB,
+                    "Jinja error: only support format \"macro name(args)\"."
+                );
+                JinjaMacro macro;
+                for (int t = 3; t < (int)curBlock.tokens.size() && curBlock.tokens[t].type != JinjaToken::JinjaTokenRSB; t++) {
+                    if (curBlock.tokens[t].type != JinjaToken::JinjaTokenID) {
+                        continue;
+                    }
+                    std::string argName = curBlock.tokens[t].value;
+                    JinjaVar defValue; // JinjaNone 表示无默认
+                    if (t + 2 < (int)curBlock.tokens.size()
+                            && curBlock.tokens[t + 1].type == JinjaToken::JinjaTokenAssign) {
+                        int depth = 0;
+                        int defEnd = t + 2;
+                        for (; defEnd < (int)curBlock.tokens.size(); defEnd++) {
+                            auto tt = curBlock.tokens[defEnd].type;
+                            if (tt == JinjaToken::JinjaTokenLSB || tt == JinjaToken::JinjaTokenLMB) {
+                                depth++;
+                            } else if (tt == JinjaToken::JinjaTokenRSB || tt == JinjaToken::JinjaTokenRMB) {
+                                if (depth == 0) {
+                                    break;
+                                }
+                                depth--;
+                            } else if (tt == JinjaToken::JinjaTokenNamespace && depth == 0) {
+                                break;
+                            }
+                        }
+                        JinjaVar dummyLocal(std::initializer_list <std::pair <std::string, JinjaVar> > {});
+                        defValue = ComputeExpression(dummyLocal, curBlock.tokens, t + 2, defEnd);
+                        t = defEnd - 1;
+                    }
+                    macro.argNames.push_back(argName);
+                    macro.defaults.push_back(defValue);
+                }
+                macro.bodyStart = i + 1;
+                macro.bodyEnd = endPos;
+                this->macros[curBlock.tokens[1].value] = macro;
+                i = endPos;
+            } else if (curBlock.type == JinjaBlock::JinjaBlockType::JinjaBlockEndMacro) {
+                ErrorInFastLLM("Jinja error: endmacro without macro.");
             } else if (curBlock.type == JinjaBlock::JinjaBlockType::JinjaBlockVar) {
                 ret += ComputeExpression(var, curBlock.tokens, 0, curBlock.tokens.size()).DirectValue();
             } else if (curBlock.type == JinjaBlock::JinjaBlockFor) {
@@ -769,40 +1025,71 @@ namespace fastllm {
                     }
                 }
                 AssertInFastLLM(endPos != -1, "Jinja error: no endfor block for " + curBlock.value);
-                // 目前仅支持 "for 变量 in 表达式" 格式
-                AssertInFastLLM(
-                    curBlock.tokens.size() >= 4 &&
-                    curBlock.tokens[1].type == JinjaToken::JinjaTokenID &&
-                    curBlock.tokens[2].type == JinjaToken::JinjaTokenIn,
-                    "Jinja error: only support format \"for var in expression\"."
+                // 支持 "for a in expression" 与 "for a, b in expression"(元组解包)
+                std::vector <std::string> iterIds;
+                int inPos = -1;
+                for (int t = 1; t < (int)curBlock.tokens.size(); t++) {
+                    if (curBlock.tokens[t].type == JinjaToken::JinjaTokenIn) {
+                        inPos = t;
+                        break;
+                    }
+                    if (curBlock.tokens[t].type == JinjaToken::JinjaTokenID) {
+                        iterIds.push_back(curBlock.tokens[t].value);
+                    }
+                }
+                AssertInFastLLM(inPos != -1 && iterIds.size() >= 1 && iterIds.size() <= 2,
+                    "Jinja error: only support format \"for var[, var2] in expression\"."
                 );
 
-                std::string iterId = curBlock.tokens[1].value;
-                JinjaVar exp = ComputeExpression(var, curBlock.tokens, 3, curBlock.tokens.size());
-                JinjaVar original = var[iterId];
-                var["loop"] = {{"index", 1}, {"index0", 0}, {"first", 1}, {"last", 0}};
+                JinjaVar exp = ComputeExpression(var, curBlock.tokens, inPos + 1, curBlock.tokens.size());
+                std::vector <JinjaVar> originals;
+                for (auto &id : iterIds) {
+                    originals.push_back(var[id]);
+                }
                 if (exp.type == JinjaVar::JinjaArray) {
-                    for (auto &it : exp.arrayValue) {
-                        var[iterId] = it;
+                    long long size = (long long)exp.arrayValue.size();
+                    for (long long idx = 0; idx < size; idx++) {
+                        JinjaVar &it = exp.arrayValue[idx];
+                        if (iterIds.size() == 1) {
+                            var[iterIds[0]] = it;
+                        } else {
+                            for (int k = 0; k < 2; k++) {
+                                var[iterIds[k]] = (it.type == JinjaVar::JinjaArray && k < (int)it.arrayValue.size())
+                                    ? it.arrayValue[k] : JinjaVar();
+                            }
+                        }
+                        var["loop"] = {
+                            {"index", idx + 1}, {"index0", idx},
+                            {"first", idx == 0 ? 1 : 0}, {"last", idx + 1 == size ? 1 : 0},
+                            {"previtem", idx > 0 ? exp.arrayValue[idx - 1] : JinjaVar()},
+                            {"nextitem", idx + 1 < size ? exp.arrayValue[idx + 1] : JinjaVar()}
+                        };
                         Parse(i + 1, endPos, var, ret);
-                        var["loop"]["index"].intValue++;
-                        var["loop"]["index0"].intValue++;
-                        var["loop"]["first"].intValue = 0;
-                        var["loop"]["last"].intValue = (var["loop"]["index"].intValue == exp.arrayValue.size());
                     }
                 } else if (exp.type == JinjaVar::JinjaDict) {
+                    long long size = (long long)exp.dictValue.size();
+                    long long idx = 0;
                     for (auto &it : exp.dictValue) {
-                        var[iterId] = it.second;
+                        if (iterIds.size() == 1) {
+                            var[iterIds[0]] = it.second;
+                        } else {
+                            var[iterIds[0]] = it.first;
+                            var[iterIds[1]] = it.second;
+                        }
+                        var["loop"] = {
+                            {"index", idx + 1}, {"index0", idx},
+                            {"first", idx == 0 ? 1 : 0}, {"last", idx + 1 == size ? 1 : 0},
+                            {"previtem", JinjaVar()}, {"nextitem", JinjaVar()}
+                        };
                         Parse(i + 1, endPos, var, ret);
-                        var["loop"]["index"].intValue++;
-                        var["loop"]["index0"].intValue++;
-                        var["loop"]["first"].intValue = 0;
-                        var["loop"]["last"].intValue = (var["loop"]["index"].intValue == exp.arrayValue.size());
+                        idx++;
                     }
                 } else {
                     ErrorInFastLLM(exp.Dump() + " is not iterable");
                 }
-                var[iterId] = original;
+                for (size_t k = 0; k < iterIds.size(); k++) {
+                    var[iterIds[k]] = originals[k];
+                }
                 i = endPos;
             } else if (curBlock.type == JinjaBlock::JinjaBlockIf || curBlock.type == JinjaBlock::JinjaBlockType::JinjaBlockElseIf) {
                 int cnt = 0;
