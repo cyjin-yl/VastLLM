@@ -1512,6 +1512,36 @@ namespace fastllm {
                    Qwen35IsLogitsEnvEnabled(std::getenv("FASTLLM_PRINT_LOGITS"));
         }
 
+        static void Qwen35DebugHiddenHash(const char *stage, int layer,
+                                          const Data &data) {
+            const char *env = std::getenv("FASTLLM_QWEN35_DEBUG_HIDDEN_HASH");
+            if (env == nullptr || env[0] == '\0' ||
+                (env[0] == '0' && env[1] == '\0') ||
+                data.dataDevice != DataDevice::CUDA ||
+                data.cudaData == nullptr ||
+                data.dataType != DataType::FLOAT16) {
+                return;
+            }
+            const size_t count = (size_t)data.Count(0);
+            std::vector<uint16_t> host(count);
+            FastllmCudaCopyFromDeviceToHost(
+                host.data(), data.cudaData, count * sizeof(uint16_t));
+            uint64_t hash = 1469598103934665603ULL;
+            const uint8_t *bytes =
+                reinterpret_cast<const uint8_t *>(host.data());
+            for (size_t i = 0; i < count * sizeof(uint16_t); i++) {
+                hash = (hash ^ bytes[i]) * 1099511628211ULL;
+            }
+            printf("[Qwen3.5 hidden hash] stage=%s layer=%d count=%zu "
+                   "hash=%016llx first=",
+                   stage, layer, count, (unsigned long long)hash);
+            for (size_t i = 0; i < std::min<size_t>(8, count); i++) {
+                printf("%04x%s", (unsigned int)host[i],
+                       i + 1 == std::min<size_t>(8, count) ? "" : ",");
+            }
+            printf("\n");
+            fflush(stdout);
+        }
 
         static void Qwen35PrintTopKRows(const char *tag, const float *topkData, int batch, int topK) {
             printf("%s top%d logits:\n", tag, topK);
@@ -9245,6 +9275,7 @@ namespace fastllm {
             }
         };
 
+        Qwen35DebugHiddenHash("embedding", -1, hiddenStates);
 
         for (int i = 0; i < block_cnt; i++) {
             auto prefillLayerLast = prefillProfileEnabled ?
@@ -9484,6 +9515,10 @@ namespace fastllm {
                     projectedZSplitReady = true;
                 };
 
+                Qwen35DebugHiddenHash("input-norm", i, attenInput);
+                Qwen35DebugHiddenHash("gdn-merged", i, gdnMerged);
+                Qwen35DebugHiddenHash("qkv-proj", i, qkvConvInput);
+                Qwen35DebugHiddenHash("z-proj", i, z);
                 bool captureLinearState =
                     speculativeCaptureFirstTokenLinearState;
                 int linearStateCaptureSlots =
@@ -9640,6 +9675,7 @@ namespace fastllm {
                         baSplitReady = true;
                     }
                 }
+                Qwen35DebugHiddenHash("ba-proj", i, baMerged);
                 auto ensureBaSplit = [&]() {
                     if (baSplitReady) {
                         return;
@@ -10014,6 +10050,7 @@ namespace fastllm {
                                        convOutputPermuted);
                     convOutputForRecurrent = &convOutputPermuted;
                 }
+                Qwen35DebugHiddenHash("conv-out", i, *convOutputForRecurrent);
                 bool convQkvSplitReady = false;
                 auto ensureConvQkvSplit = [&]() {
                     if (convQkvSplitReady) {
@@ -10264,6 +10301,8 @@ namespace fastllm {
                     if (batch == 1 && chunkPastValue->dims.size() > 0) {
                         Qwen35EnsureCudaLinearAttnStateKVLayout(*chunkPastValue);
                     }
+                    Qwen35DebugHiddenHash("beta", i, b);
+                    Qwen35DebugHiddenHash("decay", i, g);
                     int chunkSize = 64;
                     int keyBatchSize = 0;
                     int keySequenceLength = 0;
@@ -10407,6 +10446,9 @@ namespace fastllm {
                                               "linear_attn.inv_scale"),
                                 rms_norm_eps, k);
                         }
+                        Qwen35DebugHiddenHash("q-norm", i, q);
+                        Qwen35DebugHiddenHash("k-norm", i, k);
+                        Qwen35DebugHiddenHash("v-split", i, v);
                         Qwen3CudaPermuteSelf(cudaRunner, q, {0, 2, 1, 3});
                         Qwen3CudaPermuteSelf(cudaRunner, k, {0, 2, 1, 3});
                         Qwen3CudaPermuteSelf(cudaRunner, v, {0, 2, 1, 3});
@@ -10451,6 +10493,11 @@ namespace fastllm {
                         Qwen35CudaMulTo(cudaRunner, kBeta, *pbb);
                         Qwen35CudaMulTo(cudaRunner, vBeta, *pbb);
                     }
+                    Qwen35DebugHiddenHash("qq", i, qq);
+                    Qwen35DebugHiddenHash("pkk", i, *pkk);
+                    Qwen35DebugHiddenHash("k-beta", i, kBeta);
+                    Qwen35DebugHiddenHash("v-beta", i, vBeta);
+                    Qwen35DebugHiddenHash("pgg", i, *pgg);
 
                     qq.Reshape({qq.dims[0], qq.dims[1], -1, chunkSize, qq.dims.back()});
                     pkk->Reshape({pkk->dims[0], pkk->dims[1], -1, chunkSize, pkk->dims.back()});
@@ -10563,6 +10610,8 @@ namespace fastllm {
                                                          attn, decayMask, kCumdecay,
                                                          *chunkPastValue, coreAttnOut,
                                                          fuseOutputDecayMask);
+                    Qwen35DebugHiddenHash("core-raw", i, coreAttnOut);
+                    Qwen35DebugHiddenHash("state", i, *chunkPastValue);
                     coreAttnOut.Reshape({coreAttnOut.dims[0], coreAttnOut.dims[1],
                                          -1, coreAttnOut.dims.back()});
                     if (packedRagged) {
@@ -10586,6 +10635,7 @@ namespace fastllm {
                     } else {
                         Qwen3CudaPermuteSelf(cudaRunner, coreAttnOut, {0, 2, 1, 3});
                     }
+                    Qwen35DebugHiddenHash("core-layout", i, coreAttnOut);
                     if (batchedPrefill) {
                         // Keep the recurrent state in the prefill [K, V]
                         // layout across outer chunks. Decode converts it to
@@ -11043,9 +11093,13 @@ namespace fastllm {
                 }
 
             }
+            Qwen35DebugHiddenHash("post-attn", i, hiddenStates);
             Qwen3CudaRMSNorm(cudaRunner, hiddenStates,
                              *requireLocal(weight[postRmsName], postRmsName),
                              rms_norm_eps, attenInput);
+            Qwen35DebugHiddenHash("mlp-input", i, attenInput);
+            bool hasDenseMlp = weight.weight.find(swigluWeightName) != weight.weight.end() &&
+                               weight.weight.find(downWeightName) != weight.weight.end();
             if (prefillProfileEnabled) {
                 long long blockUs =
                     Qwen35PrefillProfileSyncElapsedUs(prefillLayerLast);
@@ -11092,6 +11146,7 @@ namespace fastllm {
                 if (prefillProfileEnabled) {
                     prefillProfile.mlpUs += Qwen35PrefillProfileSyncElapsedUs(prefillMlpLast);
                 }
+                Qwen35DebugHiddenHash("layer", i, hiddenStates);
                 continue;
             }
 
