@@ -11098,8 +11098,6 @@ namespace fastllm {
                              *requireLocal(weight[postRmsName], postRmsName),
                              rms_norm_eps, attenInput);
             Qwen35DebugHiddenHash("mlp-input", i, attenInput);
-            bool hasDenseMlp = weight.weight.find(swigluWeightName) != weight.weight.end() &&
-                               weight.weight.find(downWeightName) != weight.weight.end();
             if (prefillProfileEnabled) {
                 long long blockUs =
                     Qwen35PrefillProfileSyncElapsedUs(prefillLayerLast);

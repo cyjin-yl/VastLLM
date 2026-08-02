@@ -307,16 +307,6 @@ namespace fastllm {
                spec == "none" || spec == "disable";
     }
 
-    static bool Qwen35GGUFVHeadsTiledEnabled() {
-        const char *env = std::getenv("FASTLLM_QWEN35_GGUF_VHEAD_TILED");
-        if (env == nullptr || env[0] == '\0') {
-            return true;
-        }
-        const std::string value = TrimAndLower(env);
-        return value != "0" && value != "false" && value != "off" &&
-               value != "no" && value != "disable";
-    }
-
     static int ParseRoutedExpertIndex(const std::string &weightName) {
         const char *markers[] = {".ffn.experts.", ".moe.experts."};
         size_t pos = std::string::npos;
