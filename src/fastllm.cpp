@@ -518,13 +518,17 @@ namespace fastllm {
         {DataType::INT8, {"int8"}}, {DataType::INT4, {"int4o"}}, {DataType::INT2, {"int2"}}, {DataType::BIT, {"bit"}}, 
         {DataType::FLOAT16, {"float16", "fp16", "half"}}, {DataType::INT4_NOZERO, {"int4"}}, {DataType::INT4_GROUP, {"int4g"}},
         {DataType::FP8_E4M3, {"float8", "fp8", "fp8_e4m3"}}, {DataType::INT2_GROUP, {"int2g"}}, {DataType::BASE3_GROUP, {"base3g"}},
-        {DataType::INT32, {"int32"}}, {DataType::NVFP4, {"nvfp4", "fp4_e2m1"}}, {DataType::INT32PARAM, {"int32param"}},
+        {DataType::INT32, {"int32"}}, {DataType::NVFP4, {"nvfp4", "fp4_e2m1"}},
+        {DataType::Q8_0_KV, {"q8_0_kv"}}, {DataType::TURBO3_KV, {"turbo3", "turbo3_kv"}},
+        {DataType::INT32PARAM, {"int32param"}},
         {DataType::FP8_E4M3_BLOCK_128, {"fp8_e4m3_block_128"}}, {DataType::AWQ_4BIT_128, {"awq_4bit_128"}},
         {DataType::INT4_PERCHANNEL, {"int4_perchannel"}}, {DataType::FP8_E4M3_PERCHANNEL, {"fp8_e4m3_perchannel"}},
         {DataType::INT4_GROUP128, {"int4_group128"}}, {DataType::INT8_PERCHANNEL, {"int8_perchannel"}},
         {DataType::NVFP4_BLOCK_16, {"nvfp4_block_16"}},
         {DataType::NVFP4_BLOCK_16_E8M0, {"nvfp4_block_16_e8m0"}},
+        {DataType::INT4_GROUP32, {"int4_group32"}},
         {DataType::INF_INT8_PERCHANNEL, {"inf_int8_perchannel"}}, {DataType::INF_INT8_GROUP128, {"inf_int8_group128"}},
+        {DataType::INF_INT8_GROUP32, {"inf_int8_group32"}},
         {DataType::DATA_AUTO_NONE, {"data_auto_none"}}, {DataType::DATA_AUTO_LINEAR, {"data_auto_linear"}},
         {DataType::DATA_AUTO_EMBEDDING, {"data_auto_embedding"}}, {DataType::DATA_AUTO_CONV, {"data_auto_conv"}},
         {DataType::DATA_AUTO_SOURCE, {"auto"}}
@@ -586,9 +590,34 @@ namespace fastllm {
         return data.cpuData + weightBytes;
     }
 
+    bool IsPackedKVCacheDataType(DataType type) {
+        return type == DataType::Q8_0_KV || type == DataType::TURBO3_KV;
+    }
+
+    size_t GetKVCacheRowBytes(DataType type, size_t columns) {
+        if (columns == 0) {
+            return 0;
+        }
+        if (type == DataType::Q8_0_KV) {
+            constexpr size_t blockValues = 32;
+            constexpr size_t blockBytes = sizeof(uint16_t) + blockValues;
+            return ((columns + blockValues - 1) / blockValues) * blockBytes;
+        }
+        if (type == DataType::TURBO3_KV) {
+            constexpr size_t blockValues = 128;
+            constexpr size_t blockBytes = sizeof(uint16_t) + blockValues / 4 + blockValues / 8;
+            static_assert(blockBytes == 50, "Turbo3 KV block must be 50 bytes per 128 values");
+            return ((columns + blockValues - 1) / blockValues) * blockBytes;
+        }
+        return GetDataBytes(type, 1, columns);
+    }
+
     size_t GetDataBytes(DataType type, size_t rows, size_t columns) {
         if (rows == 0 || columns == 0) {
             return 0;
+        }
+        if (IsPackedKVCacheDataType(type)) {
+            return rows * GetKVCacheRowBytes(type, columns);
         }
         if (type == DataType::FLOAT32) {
             return rows * columns * sizeof(float);
@@ -620,6 +649,12 @@ namespace fastllm {
             rows *= (columns / 128);
             columns = 128;
             return rows * (columns / 2 + 2 * sizeof(float));
+        } else if (type == DataType::INT4_GROUP32) {
+            AssertInFastLLM(columns % 32 == 0,
+                            "INT4_GROUP32 columns should be divisible by 32.\n");
+            // Four groups per block: [packed INT4] [BF16 scales], without
+            // padding in the final partial block. This is still 18 bytes/group.
+            return rows * (columns / 2 + columns / 32 * sizeof(uint16_t));
         } else if (type == DataType::AWQ_4BIT_128) {
             int groups = (columns - 1) / 128 + 1;
             size_t colBytes = columns / 2 + groups + groups * sizeof(float);
@@ -629,6 +664,9 @@ namespace fastllm {
             return rows * colBytes;
         } else if (type == DataType::INF_INT8_GROUP128) {
             size_t colBytes = (columns / 128) * (128 + sizeof(float) + sizeof(int)); // [int8 values] + scale + sum
+            return rows * colBytes;
+        } else if (type == DataType::INF_INT8_GROUP32) {
+            size_t colBytes = (columns / 32) * (32 + sizeof(float) + sizeof(int));
             return rows * colBytes;
         } else if (type >= DataType::DATA_GGUF_FORMAT && type < DataType::DATA_GGUF_FORMAT_END) {
             size_t colBytes = ggml_row_size((ggml_type)(type - DataType::DATA_GGUF_FORMAT), columns);
@@ -1284,11 +1322,19 @@ namespace fastllm {
         data.weightType = weightType;
         if (dataType == oriDataType &&
             (dataType == DataType::NVFP4 || dataType == DataType::NVFP4_BLOCK_16 ||
-             dataType == DataType::NVFP4_BLOCK_16_E8M0)) {
+             dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             dataType == DataType::INT4_GROUP32)) {
             this->blockK = blockK;
             this->blockM = blockM;
             if (dataType == DataType::NVFP4) {
                 this->scales.clear();
+            }
+            if (dataType == DataType::INT4_GROUP32) {
+                AssertInFastLLM(this->dims.size() == 2 && this->dims[1] % 32 == 0,
+                                "INT4_GROUP32 requires a 2D weight with columns divisible by 32.\n");
+                this->perChannelAxis = 0;
+                this->groupCnt = 32;
+                this->group = this->dims[1] / 32;
             }
             data.UpdateUnitSize();
             data.Allocate(false);
@@ -1543,6 +1589,14 @@ namespace fastllm {
     }
 
     void Data::UpdateUnitSize() {
+        if (this->dataType == DataType::INT4_GROUP32 && this->dims.size() >= 2) {
+            const int columns = this->dims.back();
+            AssertInFastLLM(columns % 32 == 0,
+                            "INT4_GROUP32 columns should be divisible by 32.\n");
+            this->perChannelAxis = 0;
+            this->groupCnt = 32;
+            this->group = columns / 32;
+        }
         if (this->dataType == DataType::FLOAT32) {
             this->unitSize = 4;
             this->unitSizeDiv = 1;
@@ -1552,7 +1606,8 @@ namespace fastllm {
             this->unitSize = 2;
             this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::INT8 || this->dataType == DataType::FP8_E4M3 ||
-                   this->dataType == DataType::FP8_E4M3_PERCHANNEL) {
+                   this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
+                   IsPackedKVCacheDataType(this->dataType)) {
             this->unitSize = 1;
             this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::NVFP4) {
@@ -1560,7 +1615,8 @@ namespace fastllm {
             this->unitSizeDiv = 2;
         } else if (this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
                    this->dataType == DataType::NVFP4_BLOCK_16 ||
-                   this->dataType == DataType::NVFP4_BLOCK_16_E8M0) {
+                   this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+                   this->dataType == DataType::INT4_GROUP32) {
             this->unitSize = 1;
             this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::INT4 
@@ -1587,7 +1643,9 @@ namespace fastllm {
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
-             this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() >= 2) {
+             this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             this->dataType == DataType::INT4_GROUP32 ||
+             IsPackedKVCacheDataType(this->dataType)) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
             FastllmGetPackedRowsCols(this->dims, rows, columns);
             this->expansionBytes = GetDataBytes(this->dataType, rows, columns);
@@ -1810,7 +1868,9 @@ namespace fastllm {
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
-             this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() >= 2) {
+             this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             this->dataType == DataType::INT4_GROUP32 ||
+             IsPackedKVCacheDataType(this->dataType)) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
             FastllmGetPackedRowsCols(this->dims, rows, columns);
             return GetDataBytes(this->dataType, rows, columns);
@@ -1827,7 +1887,9 @@ namespace fastllm {
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
              this->dataType == DataType::FP8_E4M3_PERCHANNEL ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
-             this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() >= 2) {
+             this->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+             this->dataType == DataType::INT4_GROUP32 ||
+             IsPackedKVCacheDataType(this->dataType)) && this->dims.size() >= 2) {
             size_t rows = 0, columns = 0;
             FastllmGetPackedRowsCols(this->dims, rows, columns);
             this->expansionBytes = GetDataBytes(this->dataType, rows, columns);
@@ -2685,6 +2747,8 @@ namespace fastllm {
             int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
             ret += k * this->group * 2 * sizeof(float);
             ret += this->GetBytes();
+        } else if (this->dataType == INT4_GROUP32) {
+            ret += this->GetBytes();
         } else if (this->dataType == DATA_GGUF_FORMAT) {
             ret += sizeof(int);
             ret += this->GetBytes();
@@ -2742,6 +2806,8 @@ namespace fastllm {
                 writer.WriteFloat(this->mins[i]);
                 writer.WriteFloat(this->scales[i]);
             }
+            writer.WriteBytes(this->cpuData, this->GetBytes());
+        } else if (this->dataType == INT4_GROUP32) {
             writer.WriteBytes(this->cpuData, this->GetBytes());
         } else if (this->dataType == DATA_GGUF_FORMAT) {
             writer.WriteInt(this->ggmlType);
@@ -2819,6 +2885,13 @@ namespace fastllm {
                     // this->zeros[i] = this->perChannelsConfigs[i].zeroPoint;
                 }
                 reader.ReadBytes(this->cpuData, this->GetBytes());
+            } else if (this->dataType == INT4_GROUP32) {
+                AssertInFastLLM(this->dims.size() == 2 && this->dims[1] % 32 == 0,
+                                "CreateFromFastllmFormat: invalid INT4_GROUP32 shape.\n");
+                this->perChannelAxis = 0;
+                this->groupCnt = 32;
+                this->group = this->dims[1] / 32;
+                reader.ReadBytes(this->cpuData, this->GetBytes());
             } else if (this->dataType == DATA_GGUF_FORMAT) {
                 reader.ReadBytes(this->cpuData, this->GetBytes());
             } else if (this->dataType == INT32 || this->dataType == INT32PARAM) {
@@ -2873,6 +2946,8 @@ namespace fastllm {
             return DataType::INF_INT8_PERCHANNEL;
         } else if (this->dataType == DataType::INT4_GROUP128) {
             return DataType::INF_INT8_GROUP128;
+        } else if (this->dataType == DataType::INT4_GROUP32) {
+            return DataType::INF_INT8_GROUP32;
         } else if (this->dataType == DataType::BFLOAT16 || 
                     this->dataType == DataType::FP8_E4M3 ||
                     this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
@@ -3792,17 +3867,18 @@ namespace fastllm {
     void MergeMOE(const Data &input, const Data &index, const Data &score, std::vector <Data*> &weights, std::vector <Data*> &biass, 
                 Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
                 float sharedScale, Data &output, int layer, MoeGateType gateType,
-                bool expertParallel) {
+                bool expertParallel, float swigluLimit, bool deepSeekV4Mode) {
         curExecutor->Run("MergeMOE", {
                 {"input", (Data*)&input}, {"index", (Data*)&index}, {"score", (Data*)&score},
                 {"weights", (Data*)weights.data()}, {"biass", (Data*)biass.data()},
                 {"w1", (Data*)&w1}, {"w2", (Data*)&w2}, {"w3", (Data*)&w3},
                 {"curInput", &curInput}, {"curOutput", &curOutput},
                 {"output", (Data*)&output}
-        }, {{"sharedScale", sharedScale}}, 
+        }, {{"sharedScale", sharedScale}, {"swigluLimit", swigluLimit}},
                                         {{"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()},
                                          {"layer", layer}, {"gateType", (int)gateType},
-                                         {"expertParallel", expertParallel ? 1 : 0}});
+                                         {"expertParallel", expertParallel ? 1 : 0},
+                                         {"deepSeekV4Mode", deepSeekV4Mode ? 1 : 0}});
     }
 
     void FusedMOE(const Data &input, const Data &index, const Data &score,

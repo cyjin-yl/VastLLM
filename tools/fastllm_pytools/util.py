@@ -202,7 +202,8 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
         "Qwen3NextForCausalLM",
         "MiniMaxM2ForCausalLM",
         "HYV3ForCausalLM",
-    ] or model_type in ["deepseek_v4", "glm_moe_dsa", "qwen3_5_moe", "hy_v3"] or text_model_type == "qwen3_5_moe_text")
+        "LagunaForCausalLM",
+    ] or model_type in ["deepseek_v4", "glm_moe_dsa", "qwen3_5_moe", "hy_v3", "laguna"] or text_model_type == "qwen3_5_moe_text")
 
 def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description = des, add_help = add_help)
@@ -214,7 +215,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--moe_dtype', type = str, default = "", help = 'MOE层使用的权重类型（读取HF模型时有效）')
     parser.add_argument('--moe_atype', type = str, default = "", help = 'MOE层激活类型，可使用auto、float32、float16或bfloat16')
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
-    parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16或fp8_e4m3')
+    parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3或turbo3（Qwen3.5/3.6需FASTLLM_QWEN35_TURBO3_KV=1）')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
@@ -390,6 +391,7 @@ def make_normal_llm_model(args, startup_progress = None):
 
             if (architecture == 'Qwen3ForCausalLM' or architecture == 'Qwen3MoeForCausalLM' or
                 architecture == 'DeepseekV4ForCausalLM' or model_type == 'deepseek_v4' or
+                architecture == 'LagunaForCausalLM' or model_type == 'laguna' or
                 architecture == 'Qwen3_5MoeForConditionalGeneration' or
                 model_type == 'qwen3_5_moe' or text_model_type == 'qwen3_5_moe_text' or
                 architecture == 'Glm4MoeForCausalLM' or architecture == 'GlmMoeDsaForCausalLM' or

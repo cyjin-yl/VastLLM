@@ -283,6 +283,19 @@ void FastllmCudaPagedCacheCopyBatch(uint8_t *pagedData, int32_t *pageIdxArray, i
                                     int pageLen, int batch, int numHeads, int headDim,
                                     fastllm::DataType dstType, uint8_t *inputData, fastllm::DataType srcType,
                                     bool sync = true);
+bool FastllmCudaPackedKVCacheCopy(uint8_t *pagedData, int pageIdx, int pageLen,
+                                  int numHeads, int headDim, fastllm::DataType dstType,
+                                  uint8_t *inputData, fastllm::DataType srcType,
+                                  int seqLen, int inputOffset, int copyLen, int pageOffset);
+bool FastllmCudaPackedKVCacheCopyBatch(uint8_t *pagedData, int32_t *pageIdxArray,
+                                       int32_t *pageOffsetArray, int pageLen, int batch,
+                                       int numHeads, int headDim, fastllm::DataType dstType,
+                                       uint8_t *inputData, fastllm::DataType srcType,
+                                       bool sync = true);
+bool FastllmCudaPackedKVCacheGatherHeadRangeToHalf(
+        const uint8_t *pagedData, fastllm::DataType srcType,
+        const int32_t *pageIndices, int kvStart, int chunkLen,
+        int pageLen, int numHeads, int headDim, int head, void *output);
 
 bool FastllmFloatToHalf(void *a, void *b, int len);
 bool FastllmHalfToFloat(void *a, void *b, int len);
@@ -506,6 +519,8 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
     fastllm::Data &index, fastllm::Data &score, int topk, bool needNorm, float routeScale);
 bool FastllmCudaFusedSoftmaxSelectExpert(const fastllm::Data &logits, const fastllm::Data *gateBias,
     fastllm::Data &index, fastllm::Data &score, int topk, bool needNorm, float routeScale);
+bool FastllmCudaFusedSigmoidSelectExpert(const fastllm::Data &logits, const fastllm::Data *gateBias,
+    fastllm::Data &index, fastllm::Data &score, int topk, bool needNorm, float routeScale);
 bool FastllmCudaMaskAndRemapExpertsForLocalRange(fastllm::Data &index, fastllm::Data &score,
                                                  int expertStart, int expertEnd);
 bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis);
@@ -515,6 +530,7 @@ bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weigh
 bool FastllmCudaMatMulFloatInt4(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaMatMulFloatInt4Group32(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaMatMulFloat32(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaMatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
@@ -683,6 +699,7 @@ bool FastllmCudaHalfMergeMOEInt8Batch1Indexed(const fastllm::Data &input,
                                               const float *scores,
                                               int topk);
 bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaHalfMatMulFloatInt4Group32(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMergeMOEInt4GroupBatch1Indexed(const fastllm::Data &input,
                                                    fastllm::Data &scratch,
                                                    fastllm::Data &output,
@@ -768,6 +785,7 @@ bool FastllmCudaHalfMergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data
                                        bool scoresOnCuda, int topk, int hidden, int inter);
 
 bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaBFloat16MatMulInt4Group32(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulFloat32(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);

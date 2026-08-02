@@ -2587,8 +2587,21 @@ namespace fastllm {
             return;
         }
         if (data.dims.size() == 0) {
+            // Empty KV caches can already own pre-expanded storage. Widening an
+            // empty BF16/FP16 cache by only changing unitSize leaves the old
+            // two-byte allocation in place, so the first FP32 append writes
+            // past the buffer. There are no logical elements to preserve, but
+            // the capacity must be reallocated for the new element width.
+            uint64_t oldExpansionSize = data.expansionSize;
+            bool hadStorage = data.cudaData != nullptr;
+            if (hadStorage) {
+                data.FreeSpace();
+            }
             data.dataType = DataType::FLOAT32;
             data.UpdateUnitSize();
+            if (hadStorage && oldExpansionSize > 0) {
+                data.MallocSpace(oldExpansionSize);
+            }
             return;
         }
         if (data.dataType == DataType::FLOAT16) {
@@ -3018,6 +3031,7 @@ namespace fastllm {
                    weightType == DataType::BFLOAT16 ||
                    weightType == DataType::INT8 ||
                    weightType == DataType::INT4_GROUP ||
+                   weightType == DataType::INT4_GROUP32 ||
                    weightType == DataType::INT4_GROUP128 ||
                    weightType == DataType::INT4_NOZERO ||
                    weightType == DataType::FP8_E4M3 ||
@@ -3036,6 +3050,7 @@ namespace fastllm {
                    weightType == DataType::INT4 ||
                    weightType == DataType::INT4_NOZERO ||
                    weightType == DataType::INT4_GROUP ||
+                   weightType == DataType::INT4_GROUP32 ||
                    weightType == DataType::FP8_E4M3 ||
                    weightType == DataType::FP8_E4M3_BLOCK_128 ||
                    weightType == DataType::FP8_E4M3_PERCHANNEL ||
@@ -3048,6 +3063,7 @@ namespace fastllm {
             return weightType == DataType::BFLOAT16 ||
                    weightType == DataType::FLOAT32 ||
                    weightType == DataType::FLOAT16 ||
+                   weightType == DataType::INT4_GROUP32 ||
                    weightType == DataType::FP8_E4M3 ||
                    weightType == DataType::FP8_E4M3_BLOCK_128 ||
                    weightType == DataType::FP8_E4M3_PERCHANNEL ||
@@ -3080,6 +3096,8 @@ namespace fastllm {
                 FastllmCudaHalfMatMulFloatInt8(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::INT4_GROUP) {
                 FastllmCudaHalfMatMulFloatInt4Group(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::INT4_GROUP32) {
+                FastllmCudaHalfMatMulFloatInt4Group32(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::INT4_GROUP128) {
                 FastllmCudaHalfMatMulFloatInt4Group128(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::INT4_NOZERO) {
@@ -3124,6 +3142,8 @@ namespace fastllm {
                 FastllmCudaMatMulFloatInt4NoZero(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::INT4_GROUP) {
                 FastllmCudaMatMulFloatInt4Group(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::INT4_GROUP32) {
+                FastllmCudaMatMulFloatInt4Group32(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FP8_E4M3) {
                 FastllmCudaMatMulFloatFP8E4M3(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
@@ -3148,6 +3168,8 @@ namespace fastllm {
                 FastllmCudaBFloat16MatMulFloat32(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FLOAT16) {
                 FastllmCudaBFloat16MatMulFloat16(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::INT4_GROUP32) {
+                FastllmCudaBFloat16MatMulInt4Group32(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FP8_E4M3) {
                 if (!TryCudaCutlassLinearFp8Block128(input, weight, bias, output, n, m, k) &&
                     !TryCudaTritonLinearFp8Block128(input, weight, bias, output, n, m, k)) {
@@ -6384,8 +6406,9 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         AssertInFastLLM(cache.dataType == DataType::FLOAT32 ||
                         cache.dataType == DataType::FLOAT16 ||
                         cache.dataType == DataType::BFLOAT16 ||
-                        cache.dataType == DataType::FP8_E4M3,
-                        "CudaAppendPagedCacheOp's cache's type should be float32, float16, bfloat16 or fp8_e4m3.\n");
+                        cache.dataType == DataType::FP8_E4M3 ||
+                        IsPackedKVCacheDataType(cache.dataType),
+                        "CudaAppendPagedCacheOp's cache type should be float32, float16, bfloat16, fp8_e4m3 or packed KV.\n");
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
                         input.dataType == DataType::FLOAT16 ||
                         input.dataType == DataType::BFLOAT16,
@@ -6551,8 +6574,9 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         AssertInFastLLM(((Data*)&manager)->dataType == DataType::FLOAT32 ||
                         ((Data*)&manager)->dataType == DataType::FLOAT16 ||
                         ((Data*)&manager)->dataType == DataType::BFLOAT16 ||
-                        ((Data*)&manager)->dataType == DataType::FP8_E4M3,
-                        "CudaAppendPagedCacheBatchOp's cache type should be float32, float16, bfloat16 or fp8_e4m3.\n");
+                        ((Data*)&manager)->dataType == DataType::FP8_E4M3 ||
+                        IsPackedKVCacheDataType(((Data*)&manager)->dataType),
+                        "CudaAppendPagedCacheBatchOp's cache type should be float32, float16, bfloat16, fp8_e4m3 or packed KV.\n");
         AssertInFastLLM(input.dims.size() == 3,
                         "CudaAppendPagedCacheBatchOp's input should have 3 dimensions [batch, numHeads, headDim].\n");
         AssertInFastLLM(insertIndexs.dims.size() == 1 && insertIndexs.dims[0] == input.dims[0],

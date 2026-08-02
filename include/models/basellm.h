@@ -29,6 +29,24 @@ namespace fastllm {
     };
 
     class basellm;
+    struct Qwen35LongPrefillProgress {
+        bool inProgress = false;
+        int total = 0;
+        int cursor = 0;
+        bool mtpViable = true;
+        uint64_t ticket = 0;
+        std::map<PagedCacheManager*, int> reservedPages;
+
+        void Reset() {
+            inProgress = false;
+            total = 0;
+            cursor = 0;
+            mtpViable = true;
+            ticket = 0;
+            reservedPages.clear();
+        }
+    };
+
 
     struct ResponseContext {
         bool isEnding = false; // 代表这个请求已经处理完成了，不需要再forward了，但生成的token可能还没有被fetch
@@ -44,6 +62,8 @@ namespace fastllm {
         LastTokensUnit tokens;
         ResponseContextError error = ResponseContextErrorNone;
         std::string toolCallConstraintGeneratedText;
+        std::vector<int> pendingStopTokens;
+        std::string pendingStopText;
 
         int preTokens = 0;
         int curTokens = 0;
@@ -51,10 +71,11 @@ namespace fastllm {
         std::map <std::string, int> intParams;
 
         int cacheLen = 0;
+        Qwen35LongPrefillProgress longPrefill;
 
         ~ResponseContext();
 
-        void Init(int blocks, DataType dataType, DataType kvCacheDataType);
+        void Init(basellm *model);
         void TryRecord(basellm *model);
         void TryRecordPagedCache(basellm *model);
     };
@@ -167,6 +188,8 @@ namespace fastllm {
         std::map<std::string, std::vector<Data>> dataVectorMap;
         std::map<std::string, std::vector<Data*>> dataPtrVectorMap;
     };
+
+    DataType ParseKVCacheDataType(const std::string &value);
 
     class basellm {
     public:
@@ -340,6 +363,15 @@ namespace fastllm {
         // 占用多少比例的可用 KV 预算。其余空间优先留给 token-growing KV cache。
         virtual int GetAutoWarmupLinearAttentionBatchBudgetPercent() const { return 50; }
 
+        // A non-negative value marks an ordinary attention layer whose KV
+        // history is periodically compacted to a bounded tail.  AutoWarmup
+        // treats that storage as a per-request fixed cost instead of charging
+        // it once for every token in the advertised context length.
+        virtual int GetKVCacheRetainedTokens(int layer) const {
+            (void)layer;
+            return -1;
+        }
+
         virtual bool ShouldEnforceAutoWarmupRuntimeBatchLimit() const { return false; }
 
         virtual void WarmupCudaRuntimeBuffers(int batch) {}
@@ -347,6 +379,10 @@ namespace fastllm {
         // 当前运行配置是否可以使用 ForwardGPU。
         // 默认仅在纯 GPU 设备映射下启用；有混合设备实现的模型可以覆盖此判断。
         virtual bool CanUseGPUForward() const;
+
+        // AutoWarmup 时将实际放在 NUMA 上的 MoE 专家权重全部注册，
+        // 避免未命中的专家在正式解码路径中触发首次分配和拷贝。
+        void WarmupNumaMoeWeights();
 
         void AutoWarmup(); // 自动预热：use_new_engine 时使用新引擎预热，否则调用 WarmUp
 
@@ -361,6 +397,10 @@ namespace fastllm {
 
         virtual PagedCacheManager* GetPagedKVCacheManager(int layerIndex, bool isKey) const;
         virtual std::vector<std::pair<int, PagedCacheManager*> > GetPagedKVCacheManagers(int layerIndex, bool isKey) const;
+        virtual std::pair<DataType, DataType> GetKVCacheDataTypes(int layerIndex) const {
+            (void)layerIndex;
+            return {this->kvCacheDataType, this->kvCacheDataType};
+        }
         virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context);
         virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const;
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const;
@@ -397,6 +437,8 @@ namespace fastllm {
         // per-request chunks for recurrent-state snapshots while retaining a
         // larger aggregate batching limit.
         virtual int GetBatchedPrefillTokenLimit();
+
+        virtual void SetTokenLimit(int tokens);
 
         virtual void SetDataType(DataType dataType);
 

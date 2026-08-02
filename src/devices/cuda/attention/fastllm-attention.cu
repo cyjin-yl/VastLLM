@@ -975,7 +975,7 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
     uint32_t head_dim_vo = v2;           // VO head dimension
     
     // 确定 mask mode - FlashInfer 的 custom mask 需要 bit-packed 格式，暂时不支持
-    bool use_custom_mask = (maskd != nullptr);
+    const bool use_custom_mask = (maskd != nullptr);
 // printf("maskType = %d, use_custom_mask = %d, batch = %d\n", maskType, use_custom_mask, batch);
 #ifdef FASTLLM_ENABLE_FLASHINFER
     MaskMode mask_mode = MaskMode::kNone;
@@ -984,11 +984,11 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
     }
 mask_mode = MaskMode::kCausal;
 #endif
-    // 注意：FlashInfer 的 custom mask 格式与 fastllm 不同，暂时禁用
-    if (use_custom_mask) {
-        // Fallback 到原始实现，因为 mask 格式不兼容
-        use_custom_mask = false;
-    }
+    // FlashInfer's custom mask is bit-packed and is not compatible with
+    // FastLLM's dense mask.  Keep use_custom_mask=true so the selection below
+    // falls back to the original attention implementation, which consumes the
+    // dense sliding-window mask.  Clearing this flag would silently run causal
+    // full attention and makes restored sliding KV tails numerically wrong.
     
     // FlashInfer 支持 HND 布局，使用 HND 布局实现
     // fastllm 的数据布局是 HND: [num_heads, seq_len, head_dim]
@@ -1119,7 +1119,9 @@ FastllmCudaPermute(*((fastllm::Data*)&output), {1, 0, 2});
     if (q1 >= 1024 || (q1 > 1 && q1 != k1 && k1 >= 1024)) {
         int alignQ1 = q1, alignK1 = k1;
         int part = alignK1;
-        bool useFastAttn = getCudaInfos()->hasTensorCore && batch == 1 && (q2 == 128 && v2 == 128) && maskType == 0;
+        bool useFastAttn = getCudaInfos()->hasTensorCore && batch == 1 &&
+                           (q2 == 128 && v2 == 128) && maskType == 0 &&
+                           maskd == nullptr;
         useFastAttn &= (q1 % 1024 == 0 && k1 % 1024 == 0);
 
         if (useFastAttn) {
@@ -1411,6 +1413,14 @@ bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const 
         if (maskd) {
             int spatial = q1 * k1, n = batch, m = q0 / batch;
             FastllmAttentionMaskKernel <256> <<< n * m, 256>>>(qk, maskd, -10000, n, m, spatial);
+        } else if (batch == 1 && maskType == 0 && q1 > 1) {
+            // qk is laid out as [q0, q1, k1]. Apply the causal mask per head;
+            // base=k1-q1 also covers chunked prefill with an existing KV cache.
+            for (int h = 0; h < q0; h++) {
+                CausalMask<256, float> <<< q1, 256 >>>(
+                    qk + (size_t)h * q1 * k1, -10000.0f,
+                    q1, k1, k1 - q1);
+            }
         }
 
         int outer = q0 * q1;
@@ -1872,6 +1882,14 @@ void FastllmCudaPagedCacheCopy(
     int inputOffset,
     int copyLen,
     int pageOffset) {
+    if (fastllm::IsPackedKVCacheDataType(dstType)) {
+        if (!FastllmCudaPackedKVCacheCopy(
+                pagedData, pageIdx, pageLen, numHeads, headDim, dstType,
+                inputData, srcType, seqLen, inputOffset, copyLen, pageOffset)) {
+            fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopy: packed KV cache copy failed.\n");
+        }
+        return;
+    }
     if (srcType == fastllm::DataType::FLOAT32) {
         if (dstType == fastllm::DataType::FLOAT32) {
             FastllmCudaPagedCacheCopyTyped<float, float>(pagedData, pageIdx, pageLen, numHeads, headDim,
@@ -2014,6 +2032,14 @@ void FastllmCudaPagedCacheCopyBatch(
     uint8_t *inputData,
     fastllm::DataType srcType,
     bool sync) {
+    if (fastllm::IsPackedKVCacheDataType(dstType)) {
+        if (!FastllmCudaPackedKVCacheCopyBatch(
+                pagedData, pageIdxArray, pageOffsetArray, pageLen, batch,
+                numHeads, headDim, dstType, inputData, srcType, sync)) {
+            fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopyBatch: packed KV cache copy failed.\n");
+        }
+        return;
+    }
     if (srcType == fastllm::DataType::FLOAT32) {
         if (dstType == fastllm::DataType::FLOAT32) {
             FastllmCudaPagedCacheCopyBatchTyped<float, float>(pagedData, pageIdxArray, pageOffsetArray,
@@ -2361,6 +2387,11 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
         printf("DoCudaAttentionPaged: pagedKVCacheData is nullptr\n");
         exit(0);
     }
+    if (fastllm::IsPackedKVCacheDataType(pagedKVCacheK->dataType) ||
+        fastllm::IsPackedKVCacheDataType(pagedKVCacheV->dataType)) {
+        return FastllmCudaHalfPagedAttentionFastllmFallback(
+            q, k, v, output, group, scale);
+    }
     
     int pageLen = k.pageLen;
     int numHeads = pagedKVCacheK->dims[2];  // [maxPages, pageLen, numHeads, headDim]
@@ -2592,6 +2623,22 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
 }
 
 bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited, bool sync, bool enableCudaGraph, int flashInferCudaGraph) {
+    if (FastllmCudaTrySm70PagedAttentionDecode(
+            q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens,
+            output, group, scale, attentionType)) {
+        if (sync) {
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        return true;
+    }
+    if (FastllmCudaTrySm70FlashAttentionPrefill(
+            q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens,
+            output, group, scale, attentionType)) {
+        if (sync) {
+            FastllmCudaSyncCurrentThreadStream();
+        }
+        return true;
+    }
 #ifndef FASTLLM_ENABLE_FLASHINFER
     bool ok = FastllmCudaHalfPagedAttentionBatchFastllmFallback(
         q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale);

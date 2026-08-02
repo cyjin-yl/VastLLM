@@ -6,6 +6,7 @@
 #include <algorithm>
 
 #include "fastllm.h"
+#include "utils/utils.h"
 #ifdef __AVX2__
 #include "immintrin.h"
 #endif
@@ -39,6 +40,9 @@ namespace fastllm {
     // c: [n * k]的float32的结果矩阵  
     bool MatMulInt8Int4_AVX512VNNI(uint8_t *a, uint8_t *b, float *c, int n, int m, int k) {
 #ifdef __AVX512VNNI__
+        if (m % 64 != 0) {
+            return false;
+        }
         float *values = c;
 
         int block = 0;
@@ -149,6 +153,12 @@ namespace fastllm {
     bool MatMulInt8Int4Group_AVX512VNNI(uint8_t *a, uint8_t *b, float *c, int n, int m, int k, 
         int group, int realGroup, int groupCnt, float *iscales, float *scales, float *izeros, float *weightMins) {
 #ifdef __AVX512VNNI__
+        // Every quantization group must be representable by complete VNNI
+        // blocks. Returning false selects the AVX2/scalar implementation with
+        // the matching 32-value input layout.
+        if (groupCnt <= 0 || groupCnt % 64 != 0 || m % 64 != 0) {
+            return false;
+        }
         float *values = c;
         int block = 0;
 
@@ -1100,6 +1110,362 @@ namespace fastllm {
         }
         
         AddBiasAVX512(outputData, biasData, n, k, st, end);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+#ifdef __AVX512VNNI__
+    __attribute__((always_inline)) inline __m512i
+    UnpackInt4Group32Pair_AVX512VNNI(const uint8_t *packedData) {
+        // Two neighboring group-32 payloads are contiguous in every compact
+        // four-group block. Unpack both with one 256-bit load and lane-local
+        // shuffles, producing 64 unsigned nibble values in their original
+        // order. This path is shared by decode and all batched row kernels.
+        const __m256i packed = _mm256_loadu_si256(
+            (const __m256i*)packedData);
+        const __m256i nibbleMask = _mm256_set1_epi8(0x0f);
+        const __m256i low = _mm256_and_si256(packed, nibbleMask);
+        const __m256i high = _mm256_and_si256(
+            _mm256_srli_epi16(packed, 4), nibbleMask);
+        const __m256i firstHalf = _mm256_unpacklo_epi8(high, low);
+        const __m256i secondHalf = _mm256_unpackhi_epi8(high, low);
+        const __m256i group0 = _mm256_permute2x128_si256(
+            firstHalf, secondHalf, 0x20);
+        const __m256i group1 = _mm256_permute2x128_si256(
+            firstHalf, secondHalf, 0x31);
+        __m512i unpacked = _mm512_castsi256_si512(group0);
+        return _mm512_inserti64x4(unpacked, group1, 1);
+    }
+
+    template <int ROWS>
+    __attribute__((always_inline)) inline void
+    LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows(
+            const uint8_t *inputData, const uint8_t *weightRow,
+            float *biasData, float *outputData, int rowBase, int out,
+            int groups, size_t inputRowBytes, int k) {
+        constexpr int groupCnt = 32;
+        constexpr size_t inputGroupBytes = groupCnt + sizeof(float) + sizeof(int);
+        __m512 accum[ROWS];
+        float correction[ROWS];
+#pragma unroll
+        for (int rowOffset = 0; rowOffset < ROWS; rowOffset++) {
+            accum[rowOffset] = _mm512_setzero_ps();
+            correction[rowOffset] = 0.0f;
+        }
+
+        int group = 0;
+        for (; group + 1 < groups; group += 2) {
+            const uint8_t *weightBlock0 = weightRow +
+                GetInt4Group32DataOffset(group, groups);
+            const __m512i weights =
+                UnpackInt4Group32Pair_AVX512VNNI(weightBlock0);
+            const size_t scaleOffset =
+                GetInt4Group32ScaleOffset(group, groups);
+            const float weightScale0 = BFloat16BitsToFloat32(
+                *(const uint16_t*)(weightRow + scaleOffset));
+            const float weightScale1 = BFloat16BitsToFloat32(
+                *(const uint16_t*)(weightRow + scaleOffset +
+                                   sizeof(uint16_t)));
+
+#pragma unroll
+            for (int rowOffset = 0; rowOffset < ROWS; rowOffset++) {
+                const uint8_t *inputRow = inputData +
+                    (size_t)(rowBase + rowOffset) * inputRowBytes;
+                const uint8_t *input0 = inputRow +
+                    (size_t)group * inputGroupBytes;
+                const uint8_t *input1 = input0 + inputGroupBytes;
+                const __m256i a0 = _mm256_loadu_si256(
+                    (const __m256i*)input0);
+                const __m256i a1 = _mm256_loadu_si256(
+                    (const __m256i*)input1);
+                __m512i activations = _mm512_castsi256_si512(a0);
+                activations = _mm512_inserti64x4(activations, a1, 1);
+                const __m512i dots = _mm512_dpbusd_epi32(
+                    _mm512_setzero_si512(), weights, activations);
+
+                const float scale0 =
+                    *(const float*)(input0 + groupCnt) * weightScale0;
+                const float scale1 =
+                    *(const float*)(input1 + groupCnt) * weightScale1;
+                const __m512 coefficients = _mm512_mask_blend_ps(
+                    (__mmask16)0xff00, _mm512_set1_ps(scale0),
+                    _mm512_set1_ps(scale1));
+                accum[rowOffset] = _mm512_fmadd_ps(
+                    _mm512_cvtepi32_ps(dots), coefficients,
+                    accum[rowOffset]);
+
+                const int sum0 = *(const int*)(
+                    input0 + groupCnt + sizeof(float));
+                const int sum1 = *(const int*)(
+                    input1 + groupCnt + sizeof(float));
+                correction[rowOffset] -=
+                    8.0f * ((float)sum0 * scale0 + (float)sum1 * scale1);
+            }
+        }
+
+#pragma unroll
+        for (int rowOffset = 0; rowOffset < ROWS; rowOffset++) {
+            float total = _mm512_reduce_add_ps(accum[rowOffset]) +
+                          correction[rowOffset];
+            if (group < groups) {
+                const uint8_t *inputRow = inputData +
+                    (size_t)(rowBase + rowOffset) * inputRowBytes;
+                const uint8_t *inputGroup = inputRow +
+                    (size_t)group * inputGroupBytes;
+                const int8_t *values = (const int8_t*)inputGroup;
+                const uint8_t *packed = weightRow +
+                    GetInt4Group32DataOffset(group, groups);
+                int dot = 0;
+#pragma unroll
+                for (int i = 0; i < groupCnt; i += 2) {
+                    dot += values[i] * (packed[i / 2] >> 4) +
+                           values[i + 1] * (packed[i / 2] & 0x0f);
+                }
+                const float scale = *(const float*)(inputGroup + groupCnt) *
+                    BFloat16BitsToFloat32(
+                        *(const uint16_t*)(weightRow +
+                            GetInt4Group32ScaleOffset(group, groups)));
+                const int sum = *(const int*)(
+                    inputGroup + groupCnt + sizeof(float));
+                total += (dot - 8 * sum) * scale;
+            }
+            if (biasData != nullptr) {
+                total += biasData[out];
+            }
+            outputData[(size_t)(rowBase + rowOffset) * k + out] = total;
+        }
+    }
+
+    template <int ROWS>
+    __attribute__((always_inline)) inline void
+    LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows2(
+            const uint8_t *inputData, const uint8_t *weightRow0,
+            const uint8_t *weightRow1, float *biasData, float *outputData,
+            int rowBase, int out, int groups, size_t inputRowBytes, int k) {
+        constexpr int groupCnt = 32;
+        constexpr size_t inputGroupBytes = groupCnt + sizeof(float) + sizeof(int);
+        __m512 accum0[ROWS], accum1[ROWS];
+        float correction0[ROWS], correction1[ROWS];
+#pragma unroll
+        for (int rowOffset = 0; rowOffset < ROWS; rowOffset++) {
+            accum0[rowOffset] = _mm512_setzero_ps();
+            accum1[rowOffset] = _mm512_setzero_ps();
+            correction0[rowOffset] = 0.0f;
+            correction1[rowOffset] = 0.0f;
+        }
+
+        // The two-output specialization is used only for even group counts;
+        // Laguna's 2048/3072-wide expert matrices satisfy this naturally.
+        for (int group = 0; group < groups; group += 2) {
+            const size_t dataOffset0 =
+                GetInt4Group32DataOffset(group, groups);
+            const __m512i weights0 =
+                UnpackInt4Group32Pair_AVX512VNNI(weightRow0 + dataOffset0);
+            const __m512i weights1 =
+                UnpackInt4Group32Pair_AVX512VNNI(weightRow1 + dataOffset0);
+
+            const size_t scaleOffset0 =
+                GetInt4Group32ScaleOffset(group, groups);
+            const size_t scaleOffset1 = scaleOffset0 + sizeof(uint16_t);
+            const float weightScale00 = BFloat16BitsToFloat32(
+                *(const uint16_t*)(weightRow0 + scaleOffset0));
+            const float weightScale01 = BFloat16BitsToFloat32(
+                *(const uint16_t*)(weightRow0 + scaleOffset1));
+            const float weightScale10 = BFloat16BitsToFloat32(
+                *(const uint16_t*)(weightRow1 + scaleOffset0));
+            const float weightScale11 = BFloat16BitsToFloat32(
+                *(const uint16_t*)(weightRow1 + scaleOffset1));
+
+#pragma unroll
+            for (int rowOffset = 0; rowOffset < ROWS; rowOffset++) {
+                const uint8_t *inputRow = inputData +
+                    (size_t)(rowBase + rowOffset) * inputRowBytes;
+                const uint8_t *input0 = inputRow +
+                    (size_t)group * inputGroupBytes;
+                const uint8_t *input1 = input0 + inputGroupBytes;
+                const __m256i a0 = _mm256_loadu_si256(
+                    (const __m256i*)input0);
+                const __m256i a1 = _mm256_loadu_si256(
+                    (const __m256i*)input1);
+                __m512i activations = _mm512_castsi256_si512(a0);
+                activations = _mm512_inserti64x4(activations, a1, 1);
+                const __m512i dots0 = _mm512_dpbusd_epi32(
+                    _mm512_setzero_si512(), weights0, activations);
+                const __m512i dots1 = _mm512_dpbusd_epi32(
+                    _mm512_setzero_si512(), weights1, activations);
+
+                const float inputScale0 = *(const float*)(input0 + groupCnt);
+                const float inputScale1 = *(const float*)(input1 + groupCnt);
+                const float scale00 = inputScale0 * weightScale00;
+                const float scale01 = inputScale1 * weightScale01;
+                const float scale10 = inputScale0 * weightScale10;
+                const float scale11 = inputScale1 * weightScale11;
+                const __m512 coefficients0 = _mm512_mask_blend_ps(
+                    (__mmask16)0xff00, _mm512_set1_ps(scale00),
+                    _mm512_set1_ps(scale01));
+                const __m512 coefficients1 = _mm512_mask_blend_ps(
+                    (__mmask16)0xff00, _mm512_set1_ps(scale10),
+                    _mm512_set1_ps(scale11));
+                accum0[rowOffset] = _mm512_fmadd_ps(
+                    _mm512_cvtepi32_ps(dots0), coefficients0,
+                    accum0[rowOffset]);
+                accum1[rowOffset] = _mm512_fmadd_ps(
+                    _mm512_cvtepi32_ps(dots1), coefficients1,
+                    accum1[rowOffset]);
+
+                const int sum0 = *(const int*)(
+                    input0 + groupCnt + sizeof(float));
+                const int sum1 = *(const int*)(
+                    input1 + groupCnt + sizeof(float));
+                correction0[rowOffset] -=
+                    8.0f * ((float)sum0 * scale00 + (float)sum1 * scale01);
+                correction1[rowOffset] -=
+                    8.0f * ((float)sum0 * scale10 + (float)sum1 * scale11);
+            }
+        }
+
+        const float bias0 = biasData == nullptr ? 0.0f : biasData[out];
+        const float bias1 = biasData == nullptr ? 0.0f : biasData[out + 1];
+#pragma unroll
+        for (int rowOffset = 0; rowOffset < ROWS; rowOffset++) {
+            outputData[(size_t)(rowBase + rowOffset) * k + out] =
+                _mm512_reduce_add_ps(accum0[rowOffset]) +
+                correction0[rowOffset] + bias0;
+            outputData[(size_t)(rowBase + rowOffset) * k + out + 1] =
+                _mm512_reduce_add_ps(accum1[rowOffset]) +
+                correction1[rowOffset] + bias1;
+        }
+    }
+#endif
+
+    bool LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Kernel(
+        uint8_t *inputData, uint8_t *weightData, float *biasData,
+        float *outputData, int n, int m, int k, int st, int end) {
+#ifdef __AVX512VNNI__
+        if (m <= 0 || m % 32 != 0) {
+            return false;
+        }
+        constexpr int groupCnt = 32;
+        constexpr size_t inputGroupBytes = groupCnt + sizeof(float) + sizeof(int);
+        const int groups = m / groupCnt;
+        const size_t inputRowBytes = GetDataBytes(DataType::INF_INT8_GROUP32, 1, m);
+        const size_t weightRowBytes = GetDataBytes(DataType::INT4_GROUP32, 1, m);
+        if (n == 1) {
+            for (int out = st; out < end; out++) {
+                const uint8_t *weightRow =
+                    weightData + (size_t)out * weightRowBytes;
+                LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows<1>(
+                    inputData, weightRow, biasData, outputData, 0, out,
+                    groups, inputRowBytes, k);
+            }
+            return true;
+        }
+
+        // For batched rows, block two output rows together so both dot products
+        // reuse activation loads, scales and sums. Both this path and the
+        // dedicated n == 1 path above share the compact pair-unpack helper.
+        constexpr int inputBlock = 8;
+        int out = st;
+        if ((groups & 1) == 0) {
+            for (; out + 1 < end; out += 2) {
+                const uint8_t *weightRow0 =
+                    weightData + (size_t)out * weightRowBytes;
+                const uint8_t *weightRow1 = weightRow0 + weightRowBytes;
+                int rowBase = 0;
+                for (; rowBase + inputBlock <= n; rowBase += inputBlock) {
+                    LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows2<inputBlock>(
+                        inputData, weightRow0, weightRow1, biasData, outputData,
+                        rowBase, out, groups, inputRowBytes, k);
+                }
+                switch (n - rowBase) {
+                    case 0: break;
+                    case 1:
+                        LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows2<1>(
+                            inputData, weightRow0, weightRow1, biasData,
+                            outputData, rowBase, out, groups, inputRowBytes, k);
+                        break;
+                    case 2:
+                        LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows2<2>(
+                            inputData, weightRow0, weightRow1, biasData,
+                            outputData, rowBase, out, groups, inputRowBytes, k);
+                        break;
+                    case 3:
+                        LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows2<3>(
+                            inputData, weightRow0, weightRow1, biasData,
+                            outputData, rowBase, out, groups, inputRowBytes, k);
+                        break;
+                    case 4:
+                        LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows2<4>(
+                            inputData, weightRow0, weightRow1, biasData,
+                            outputData, rowBase, out, groups, inputRowBytes, k);
+                        break;
+                    case 5:
+                        LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows2<5>(
+                            inputData, weightRow0, weightRow1, biasData,
+                            outputData, rowBase, out, groups, inputRowBytes, k);
+                        break;
+                    case 6:
+                        LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows2<6>(
+                            inputData, weightRow0, weightRow1, biasData,
+                            outputData, rowBase, out, groups, inputRowBytes, k);
+                        break;
+                    case 7:
+                        LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows2<7>(
+                            inputData, weightRow0, weightRow1, biasData,
+                            outputData, rowBase, out, groups, inputRowBytes, k);
+                        break;
+                }
+            }
+        }
+        for (; out < end; out++) {
+            const uint8_t *weightRow = weightData + (size_t)out * weightRowBytes;
+            int rowBase = 0;
+            for (; rowBase + inputBlock <= n; rowBase += inputBlock) {
+                LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows<inputBlock>(
+                    inputData, weightRow, biasData, outputData, rowBase, out,
+                    groups, inputRowBytes, k);
+            }
+            switch (n - rowBase) {
+                case 0: break;
+                case 1:
+                    LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows<1>(
+                        inputData, weightRow, biasData, outputData, rowBase, out,
+                        groups, inputRowBytes, k);
+                    break;
+                case 2:
+                    LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows<2>(
+                        inputData, weightRow, biasData, outputData, rowBase, out,
+                        groups, inputRowBytes, k);
+                    break;
+                case 3:
+                    LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows<3>(
+                        inputData, weightRow, biasData, outputData, rowBase, out,
+                        groups, inputRowBytes, k);
+                    break;
+                case 4:
+                    LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows<4>(
+                        inputData, weightRow, biasData, outputData, rowBase, out,
+                        groups, inputRowBytes, k);
+                    break;
+                case 5:
+                    LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows<5>(
+                        inputData, weightRow, biasData, outputData, rowBase, out,
+                        groups, inputRowBytes, k);
+                    break;
+                case 6:
+                    LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows<6>(
+                        inputData, weightRow, biasData, outputData, rowBase, out,
+                        groups, inputRowBytes, k);
+                    break;
+                case 7:
+                    LinearINT8GROUP32_INT4GROUP32_AVX512VNNI_Rows<7>(
+                        inputData, weightRow, biasData, outputData, rowBase, out,
+                        groups, inputRowBytes, k);
+                    break;
+            }
+        }
         return true;
 #else
         return false;

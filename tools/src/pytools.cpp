@@ -511,7 +511,12 @@ extern "C" {
 #ifdef USE_ROCM
             model->SetDataType(fastllm::DataType::FLOAT32);
 #else
-            if (model->model_type == "glm_moe_dsa") {
+            if (model->model_type == "laguna") {
+                // Laguna's late-layer activations exceed the finite FP16
+                // range, so its automatic CUDA activation type must retain
+                // the checkpoint's BF16 exponent range.
+                model->SetDataType(fastllm::DataType::BFLOAT16);
+            } else if (model->model_type == "glm_moe_dsa") {
                 model->SetDataType(fastllm::DataType::FLOAT32);
             } else if (model->use_new_engine
                 || model->model_struct == "chatglm" 
@@ -558,8 +563,10 @@ extern "C" {
             model->SetKVCacheDataType(fastllm::DataType::FLOAT32);
         } else if (dtypeStr == "fp8" || dtypeStr == "float8" || dtypeStr == "fp8_e4m3") {
             model->SetKVCacheDataType(fastllm::DataType::FP8_E4M3);
+        } else if (dtypeStr == "turbo3" || dtypeStr == "turbo3_kv") {
+            model->SetKVCacheDataType(fastllm::DataType::TURBO3_KV);
         } else {
-            fastllm::ErrorInFastLLM("set_model_kv_cache_dtype error: kv_cache_dtype should be auto, float32, float16, bfloat16 or fp8_e4m3.");
+            fastllm::ErrorInFastLLM("set_model_kv_cache_dtype error: kv_cache_dtype should be auto, float32, float16, bfloat16, fp8_e4m3 or turbo3.");
         }
         return;
     }

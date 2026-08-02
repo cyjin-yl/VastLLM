@@ -163,6 +163,8 @@ namespace fastllm {
         bool enable_hash_id = false; // 给会话添加hash id
         bool add_special_tokens = true; // prompt添加special tokens（chatglm模型生效）
         std::multiset <int> stop_token_ids;
+        std::vector<std::vector<int>> stop_token_sequences;
+        std::vector<std::string> stop_strings;
         bool tool_call_name_constraint_enabled = false;
         std::vector <std::string> tool_call_allowed_names;
         std::vector <std::string> tool_call_invoke_name_prefixes;
@@ -306,6 +308,8 @@ namespace fastllm {
         BASE3_GROUP = 12, // 三元量化，-1 0 1
         INT32 = 13, // int32
         NVFP4 = 14, // packed fp4 e2m1 + compact e8m0 block scales
+        Q8_0_KV = 15, // KV cache: one fp16 scale + 32 int8 values per 32-value block
+        TURBO3_KV = 16, // TurboQuant KV: fp16 norm + packed 3-bit indices per 128-value block
         INT32PARAM = 100, // int32的参数，这种类型的数据永远存在CPU上
         FP8_E4M3_BLOCK_128 = 1000, // fp8e4m3, block = 128
         AWQ_4BIT_128 = 1001, // awq, bits = 4, group = 128
@@ -315,8 +319,13 @@ namespace fastllm {
         INT8_PERCHANNEL = 1005, // int8, per channel量化
         NVFP4_BLOCK_16 = 1006, // packed fp4 e2m1, blockM = 16, inline float scale per block
         NVFP4_BLOCK_16_E8M0 = 1007, // packed fp4 e2m1, blockM = 16, inline e8m0 scale per block
+        // Symmetric group-32 INT4. Four groups form one compact block:
+        // [up to 4 * 16 packed INT4 bytes] [the corresponding BF16 scales].
+        // The final partial block has no padding. The implicit zero point is 8.
+        INT4_GROUP32 = 1008,
         INF_INT8_PERCHANNEL = 2000, // 推理用的int8, per channel量化
         INF_INT8_GROUP128 = 2001, // 推理用的int8, per group量化，group = 128
+        INF_INT8_GROUP32 = 2002, // 推理用的int8, per group量化，group = 32
         DATA_GGUF_FORMAT = 9999, DATA_GGUF_FORMAT_END = 19999, // [DATA_GGUF_FORMAT, DATA_GGUF_FORMAT_END]之间为GGUF格式的数据，ggml_type = type - DATA_FFUF_FORMAT
         DATA_AUTO_NONE = 99999, DATA_AUTO_LINEAR, DATA_AUTO_EMBEDDING, DATA_AUTO_CONV,
         DATA_AUTO_SOURCE // auto keeps scaled FP8 source weights, otherwise uses FLOAT16
@@ -325,6 +334,35 @@ namespace fastllm {
     std::string GetDataTypeName(DataType type);
 
     size_t GetDataBytes(DataType type, size_t rows, size_t columns);
+    bool IsPackedKVCacheDataType(DataType type);
+    size_t GetKVCacheRowBytes(DataType type, size_t columns);
+    constexpr size_t INT4_GROUP32_GROUP_SIZE = 32;
+    constexpr size_t INT4_GROUP32_PACKED_BYTES = 16;
+    constexpr size_t INT4_GROUP32_BLOCK_GROUPS = 4;
+
+    // INT4_GROUP32 keeps four packed groups together before their four scales.
+    // These helpers also handle the final 1-3 group block without padding.
+    inline size_t GetInt4Group32DataOffset(size_t group, size_t groups) {
+        (void)groups;
+        const size_t block = group / INT4_GROUP32_BLOCK_GROUPS;
+        const size_t inBlock = group % INT4_GROUP32_BLOCK_GROUPS;
+        return block * INT4_GROUP32_BLOCK_GROUPS *
+                   (INT4_GROUP32_PACKED_BYTES + sizeof(uint16_t)) +
+               inBlock * INT4_GROUP32_PACKED_BYTES;
+    }
+
+    inline size_t GetInt4Group32ScaleOffset(size_t group, size_t groups) {
+        const size_t block = group / INT4_GROUP32_BLOCK_GROUPS;
+        const size_t inBlock = group % INT4_GROUP32_BLOCK_GROUPS;
+        const size_t blockBegin = block * INT4_GROUP32_BLOCK_GROUPS;
+        const size_t blockGroups = std::min(
+            INT4_GROUP32_BLOCK_GROUPS, groups - blockBegin);
+        return block * INT4_GROUP32_BLOCK_GROUPS *
+                   (INT4_GROUP32_PACKED_BYTES + sizeof(uint16_t)) +
+               blockGroups * INT4_GROUP32_PACKED_BYTES +
+               inBlock * sizeof(uint16_t);
+    }
+
     size_t GetNVFP4WeightBytes(size_t rows, size_t columns);
     size_t GetNVFP4ScaleBytes(size_t rows, size_t columns, int blockK, int blockM);
     size_t GetNVFP4StorageBytes(size_t rows, size_t columns, int blockK, int blockM);
@@ -861,7 +899,8 @@ namespace fastllm {
     void MergeMOE(const Data &input, const Data &index, const Data &score, std::vector <Data*> &weights, std::vector <Data*> &biass, 
                 Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
                 float sharedScale, Data &output, int layer = 0, MoeGateType gateType = MoeGateSwiglu,
-                bool expertParallel = false);
+                bool expertParallel = false, float swigluLimit = 0.0f,
+                bool deepSeekV4Mode = false);
 
     void FusedMOE(const Data &input, const Data &index, const Data &score,
                 Data &gate, Data &up, Data &down, Data &w1,

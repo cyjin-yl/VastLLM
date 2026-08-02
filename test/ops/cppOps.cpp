@@ -1,5 +1,6 @@
 #include "fastllm.h"
 #include "executor.h"
+#include "utils/utils.h"
 
 #include <algorithm>
 #include <chrono>
@@ -186,6 +187,51 @@ namespace {
             weight.Resize({out, in});
             weight.CreateFromOriData(fastllm::WeightType::LINEAR, fastllm::DataType::FLOAT32,
                                      (uint8_t *) fp32Weight.cpuData, nullptr, nullptr, groupCnt);
+            return;
+        }
+        if (weightType == "int4group32") {
+            constexpr int groupCnt = 32;
+            if (in % groupCnt != 0) {
+                throw std::runtime_error("int4group32 input features must be divisible by 32");
+            }
+            weight.dataType = fastllm::DataType::INT4_GROUP32;
+            weight.Resize({out, in});
+            weight.Allocate(true);
+            const int groups = in / groupCnt;
+            const size_t rowBytes = fastllm::GetDataBytes(
+                fastllm::DataType::INT4_GROUP32, 1, in);
+            const float *source = (const float*)fp32Weight.cpuData;
+            for (int row = 0; row < out; row++) {
+                uint8_t *rowData = weight.cpuData + (size_t)row * rowBytes;
+                for (int group = 0; group < groups; group++) {
+                    const float *sourceBlock = source +
+                        (size_t)row * in + group * groupCnt;
+                    float absMax = 0.0f;
+                    for (int column = 0; column < groupCnt; column++) {
+                        absMax = std::max(absMax, std::fabs(sourceBlock[column]));
+                    }
+                    uint8_t *block = rowData +
+                        fastllm::GetInt4Group32DataOffset(group, groups);
+                    const uint16_t scaleBits = fastllm::Float32ToBFloat16RNEBits(
+                        absMax == 0.0f ? 0.0f : absMax / 7.0f);
+                    std::memcpy(rowData +
+                                    fastllm::GetInt4Group32ScaleOffset(group, groups),
+                                &scaleBits, sizeof(scaleBits));
+                    const float scale = fastllm::BFloat16BitsToFloat32(scaleBits);
+                    for (int column = 0; column < groupCnt; column += 2) {
+                        auto quantize = [scale](float value) {
+                            if (scale == 0.0f) {
+                                return 8;
+                            }
+                            return std::max(0, std::min(15,
+                                (int)std::lround(value / scale) + 8));
+                        };
+                        const int high = quantize(sourceBlock[column]);
+                        const int low = quantize(sourceBlock[column + 1]);
+                        block[column / 2] = (uint8_t)((high << 4) | low);
+                    }
+                }
+            }
             return;
         }
         throw std::runtime_error("unsupported linear weight_type: " + weightType);
@@ -1133,7 +1179,7 @@ namespace {
                 params.Add("batch", "4", "batch size");
                 params.Add("in", "8", "input features");
                 params.Add("out", "6", "output features");
-                params.Add("weight_type", "float32", "weight datatype: float32 or int4group");
+                params.Add("weight_type", "float32", "weight datatype: float32, int4group, or int4group32");
                 params.Add("group_cnt", "128", "group size used by int4group quantization");
                 return params;
             },
@@ -1173,7 +1219,13 @@ namespace {
             },
             [](const OpTestParams &params) {
                 int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
-                return FloatBytes({batch, in}) + FloatBytes({out, in}) + FloatBytes({out}) + FloatBytes({batch, out});
+                double weightBytes = FloatBytes({out, in});
+                if (params.GetString("weight_type") == "int4group32") {
+                    weightBytes = (double)fastllm::GetDataBytes(
+                        fastllm::DataType::INT4_GROUP32, out, in);
+                }
+                return FloatBytes({batch, in}) + weightBytes +
+                       FloatBytes({out}) + FloatBytes({batch, out});
             },
             [](const OpTestParams &params) {
                 int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
@@ -2502,13 +2554,16 @@ namespace {
 
     struct FusedRouterTopKBenchState {
         int batch = 1;
+        int topk = 8;
         bool withBias = true;
         bool needNorm = true;
+        bool sigmoid = false;
         float routeScale = 1.0f;
         std::string path;
         fastllm::Data logits, bias;
         fastllm::Data fusedIndex, fusedScore;
-        fastllm::Data referenceLogits, referenceProb, referenceIndex, referenceScore;
+        fastllm::Data referenceLogits, referenceProb, referenceBias;
+        fastllm::Data referenceIndex, referenceScore;
 
         static void PrepareOutput(fastllm::Data &data, fastllm::DataType type,
                                   const std::vector<int> &dims) {
@@ -2521,15 +2576,24 @@ namespace {
 
         void RunReference() {
             fastllm::ToDataType(logits, referenceLogits, fastllm::DataType::FLOAT32);
-            fastllm::Softmax(referenceLogits, referenceProb, -1);
-            fastllm::SelectExpert(referenceProb, referenceIndex, referenceScore, 8,
-                                  needNorm, routeScale, withBias ? &bias : nullptr);
+            if (sigmoid) {
+                fastllm::Sigmoid(referenceLogits, referenceProb);
+            } else {
+                fastllm::Softmax(referenceLogits, referenceProb, -1);
+            }
+            fastllm::SelectExpert(referenceProb, referenceIndex, referenceScore, topk,
+                                  needNorm, routeScale,
+                                  withBias ? &referenceBias : nullptr);
         }
 
         void RunFused() {
-            bool ok = FastllmCudaFusedSoftmaxSelectExpert(
-                logits, withBias ? &bias : nullptr, fusedIndex, fusedScore,
-                8, needNorm, routeScale);
+            bool ok = sigmoid
+                ? FastllmCudaFusedSigmoidSelectExpert(
+                    logits, withBias ? &bias : nullptr, fusedIndex, fusedScore,
+                    topk, needNorm, routeScale)
+                : FastllmCudaFusedSoftmaxSelectExpert(
+                    logits, withBias ? &bias : nullptr, fusedIndex, fusedScore,
+                    topk, needNorm, routeScale);
             if (!ok) {
                 throw std::runtime_error("fused router top-k launch failed");
             }
@@ -2553,19 +2617,19 @@ namespace {
                         break;
                     }
                 }
-                size_t tokenStart = (mismatch / 8) * 8;
-                os << " expected_top8=";
-                for (size_t i = tokenStart; i < tokenStart + 8; i++) {
+                size_t tokenStart = (mismatch / topk) * topk;
+                os << " expected_topk=";
+                for (size_t i = tokenStart; i < tokenStart + topk; i++) {
                     os << (i == tokenStart ? "[" : ",") << expectedIndex[i];
                 }
-                os << "] actual_top8=";
-                for (size_t i = tokenStart; i < tokenStart + 8; i++) {
+                os << "] actual_topk=";
+                for (size_t i = tokenStart; i < tokenStart + topk; i++) {
                     os << (i == tokenStart ? "[" : ",") << actualIndex[i];
                 }
                 os << "] expected_prob=";
                 std::vector<float> referenceProbValues = ToFloatVector(referenceProb);
-                size_t probStart = (mismatch / 8) * 256;
-                for (size_t i = tokenStart; i < tokenStart + 8; i++) {
+                size_t probStart = (mismatch / topk) * 256;
+                for (size_t i = tokenStart; i < tokenStart + topk; i++) {
                     os << (i == tokenStart ? "[" : ",")
                        << referenceProbValues[probStart + expectedIndex[i]];
                 }
@@ -2578,7 +2642,8 @@ namespace {
             for (size_t i = 0; i < expectedScore.size(); i++) {
                 maxAbsDiff = std::max(maxAbsDiff, std::fabs(expectedScore[i] - actualScore[i]));
             }
-            if (maxAbsDiff > 0.0f) {
+            const float scoreTolerance = sigmoid ? 1.0e-6f : 0.0f;
+            if (maxAbsDiff > scoreTolerance) {
                 std::ostringstream os;
                 os << "fused router score mismatch: max_abs_diff=" << maxAbsDiff;
                 throw std::runtime_error(os.str());
@@ -2589,6 +2654,8 @@ namespace {
 #ifdef USE_CUDA
             FastllmCudaSetDevice(0);
             batch = params.GetInt("batch");
+            sigmoid = params.GetString("activation") == "sigmoid";
+            topk = sigmoid ? 10 : 8;
             withBias = params.GetInt("bias") != 0;
             needNorm = params.GetInt("norm") != 0;
             routeScale = params.GetFloat("route_scale");
@@ -2638,9 +2705,20 @@ namespace {
                 fp32Bias.CopyFrom(generated);
             }
             bias.CopyFrom(fp32Bias);
+            std::string biasType = params.GetString("bias_type");
+            if (biasType == "fp16") {
+                fastllm::ToDataType(bias, fastllm::DataType::FLOAT16);
+            } else if (biasType == "bf16") {
+                fastllm::ToDataType(bias, fastllm::DataType::BFLOAT16);
+            } else if (biasType != "fp32") {
+                throw std::runtime_error("bias_type must be fp16, bf16 or fp32");
+            }
+            referenceBias.CopyFrom(bias);
+            fastllm::ToDataType(referenceBias, fastllm::DataType::FLOAT32);
+            referenceBias.ToDevice(fastllm::DataDevice::CUDA);
             bias.ToDevice(fastllm::DataDevice::CUDA);
-            PrepareOutput(fusedIndex, fastllm::DataType::INT32, {batch, 8});
-            PrepareOutput(fusedScore, fastllm::DataType::FLOAT32, {batch, 8});
+            PrepareOutput(fusedIndex, fastllm::DataType::INT32, {batch, topk});
+            PrepareOutput(fusedScore, fastllm::DataType::FLOAT32, {batch, topk});
             Check();
 #else
             (void)params;
@@ -2691,11 +2769,13 @@ namespace {
     static OpCase MakeFusedRouterTopKCase() {
         return {
             "fused_router_topk",
-            "benchmark and validate fused softmax + SelectExpert top8/256",
+            "benchmark and validate fused softmax/sigmoid + SelectExpert for 256 experts",
             []() {
                 OpTestParams params;
                 params.Add("batch", "1", "token batch size");
                 params.Add("input_type", "fp16", "fp16, bf16 or fp32");
+                params.Add("bias_type", "fp32", "fp16, bf16 or fp32");
+                params.Add("activation", "softmax", "softmax/top8 or sigmoid/top10");
                 params.Add("bias", "1", "whether correction bias is present");
                 params.Add("norm", "1", "normalize selected probabilities");
                 params.Add("route_scale", "1.0", "router score scale");
