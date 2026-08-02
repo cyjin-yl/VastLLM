@@ -24,6 +24,12 @@ using RuntimeResultBatch = std::function<void(int index, std::vector <std::strin
 namespace fastllm {
     using ChatMessages = std::vector <std::pair <std::string, std::string> >;
 
+    struct MultimodalImage {
+        int width = 0;
+        int height = 0;
+        std::vector<float> rgb;
+    };
+
     enum ResponseContextError {
         ResponseContextErrorNone = 0, ResponseContextErrorPromptTooLong
     };
@@ -191,6 +197,51 @@ namespace fastllm {
 
     DataType ParseKVCacheDataType(const std::string &value);
 
+    struct ModelResponseContextCpuState {
+        virtual ~ModelResponseContextCpuState() = default;
+    };
+
+    struct CacheCpuSnapshot {
+        bool valid = false;
+        bool paged = false;
+        bool empty = false;
+        CacheSnapshotMetadata metadata;
+        PagedCacheCpuSnapshot pagedData;
+        Data tensorData;
+    };
+
+    struct ResponseContextCpuSnapshot {
+        uint64_t ticket = 0;
+        uint64_t suspendedAtMilliseconds = 0;
+        bool zstdAttempted = false;
+        bool diskSpillAttempted = false;
+        std::mutex storageMutex;
+        size_t contextTokens = 0;
+        int generatedTokens = 0;
+        size_t hostBytes = 0;
+        std::vector<std::pair<CacheCpuSnapshot, CacheCpuSnapshot> > caches;
+        std::unique_ptr<ModelResponseContextCpuState> modelState;
+    };
+    ResponseContext *SelectCpuRequestSwapVictim(
+        const std::vector<std::pair<int, ResponseContext*> > &candidates,
+        const ResponseContext *excluded);
+    bool CpuRequestSwapQuantumExpired(
+        int resumedGeneratedTokens,
+        int currentGeneratedTokens,
+        int quantumTokens,
+        size_t suspendedRequests);
+    bool CpuRequestSwapShouldSpillToDisk(
+        size_t tokens,
+        size_t storedBytes,
+        size_t minTokens,
+        size_t minBytes,
+        double diskReadMegabytesPerSecond,
+        double recomputeTokensPerSecond);
+    double UpdateCpuRequestSwapDiskReadRate(
+        double previousMegabytesPerSecond,
+        size_t bytes,
+        double seconds);
+
     class basellm {
     public:
         basellm() {};
@@ -246,6 +297,10 @@ namespace fastllm {
 
         // 模型可延迟部分 special weight 的 CUDA 加载，例如先在 CPU 上合成 fused 权重。
         virtual bool ShouldDelaySpecialWeightCudaMove(const std::string &weightName) const { return false; }
+
+        // special weight 默认跟随 MoE 设备映射；同时包含非 MoE TP 权重的模型可覆盖此选择。
+        virtual std::string SelectSpecialWeightDevice(const std::string &weightName,
+                                                      int layerId) const;
 
         // 推理
         virtual int Forward(
@@ -310,6 +365,14 @@ namespace fastllm {
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <std::vector <float>*> *logits = nullptr);
 
+        virtual std::string GetImagePlaceholder() const;
+
+        virtual bool PrepareMultimodalImageInputs(
+                std::string &prompt,
+                const std::vector<MultimodalImage> &images,
+                std::map<std::string, std::vector<Data*> > &multimodalInput,
+                std::string &error) const;
+
         // 是否需要生成AttentionMask
         virtual bool NeedAttentionMask(int qlen, int klen);
 
@@ -372,6 +435,12 @@ namespace fastllm {
             return -1;
         }
 
+        // Some direct GPU paths keep the page ids of logically bounded caches
+        // aligned with token-growing layers (for example during CUDA Graph
+        // replay).  Such caches must be charged as token-growing storage even
+        // though attention and the generic path still use a bounded tail.
+        virtual bool BoundedKVCacheUsesTokenGrowingStorage() const { return false; }
+
         virtual bool ShouldEnforceAutoWarmupRuntimeBatchLimit() const { return false; }
 
         virtual void WarmupCudaRuntimeBuffers(int batch) {}
@@ -404,6 +473,57 @@ namespace fastllm {
         virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context);
         virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const;
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const;
+
+        // Generic request-state tiering owns pastKeyValues and delegates only
+        // model-private state (for example speculative caches) to these hooks.
+        virtual bool CanSuspendResponseContextToCpu(
+            const ResponseContext *context,
+            std::string *error) const;
+        virtual bool CaptureResponseContextExtraCpuState(
+            ResponseContext *context,
+            std::unique_ptr<ModelResponseContextCpuState> &state,
+            size_t &hostBytes,
+            std::string *error);
+        virtual bool RestoreResponseContextExtraCpuState(
+            ResponseContext *context,
+            const ModelResponseContextCpuState *state,
+            std::string *error);
+        virtual void ClearResponseContextExtraDeviceState(
+            ResponseContext *context) noexcept;
+
+        bool IsCpuRequestSwapEnabled() const;
+        int GetCpuRequestSwapQuantumTokens() const;
+        bool SuspendResponseContextToCpu(
+            ResponseContext *context,
+            std::string *error = nullptr);
+        bool RestoreResponseContextFromCpu(
+            ResponseContext *context,
+            std::string *error = nullptr);
+        bool IsResponseContextSuspended(
+            const ResponseContext *context) const;
+        ResponseContext *GetOldestSuspendedResponseContext() const;
+        size_t GetSuspendedResponseContextCount() const;
+        void EraseResponseContextCpuSnapshot(ResponseContext *context);
+        bool IsCpuRequestSwapZstdEnabled() const;
+        size_t CompressColdResponseContextCpuSnapshots();
+        void ScheduleColdResponseContextCpuSnapshotTiering();
+        bool IsCpuRequestSwapDiskEnabled() const;
+        size_t SpillColdResponseContextCpuSnapshotsToDisk();
+        uint64_t GetCpuRequestSwapDiskWriteBytes() const {
+            return responseContextCpuSnapshotDiskWriteBytes.load();
+        }
+        uint64_t GetCpuRequestSwapDiskReadBytes() const {
+            return responseContextCpuSnapshotDiskReadBytes.load();
+        }
+        uint64_t GetCpuRequestSwapDiskSpillCount() const {
+            return responseContextCpuSnapshotDiskSpillCount.load();
+        }
+        uint64_t GetCpuRequestSwapDiskRestoreCount() const {
+            return responseContextCpuSnapshotDiskRestoreCount.load();
+        }
+        double GetCpuRequestSwapDiskReadMegabytesPerSecond() const {
+            return responseContextCpuSnapshotDiskReadMiBPerSecond.load();
+        }
 
         virtual void PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig);
 
@@ -517,6 +637,33 @@ namespace fastllm {
         std::map <std::string, Data*> deviceSinDatas, deviceCosDatas; // deviceSinDatas[xxx]代表xxx设备上的sinData
 
         ResponseContextDict responseContextDict;
+        mutable std::mutex responseContextCpuSnapshotMutex;
+        std::unordered_map<
+            ResponseContext*,
+            std::shared_ptr<ResponseContextCpuSnapshot> >
+                responseContextCpuSnapshots;
+        std::atomic<uint64_t> responseContextCpuSnapshotTicket{0};
+        std::atomic<uint64_t>
+            responseContextCpuSnapshotLastZstdScanMilliseconds{0};
+        std::atomic<uint64_t>
+            responseContextCpuSnapshotLastDiskScanMilliseconds{0};
+        std::atomic<uint64_t>
+            responseContextCpuSnapshotDiskWriteBytes{0};
+        std::atomic<uint64_t>
+            responseContextCpuSnapshotDiskReadBytes{0};
+        std::atomic<uint64_t>
+            responseContextCpuSnapshotDiskSpillCount{0};
+        std::atomic<uint64_t>
+            responseContextCpuSnapshotDiskRestoreCount{0};
+        std::atomic<double>
+            responseContextCpuSnapshotDiskReadMiBPerSecond{0.0};
+        std::mutex responseContextCpuSnapshotDiskDirectoryMutex;
+        std::string responseContextCpuSnapshotDiskSessionDirectory;
+        int responseContextCpuSnapshotDiskSessionLockFd = -1;
+        std::atomic<bool>
+            responseContextCpuSnapshotColdTierWorkerRunning{false};
+        std::mutex responseContextCpuSnapshotColdTierThreadMutex;
+        std::thread responseContextCpuSnapshotColdTierThread;
 
         void RemoveResponseContext(int handleId);
 
@@ -568,6 +715,10 @@ namespace fastllm {
 
         // 分块 prefill 的切片大小（首块与后续块相同）；-1 表示使用模型默认
         int chunkedPrefillSize = -1;
+
+        // 由调度器在 long-prefill 的非末切片前向期间设置。支持该优化的
+        // 模型可据此只更新 KV/线性状态，省去不会被消费的 lm_head 和采样。
+        bool isIntermediateChunkedPrefill = false;
 
         int defaultChunkedPrefillSize = 8192;
 

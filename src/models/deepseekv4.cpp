@@ -33,6 +33,8 @@
 #include <cctype>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <stdexcept>
 #include <thread>
 #include <tuple>
 #include <atomic>
@@ -114,9 +116,18 @@ namespace fastllm {
             return v == nullptr ? fallback : atoi(v);
         }
 
+        static bool DeepSeekV4DeviceSpecUsesType(const std::string &deviceSpec,
+                                                 const std::string &deviceType) {
+            std::string normalized = deviceSpec;
+            std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                           [](unsigned char c) { return (char)std::tolower(c); });
+            return normalized == deviceType ||
+                   normalized.rfind(deviceType + ":", 0) == 0;
+        }
+
         static bool DeepSeekV4DeviceMapUsesMultiCuda(const std::map<std::string, int> &deviceMap) {
             for (const auto &it : deviceMap) {
-                if (it.first == "multicuda" || it.first.rfind("multicuda:", 0) == 0) {
+                if (DeepSeekV4DeviceSpecUsesType(it.first, "multicuda")) {
                     return true;
                 }
             }
@@ -224,6 +235,18 @@ namespace fastllm {
             destination.Resize(source.dims);
             destination.Allocate(false);
             FastllmCudaSetDevice(device);
+            // Persistent tensor-parallel operators publish their results from
+            // per-device worker streams.  RunMultiCudaDeviceOps wires those
+            // completion events into the caller's per-thread stream, but the
+            // synchronous cudaMemcpy used below runs on CUDA's legacy copy
+            // path and does not reliably observe that stream dependency.
+            // Finish the caller stream explicitly before handing routing data
+            // to the NUMA MoE implementation.
+            if (MultiCudaCurrentThreadWaitForWorker(device)) {
+                FastllmCudaSyncCurrentThreadStream();
+            } else {
+                FastllmCudaSyncDevice(device);
+            }
             FastllmCudaCopyFromDeviceToHost(
                 destination.cpuData, replica->cudaData,
                 destination.GetBytes());
@@ -264,6 +287,51 @@ namespace fastllm {
                 }
             }
             return devices;
+        }
+
+        static std::vector<int> GetDeepSeekV4TensorParallelDevices(
+                const std::map<std::string, int> &deviceMap) {
+            std::vector<int> devices;
+            if (!DeepSeekV4DeviceMapUsesMultiCuda(deviceMap)) {
+                return devices;
+            }
+            std::map<int, int> ratios;
+            FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+            return devices;
+        }
+
+        static void SelectDeepSeekV4TensorParallelRoot(
+                const std::map<std::string, int> &deviceMap) {
+            std::vector<int> devices = GetDeepSeekV4TensorParallelDevices(deviceMap);
+            if (!devices.empty()) {
+                FastllmCudaSetDevice(devices.front());
+            }
+        }
+
+        static void SynchronizeDeepSeekV4TensorParallelDevices(
+                const std::map<std::string, int> &deviceMap) {
+            std::vector<int> devices = GetDeepSeekV4TensorParallelDevices(deviceMap);
+            if (devices.empty()) {
+                ForceDeviceSync();
+                return;
+            }
+            for (int device : devices) {
+                FastllmCudaSetDevice(device);
+                // cudaDeviceSynchronize only observes work that a worker has
+                // already submitted.  Persistent MultiCUDA operators publish
+                // a completion event from the worker stream, so first attach
+                // that event to this thread's stream and wait for it here.
+                // This is required at cache snapshot/restore boundaries where
+                // the producer workspace can otherwise be reused too early.
+                if (MultiCudaCurrentThreadWaitForWorker(device)) {
+                    FastllmCudaSyncCurrentThreadStream();
+                }
+                FastllmCudaSyncDevice(device);
+            }
+            // A chunked prefill recursively enters ForwardBatch again.  Keep its
+            // embedding/root allocation deterministic even if a cache helper's
+            // final local operation ran on the last TP rank.
+            FastllmCudaSetDevice(devices.front());
         }
 #endif
 
@@ -676,11 +744,65 @@ namespace fastllm {
             return {FastllmCudaGetDevice()};
         }
 
+        static void PublishReplicatedCudaRootMetadata(
+                Data &data, const std::vector<int> &devices,
+                bool releaseRootPayload) {
+            if (!data.multiDeviceData || !data.IsTensorParallelReplicated() ||
+                devices.empty()) {
+                return;
+            }
+            Data *first = nullptr;
+            for (int device : devices) {
+                auto it = data.multiDeviceDatas.find(device);
+                if (it != data.multiDeviceDatas.end() && it->second != nullptr) {
+                    first = it->second;
+                    break;
+                }
+            }
+            AssertInFastLLM(first != nullptr,
+                            "DeepSeek V4 replicated CUDA tensor has no local metadata.\n");
+            if (releaseRootPayload) {
+                // Once every rank owns an independent copy, the root is metadata
+                // only.  Keeping the restored CPU allocation here is unsafe: its
+                // 128-row backing store becomes stale as the local tensors expand
+                // to 256 rows and later generic layout checks may treat that CPU
+                // pointer as a valid source for the enlarged logical tensor.
+                data.FreeSpace();
+            }
+            data.dataType = first->dataType;
+            data.UpdateUnitSize();
+            data.dims = first->dims;
+            data.strides = first->strides;
+            data.expansionDims = first->expansionDims;
+            data.expansionSize = first->expansionSize;
+            data.expansionBytes = first->expansionBytes;
+            data.dataDevice = DataDevice::CUDA;
+            data.dataDeviceIds = devices;
+            data.tpLayout = TP_LAYOUT_REPLICATED;
+            data.tpAxis = -1;
+            data.tpGlobalDims = data.dims;
+        }
+
         static void EnsureTensorOnSameCudaDevice(Data &data, const Data &reference) {
             if (!DeepSeekV4PreferCuda() || reference.dataDevice != DataDevice::CUDA ||
                 !HasTensorData(data)) {
                 return;
             }
+            if (reference.multiDeviceData && reference.IsTensorParallelReplicated()) {
+                std::vector<int> devices = GetReplicatedCudaDevices(reference);
+                if (!devices.empty()) {
+                    // Prefix-cache restoration keeps one CPU/GPU payload to
+                    // avoid storing an identical snapshot per TP rank.  Before
+                    // a cache update, recreate the replicated physical layout
+                    // of the new KV tensor; otherwise executor device selection
+                    // can fall back to the CPU op with CUDA-only input buffers.
+                    data.lockInCPU = false;
+                    PrepareMultiCudaReplicatedData(data, devices, true);
+                    PublishReplicatedCudaRootMetadata(data, devices, true);
+                    return;
+                }
+            }
+            data.lockInCPU = false;
             data.ToDevice(DataDevice::CUDA, GetCudaDeviceIdsForData(reference));
         }
 #endif
@@ -692,6 +814,7 @@ namespace fastllm {
             }
 #ifdef USE_CUDA
             if (src.multiDeviceData) {
+                const int originalDevice = FastllmCudaGetDevice();
                 std::vector<int> devices;
                 for (const auto &it : src.multiDeviceDatas) {
                     if (it.second != nullptr) {
@@ -712,8 +835,25 @@ namespace fastllm {
                     Data *dstLocal = dst.multiDeviceDatas.at(device);
                     FastllmCudaSetDevice(device);
                     dstLocal->dataType = srcLocal->dataType;
+                    dstLocal->UpdateUnitSize();
                     dstLocal->Resize(srcLocal->dims);
-                    dstLocal->Allocate(false);
+                    if (!srcLocal->expansionDims.empty() &&
+                        srcLocal->expansionSize > 0) {
+                        // KV-cache tensors keep a small logical shape inside a
+                        // much larger strided backing allocation.  GetBytes()
+                        // follows those expanded strides, so allocating only
+                        // the logical shape before the copy corrupts the next
+                        // CUDA allocation (typically the residual prefill
+                        // workspace after a 256-token prefix snapshot).
+                        dstLocal->strides = srcLocal->strides;
+                        dstLocal->expansionDims = srcLocal->expansionDims;
+                        dstLocal->MallocSpace(srcLocal->expansionSize, false);
+                    } else {
+                        dstLocal->Allocate(false);
+                    }
+                    AssertInFastLLM(
+                        dstLocal->expansionBytes >= srcLocal->GetBytes(),
+                        "DeepSeek V4 cache snapshot allocation is smaller than its source layout.\n");
                     if (srcLocal->cudaData != nullptr) {
                         FastllmCudaCopyFromDeviceToDevice(dstLocal->cudaData, srcLocal->cudaData,
                                                          srcLocal->GetBytes());
@@ -721,15 +861,82 @@ namespace fastllm {
                         memcpy(dstLocal->cpuData, srcLocal->cpuData, srcLocal->GetBytes());
                     }
                 }
+                dst.strides = src.strides;
+                dst.expansionDims = src.expansionDims;
+                dst.expansionSize = src.expansionSize;
+                dst.expansionBytes = src.expansionBytes;
+                PublishReplicatedCudaRootMetadata(dst, devices, false);
+                FastllmCudaSetDevice(originalDevice);
                 return;
             }
 #endif
             Copy(src, dst);
         }
 
+        static void CopyHistoryTensorData(Data &dst, const Data &src) {
+            ResetData(dst);
+            if (!HasTensorData(src)) {
+                return;
+            }
+
+            const Data *payload = &src;
+#ifdef USE_CUDA
+            if (src.multiDeviceData) {
+                payload = nullptr;
+                for (const auto &it : src.multiDeviceDatas) {
+                    if (it.second != nullptr &&
+                        (it.second->cudaData != nullptr || it.second->cpuData != nullptr)) {
+                        payload = it.second;
+                        break;
+                    }
+                }
+                AssertInFastLLM(payload != nullptr,
+                                "DeepSeek V4 history snapshot has no replicated payload.\n");
+            }
+#endif
+
+            dst.dataType = payload->dataType;
+            dst.UpdateUnitSize();
+            dst.Resize(payload->dims);
+            dst.dataDevice = DataDevice::CPU;
+            dst.dataDeviceIds.clear();
+            if (!payload->expansionDims.empty() && payload->expansionSize > 0) {
+                dst.strides = payload->strides;
+                dst.expansionDims = payload->expansionDims;
+                dst.MallocSpace(payload->expansionSize, false);
+            } else {
+                dst.Allocate(false);
+            }
+            AssertInFastLLM(dst.expansionBytes >= payload->GetBytes(),
+                            "DeepSeek V4 CPU history snapshot allocation is too small.\n");
+
+            if (payload->cpuData != nullptr) {
+                memcpy(dst.cpuData, payload->cpuData, payload->GetBytes());
+            }
+#ifdef USE_CUDA
+            else if (payload->cudaData != nullptr) {
+                const int originalDevice = FastllmCudaGetDevice();
+                int sourceDevice = GetPointerDeviceId(payload->cudaData);
+                AssertInFastLLM(sourceDevice >= 0,
+                                "DeepSeek V4 history snapshot has an invalid CUDA pointer.\n");
+                FastllmCudaSetDevice(sourceDevice);
+                FastllmCudaCopyFromDeviceToHost(dst.cpuData, payload->cudaData,
+                                                payload->GetBytes());
+                FastllmCudaSetDevice(originalDevice);
+            }
+#endif
+            else {
+                ErrorInFastLLM("DeepSeek V4 history snapshot has no readable payload.\n");
+            }
+            dst.isKVCache = payload->isKVCache;
+            dst.lockInCPU = true;
+            dst.ClearTensorParallelLayout();
+        }
+
         static void CatDirectTensor(Data &dst, const Data &src, int axis) {
 #ifdef USE_CUDA
             if (dst.multiDeviceData && src.multiDeviceData) {
+                const int originalDevice = FastllmCudaGetDevice();
                 for (auto &it : dst.multiDeviceDatas) {
                     int device = it.first;
                     auto srcIt = src.multiDeviceDatas.find(device);
@@ -740,9 +947,14 @@ namespace fastllm {
                     DoCudaCatDirect(*it.second, *srcIt->second, axis);
                 }
                 Data *first = dst.multiDeviceDatas.begin()->second;
-                dst.Resize(first->dims);
-                dst.tpGlobalDims = dst.dims;
-                dst.expansionDims = first->expansionDims;
+                (void)first;
+                std::vector<int> devices;
+                devices.reserve(dst.multiDeviceDatas.size());
+                for (const auto &local : dst.multiDeviceDatas) {
+                    devices.push_back(local.first);
+                }
+                PublishReplicatedCudaRootMetadata(dst, devices, false);
+                FastllmCudaSetDevice(originalDevice);
                 return;
             }
             if (!dst.multiDeviceData && src.multiDeviceData) {
@@ -753,8 +965,10 @@ namespace fastllm {
                 AssertInFastLLM(srcIt != src.multiDeviceDatas.end() && srcIt->second != nullptr &&
                                 srcIt->second->cudaData != nullptr,
                                 "DeepSeek V4 cache append is missing the source replica on the target device.\n");
+                const int originalDevice = FastllmCudaGetDevice();
                 FastllmCudaSetDevice(device);
                 DoCudaCatDirect(dst, *srcIt->second, axis);
+                FastllmCudaSetDevice(originalDevice);
                 return;
             }
 #endif
@@ -789,12 +1003,14 @@ namespace fastllm {
             newDims[1] = targetCapacity;
 #ifdef USE_CUDA
             if (data.multiDeviceData) {
+                std::vector<int> devices;
                 for (auto &it : data.multiDeviceDatas) {
                     if (it.second != nullptr) {
+                        devices.push_back(it.first);
                         EnsureCompressorRawCapacity(*it.second, targetLen);
                     }
                 }
-                data.expansionDims = newDims;
+                PublishReplicatedCudaRootMetadata(data, devices, false);
                 return;
             }
 #endif
@@ -1029,21 +1245,27 @@ namespace fastllm {
             (void)headDim;
 #ifdef USE_CUDA
             EnsureTensorOnSameCudaDevice(windowKV, kv);
-            if (decodeMeta != nullptr && decodeMeta->multiDeviceData &&
-                kv.multiDeviceData && windowKV.multiDeviceData &&
-                kv.IsTensorParallelReplicated() &&
-                windowKV.IsTensorParallelReplicated()) {
+            if (kv.multiDeviceData && kv.IsTensorParallelReplicated()) {
                 std::vector<int> devices = GetReplicatedCudaDevices(kv);
+                if (!windowKV.multiDeviceData ||
+                    !windowKV.IsTensorParallelReplicated()) {
+                    PrepareMultiCudaReplicatedData(windowKV, devices, true);
+                }
                 std::vector<char> ok(devices.size(), 0);
                 std::function<void(int, int)> task = [&](int rank, int device) {
                     const Data *localKV = GetTensorCudaReplica(kv, device);
                     Data *localWindow = GetTensorCudaReplica(windowKV, device);
-                    const Data *localMeta = GetTensorCudaReplica(*decodeMeta, device);
-                    if (localKV != nullptr && localWindow != nullptr &&
-                        localMeta != nullptr) {
-                        ok[rank] = FastllmCudaDeepSeekV4UpdateWindowKVCacheGraph(
-                            *localKV, (const int32_t*)localMeta->cudaData,
-                            windowSize, *localWindow);
+                    const Data *localMeta = decodeMeta == nullptr ? nullptr :
+                        GetTensorCudaReplica(*decodeMeta, device);
+                    if (localKV != nullptr && localWindow != nullptr) {
+                        if (localMeta != nullptr) {
+                            ok[rank] = FastllmCudaDeepSeekV4UpdateWindowKVCacheGraph(
+                                *localKV, (const int32_t*)localMeta->cudaData,
+                                windowSize, *localWindow);
+                        } else if (decodeMeta == nullptr) {
+                            ok[rank] = FastllmCudaDeepSeekV4UpdateWindowKVCache(
+                                *localKV, startPos, windowSize, *localWindow);
+                        }
                     }
                 };
                 if (!devices.empty() &&
@@ -1053,6 +1275,8 @@ namespace fastllm {
                     return;
                 }
                 FastllmCudaSetThreadError();
+                ErrorInFastLLM(
+                    "DeepSeekV4UpdateWindowKVCache: replicated CUDA update failed.\n");
             }
             if (decodeMeta != nullptr && decodeMeta->dataDevice == DataDevice::CUDA &&
                 decodeMeta->cudaData != nullptr &&
@@ -1075,6 +1299,47 @@ namespace fastllm {
             }
             ScopedExecutorProfiler executorProfile("DeepSeekV4KVCache");
 #ifdef USE_CUDA
+            if (DeepSeekV4PreferCuda() && windowKV.multiDeviceData &&
+                windowKV.IsTensorParallelReplicated()) {
+                std::vector<int> devices = GetReplicatedCudaDevices(windowKV);
+                ResetData(output);
+                output.dataType = DataType::FLOAT32;
+                output.UpdateUnitSize();
+                output.Resize({bsz, prefixLen, headDim});
+                output.dataDevice = DataDevice::CUDA;
+                output.dataDeviceIds = devices;
+                PrepareMultiCudaReplicatedData(output, devices, false);
+
+                std::vector<char> ok(devices.size(), 0);
+                std::function<void(int, int)> task = [&](int rank, int device) {
+                    const Data *localWindow =
+                        GetTensorCudaReplica(windowKV, device);
+                    auto outputIt = output.multiDeviceDatas.find(device);
+                    Data *localOutput = outputIt == output.multiDeviceDatas.end() ?
+                        nullptr : outputIt->second;
+                    if (localWindow != nullptr && localOutput != nullptr) {
+                        ok[rank] = FastllmCudaDeepSeekV4BuildWindowKVPrefix(
+                            *localWindow, startPos, windowSize, prefixLen,
+                            *localOutput);
+                    }
+                };
+                if (!devices.empty() &&
+                    MultiCudaRunDeviceCallbacks(devices, task) &&
+                    std::all_of(ok.begin(), ok.end(),
+                                [](char state) { return state != 0; })) {
+                    Data *first = output.multiDeviceDatas.at(devices.front());
+                    output.Resize(first->dims);
+                    output.strides = first->strides;
+                    output.expansionDims = first->expansionDims;
+                    output.expansionSize = first->expansionSize;
+                    output.expansionBytes = first->expansionBytes;
+                    output.tpGlobalDims = output.dims;
+                    return prefixLen;
+                }
+                FastllmCudaSetThreadError();
+                ErrorInFastLLM(
+                    "DeepSeekV4BuildWindowKVPrefix: replicated CUDA build failed.\n");
+            }
             if (DeepSeekV4PreferCuda() && windowKV.dataDevice == DataDevice::CUDA &&
                 FastllmCudaDeepSeekV4BuildWindowKVPrefix(windowKV, startPos, windowSize, prefixLen, output)) {
                 return prefixLen;
@@ -1127,6 +1392,21 @@ namespace fastllm {
                 EnsureCompressorRawCapacity(allScore, score.dims[1]);
                 return;
             }
+#ifdef USE_CUDA
+            // History snapshots intentionally retain a single CPU copy of the
+            // compressor tail.  A TP cache hit resumes with replicated CUDA
+            // projections, so restore the cached destination on every rank
+            // before CatDirect.  Otherwise the first compressed-attention
+            // layer attempts to append a CUDA replica to CPU storage.
+            if (!allKV.multiDeviceData &&
+                allKV.dataDevice == DataDevice::CPU) {
+                EnsureTensorOnSameCudaDevice(allKV, kv);
+            }
+            if (!allScore.multiDeviceData &&
+                allScore.dataDevice == DataDevice::CPU) {
+                EnsureTensorOnSameCudaDevice(allScore, score);
+            }
+#endif
             EnsureCompressorRawCapacity(allKV, oldLen + kv.dims[1]);
             EnsureCompressorRawCapacity(allScore, oldLen + score.dims[1]);
             CatDirectTensor(allKV, kv, 1);
@@ -1515,7 +1795,8 @@ namespace fastllm {
                                              int bsz, int rawTokenBase, int totalLen, int compressRatio,
                                              int headDim, int ropeDim, float ropeBase,
                                              float ropeFactor, int betaFast, int betaSlow,
-                                             int originalSeqLen, Data &output, bool preferCudaOutput = false) {
+                                             int originalSeqLen, Data &output,
+                                             bool preferCudaOutput = false) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4BuildCompressedKV");
             if (compressRatio <= 0 || totalLen < compressRatio) {
                 return false;
@@ -2441,26 +2722,36 @@ namespace fastllm {
                                         const std::vector<int> &inputIds, int nRoutedExperts,
                                         int topk, const std::string &scoreFunc, float routeScale,
                                         Data &expertIndex, Data &expertScore,
-                                        const Data *decodeMeta = nullptr) {
+                                        const Data *decodeMeta = nullptr,
+                                        const DeepSeekV4ExpertAllowList *expertPolicy = nullptr,
+                                        Data *hashRouteTable = nullptr) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4RouteScore");
             Data xFloat, routerLogits;
             ToDataType(x, xFloat, DataType::FLOAT32);
             Linear(xFloat, weight[prefix + ".gate.weight"], Data(), routerLogits, true);
 
 #ifdef USE_CUDA
-            bool hashRoutingForCuda = weight.weight.find(prefix + ".gate.tid2eid") != weight.weight.end();
+            const bool restrictedExperts =
+                expertPolicy != nullptr && expertPolicy->configured;
+            bool hashRoutingForCuda = hashRouteTable != nullptr ||
+                weight.weight.find(prefix + ".gate.tid2eid") != weight.weight.end();
+            Data *effectiveCudaHashRouteTable = hashRouteTable;
+            if (effectiveCudaHashRouteTable == nullptr && hashRoutingForCuda) {
+                effectiveCudaHashRouteTable = &weight[prefix + ".gate.tid2eid"];
+            }
             if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_ROUTE") && hashRoutingForCuda &&
                 routerLogits.dataDevice == DataDevice::CUDA && routerLogits.dataType == DataType::FLOAT32 &&
                 inputIds.size() >= (size_t)x.dims[0]) {
                 int scoreFuncMode = scoreFunc == "softmax" ? 0 : (scoreFunc == "sigmoid" ? 1 : 2);
-                if (DeepSeekV4HashRouteScoreMultiCuda(routerLogits, weight[prefix + ".gate.tid2eid"],
+                if (DeepSeekV4HashRouteScoreMultiCuda(routerLogits, *effectiveCudaHashRouteTable,
                                                       inputIds.data(), x.dims[0], topk,
                                                       scoreFuncMode, routeScale,
                                                       expertIndex, expertScore, decodeMeta)) {
                     return;
                 }
             }
-            if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_ROUTE") && !hashRoutingForCuda &&
+            if (!restrictedExperts &&
+                !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_ROUTE") && !hashRoutingForCuda &&
                 routerLogits.dataDevice == DataDevice::CUDA && routerLogits.dataType == DataType::FLOAT32) {
                 int scoreFuncMode = scoreFunc == "softmax" ? 0 : (scoreFunc == "sigmoid" ? 1 : 2);
                 Data *gateBiasData = nullptr;
@@ -2477,12 +2768,17 @@ namespace fastllm {
 #endif
             auto rawScores = ReadFloatData(routerLogits);
 
-            bool hashRouting = weight.weight.find(prefix + ".gate.tid2eid") != weight.weight.end();
+            bool hashRouting = hashRouteTable != nullptr ||
+                weight.weight.find(prefix + ".gate.tid2eid") != weight.weight.end();
+            Data *effectiveHashRouteTable = hashRouteTable;
+            if (effectiveHashRouteTable == nullptr && hashRouting) {
+                effectiveHashRouteTable = &weight[prefix + ".gate.tid2eid"];
+            }
             std::shared_ptr<const std::vector<float>> tid2eidPtr, gateBiasPtr;
             const std::vector<float> *tid2eid = nullptr;
             const std::vector<float> *gateBias = nullptr;
             if (hashRouting) {
-                tid2eidPtr = ReadWeightFloatDataCached(weight[prefix + ".gate.tid2eid"]);
+                tid2eidPtr = ReadWeightFloatDataCached(*effectiveHashRouteTable);
                 tid2eid = tid2eidPtr.get();
             } else if (weight.weight.find(prefix + ".gate.bias") != weight.weight.end()) {
                 gateBiasPtr = ReadWeightFloatDataCached(weight[prefix + ".gate.bias"]);
@@ -2490,9 +2786,20 @@ namespace fastllm {
             }
 
             int tokens = x.dims[0];
-            std::vector<int> indices((uint64_t)tokens * topk);
-            std::vector<float> weights((uint64_t)tokens * topk);
+            std::vector<int> indices;
+            std::vector<float> weights;
+            if (!hashRouting) {
+                SelectDeepSeekV4AllowedExperts(
+                    rawScores, tokens, nRoutedExperts, topk, scoreFunc,
+                    routeScale, gateBias, expertPolicy, indices, weights);
+                WriteIntData(indices, {tokens, topk}, expertIndex);
+                WriteFloatData(weights, {tokens, topk}, expertScore,
+                               DataType::FLOAT32);
+                return;
+            }
 
+            indices.resize((uint64_t)tokens * topk);
+            weights.resize((uint64_t)tokens * topk);
             for (int t = 0; t < tokens; t++) {
                 std::vector<float> originalScores(nRoutedExperts);
                 if (scoreFunc == "softmax") {
@@ -2512,42 +2819,42 @@ namespace fastllm {
                 } else {
                     for (int e = 0; e < nRoutedExperts; e++) {
                         float raw = rawScores[(uint64_t)t * nRoutedExperts + e];
-                        originalScores[e] = (scoreFunc == "sigmoid") ? SigmoidFloat(raw) : std::sqrt(SoftplusFloat(raw));
+                        originalScores[e] = (scoreFunc == "sigmoid")
+                            ? SigmoidFloat(raw)
+                            : std::sqrt(SoftplusFloat(raw));
                     }
                 }
 
                 std::vector<int> curIndices(topk);
-                auto selectByScore = [&]() {
-                    std::vector<float> selectScores = originalScores;
-                    if (gateBias != nullptr) {
-                        for (int e = 0; e < nRoutedExperts; e++) {
-                            selectScores[e] += (*gateBias)[e];
-                        }
-                    }
-                    for (int k = 0; k < topk; k++) {
-                        int best = 0;
-                        float bestScore = -std::numeric_limits<float>::infinity();
-                        for (int e = 0; e < nRoutedExperts; e++) {
-                            if (selectScores[e] > bestScore) {
-                                bestScore = selectScores[e];
-                                best = e;
-                            }
-                        }
-                        curIndices[k] = best;
-                        selectScores[best] = -std::numeric_limits<float>::infinity();
-                    }
-                };
-                bool useHashRow = hashRouting && inputIds.size() > (size_t)t && inputIds[t] >= 0 &&
-                                  tid2eid != nullptr &&
-                                  tid2eid->size() >= (uint64_t)(inputIds[t] + 1) * topk;
+                const bool validInputId = inputIds.size() > (size_t)t &&
+                                          inputIds[t] >= 0;
+                const uint64_t requiredRoutes = validInputId
+                    ? ((uint64_t)inputIds[t] + 1) * (uint64_t)topk
+                    : 0;
+                const bool useHashRow = validInputId && tid2eid != nullptr &&
+                                        tid2eid->size() >= requiredRoutes;
                 if (useHashRow) {
                     uint64_t routeOffset = (uint64_t)inputIds[t] * topk;
                     for (int k = 0; k < topk; k++) {
                         int expert = (int)((*tid2eid)[routeOffset + k] + 0.5f);
-                        curIndices[k] = std::max(0, std::min(expert, nRoutedExperts - 1));
+                        curIndices[k] = std::max(
+                            0, std::min(expert, nRoutedExperts - 1));
                     }
                 } else {
-                    selectByScore();
+                    std::vector<float> rowScores(
+                        rawScores.begin() + (uint64_t)t * nRoutedExperts,
+                        rawScores.begin() + (uint64_t)(t + 1) * nRoutedExperts);
+                    std::vector<int> fallbackIndices;
+                    std::vector<float> fallbackScores;
+                    SelectDeepSeekV4AllowedExperts(
+                        rowScores, 1, nRoutedExperts, topk, scoreFunc,
+                        routeScale, nullptr, expertPolicy,
+                        fallbackIndices, fallbackScores);
+                    for (int k = 0; k < topk; ++k) {
+                        indices[(uint64_t)t * topk + k] = fallbackIndices[k];
+                        weights[(uint64_t)t * topk + k] = fallbackScores[k];
+                    }
+                    continue;
                 }
 
                 float sum = 0.0f;
@@ -2555,17 +2862,19 @@ namespace fastllm {
                     sum += originalScores[curIndices[k]];
                 }
                 for (int k = 0; k < topk; k++) {
-                    float v = originalScores[curIndices[k]];
+                    float value = originalScores[curIndices[k]];
                     if (scoreFunc != "softmax") {
-                        v = v / sum;
+                        value /= sum;
                     }
                     indices[(uint64_t)t * topk + k] = curIndices[k];
-                    weights[(uint64_t)t * topk + k] = v * routeScale;
+                    weights[(uint64_t)t * topk + k] = value * routeScale;
                 }
             }
 
+            ValidateDeepSeekV4AllowedExpertIndices(indices, expertPolicy);
             WriteIntData(indices, {tokens, topk}, expertIndex);
-            WriteFloatData(weights, {tokens, topk}, expertScore, DataType::FLOAT32);
+            WriteFloatData(weights, {tokens, topk}, expertScore,
+                           DataType::FLOAT32);
         }
 
         static void HcHeadReference(const Data &x, Data &hcFn, Data &hcScale, Data &hcBase,
@@ -2651,6 +2960,29 @@ namespace fastllm {
             return true;
         }
     }
+
+#ifdef USE_CUDA
+    int DeepSeekV4BuildWindowKVPrefixForTest(
+            const Data &windowKV, int bsz, int headDim, int startPos,
+            int windowSize, Data &output) {
+        return BuildWindowKVPrefixData(
+            windowKV, bsz, headDim, startPos, windowSize, output);
+    }
+
+    void DeepSeekV4UpdateWindowKVCacheForTest(
+            const Data &kv, int bsz, int headDim, int startPos,
+            int windowSize, Data &windowKV) {
+        UpdateWindowKVCache(
+            kv, bsz, headDim, startPos, windowSize, windowKV);
+    }
+
+    void DeepSeekV4AppendCompressorRawForTest(
+            const Data &kv, const Data &score, int bsz, int seqlen,
+            int wideDim, Data &allKV, Data &allScore) {
+        AppendCompressorRaw(
+            kv, score, bsz, seqlen, wideDim, allKV, allScore);
+    }
+#endif
 
     struct DeepSeekV4DecodeWorkspace {
         Data hiddenStates;
@@ -3346,8 +3678,13 @@ namespace fastllm {
 
         int wideDim = (compressRatio == 4 ? 2 : 1) * cache.headDim;
         int rawCapacity = compressRatio == 4 ? 2 * compressRatio : compressRatio;
+        // ComputeCompressorRaw explicitly promotes both projections to FP32.
+        // A ratio-128 prefill can consume the complete raw tail, leaving no
+        // compressorKVRaw tensor from which to infer the graph ring type.  The
+        // old BF16 default then made every ratio-128 decode reject the fixed
+        // ring even though the live compressor output is FP32.
         DataType ringType = HasTensorData(cache.compressorKVRaw) ?
-                            cache.compressorKVRaw.dataType : DataType::BFLOAT16;
+                            cache.compressorKVRaw.dataType : DataType::FLOAT32;
         bool ringStale = !cache.cudaGraphCacheReady ||
                          cache.cudaGraphRawCapacity != rawCapacity ||
                          !DeepSeekV4GraphTensorMatches(
@@ -3546,12 +3883,12 @@ namespace fastllm {
         compressedBlocks = other.compressedBlocks;
         compressedTokenBase = other.compressedTokenBase;
         rawTailStartPos = other.rawTailStartPos;
-        CopyTensorData(windowKV, other.windowKV);
-        CopyTensorData(compressorKVRaw, other.compressorKVRaw);
-        CopyTensorData(compressorScoreRaw, other.compressorScoreRaw);
-        CopyTensorData(compressedKV, other.compressedKV);
-        CopyTensorData(compressorTailKV, other.compressorTailKV);
-        CopyTensorData(compressorTailScore, other.compressorTailScore);
+        CopyHistoryTensorData(windowKV, other.windowKV);
+        CopyHistoryTensorData(compressorKVRaw, other.compressorKVRaw);
+        CopyHistoryTensorData(compressorScoreRaw, other.compressorScoreRaw);
+        CopyHistoryTensorData(compressedKV, other.compressedKV);
+        CopyHistoryTensorData(compressorTailKV, other.compressorTailKV);
+        CopyHistoryTensorData(compressorTailScore, other.compressorTailScore);
         return *this;
     }
 
@@ -3693,7 +4030,7 @@ namespace fastllm {
             dst.windowSize = src.windowSize;
             dst.compressRatio = src.compressRatio;
             dst.compressorWideDim = src.compressorWideDim;
-            CopyTensorData(dst.windowKV, src.windowKV);
+            CopyHistoryTensorData(dst.windowKV, src.windowKV);
             dst.compressedBlocks = src.compressedBlocks;
             dst.compressedTokenBase = src.compressedTokenBase;
             dst.rawTailStartPos = src.rawTailStartPos;
@@ -3733,6 +4070,7 @@ namespace fastllm {
 #endif
         }
         state.historyTokens = memory.inputToken;
+        state.restoredHistoryCache = true;
         if (DeepSeekV4PrefixCacheDebugEnabled()) {
             printf("[fastllm-dsv4-prefix-cache] restore hit_len=%d blocks=%d layers=%d\n",
                    memory.tokens, memory.blockCount, (int)memory.layers.size());
@@ -3791,39 +4129,19 @@ namespace fastllm {
             dst.compressorRawTokenBase = src.compressorRawTokenBase;
             ResetData(dst.compressedKV);
             if (src.compressedBlocks > 0 && HasCompressedKVData(src.compressedKV)) {
-                bool copiedCompressed = false;
-#ifdef USE_CUDA
-                if (DeepSeekV4PreferCuda()) {
-                    CopyTensorData(dst.compressedKV, src.compressedKV);
-                    copiedCompressed = true;
-                }
-#endif
-                if (!copiedCompressed) {
-                    Data compressedCpuTemp;
-                    compressedCpuTemp.CopyFrom(src.compressedKV);
-                    compressedCpuTemp.ToDevice(DataDevice::CPU);
-                    dst.compressedKV.CopyFrom(compressedCpuTemp);
-                }
+                CopyHistoryTensorData(dst.compressedKV, src.compressedKV);
             }
             if (HasCompressedKVData(dst.compressedKV)) {
-#ifdef USE_CUDA
-                if (DeepSeekV4PreferCuda()) {
-                    dst.compressedKV.SetKVCache();
-                    dst.compressedKV.ToDevice(DataDevice::CUDA);
-                } else
-#endif
-                {
-                    dst.compressedKV.ToDevice(DataDevice::CPU);
-                    dst.compressedKV.lockInCPU = true;
-                }
+                dst.compressedKV.ToDevice(DataDevice::CPU);
+                dst.compressedKV.lockInCPU = true;
             }
 
             if (src.compressRatio > 0 && src.compressorWideDim > 0) {
                 int tailTokens = src.compressRatio == 4 ? 8 : (src.compressRatio == 128 ? 128 : src.compressRatio);
                 tailTokens = std::min(tailTokens, src.totalLen);
                 if (storeFullRaw) {
-                    CopyTensorData(dst.compressorKVRaw, src.compressorKVRaw);
-                    CopyTensorData(dst.compressorScoreRaw, src.compressorScoreRaw);
+                    CopyHistoryTensorData(dst.compressorKVRaw, src.compressorKVRaw);
+                    CopyHistoryTensorData(dst.compressorScoreRaw, src.compressorScoreRaw);
                     dst.compressorRawTokenBase = src.compressorRawTokenBase;
                 }
                 if (HasTensorData(src.compressorKVRaw) && HasTensorData(src.compressorScoreRaw)) {
@@ -3838,8 +4156,8 @@ namespace fastllm {
                         Data tailKV, tailScore;
                         Split(src.compressorKVRaw, 1, rawOffset, rawOffset + tailTokens, tailKV);
                         Split(src.compressorScoreRaw, 1, rawOffset, rawOffset + tailTokens, tailScore);
-                        CopyTensorData(dst.compressorTailKV, tailKV);
-                        CopyTensorData(dst.compressorTailScore, tailScore);
+                        CopyHistoryTensorData(dst.compressorTailKV, tailKV);
+                        CopyHistoryTensorData(dst.compressorTailScore, tailScore);
                     } else {
                         ResetData(dst.compressorTailKV);
                         ResetData(dst.compressorTailScore);
@@ -4483,6 +4801,340 @@ namespace fastllm {
         }
     }
 
+    DeepSeekV4ExpertAllowList ParseDeepSeekV4ExpertAllowList(
+            const std::string &spec, int expertCount, int topk,
+            const std::string &scope) {
+        if (expertCount <= 0 || topk <= 0 || topk > expertCount) {
+            throw std::runtime_error(
+                "DeepSeek V4 " + scope +
+                " expert allow-list has invalid expert/top-k dimensions.");
+        }
+
+        DeepSeekV4ExpertAllowList policy;
+        policy.mask.assign(expertCount, 0);
+        if (spec.empty()) {
+            policy.experts.reserve(expertCount);
+            for (int expert = 0; expert < expertCount; ++expert) {
+                policy.experts.push_back(expert);
+                policy.mask[expert] = 1;
+            }
+            return policy;
+        }
+
+        std::string error;
+        const json11::Json parsed = json11::Json::parse(spec, error);
+        if (!error.empty() || !parsed.is_array()) {
+            throw std::runtime_error(
+                "DeepSeek V4 " + scope +
+                " expert allow-list must be a JSON array of physical expert IDs.");
+        }
+
+        std::vector<uint8_t> seen(expertCount, 0);
+        for (const auto &value : parsed.array_items()) {
+            if (!value.is_number()) {
+                throw std::runtime_error(
+                    "DeepSeek V4 " + scope +
+                    " expert allow-list contains a non-numeric ID.");
+            }
+            const double number = value.number_value();
+            if (!std::isfinite(number) || std::floor(number) != number ||
+                number < 0.0 || number >= expertCount) {
+                throw std::runtime_error(
+                    "DeepSeek V4 " + scope +
+                    " expert allow-list contains an out-of-range or non-integer ID.");
+            }
+            const int expert = (int)number;
+            if (seen[expert] != 0) {
+                throw std::runtime_error(
+                    "DeepSeek V4 " + scope +
+                    " expert allow-list contains a duplicate physical ID.");
+            }
+            seen[expert] = 1;
+            policy.experts.push_back(expert);
+        }
+        if ((int)policy.experts.size() < topk) {
+            throw std::runtime_error(
+                "DeepSeek V4 " + scope + " expert allow-list must contain at least " +
+                std::to_string(topk) + " physical experts.");
+        }
+
+        std::sort(policy.experts.begin(), policy.experts.end());
+        for (int expert : policy.experts) {
+            policy.mask[expert] = 1;
+        }
+        policy.configured = true;
+        return policy;
+    }
+
+    std::string DeepSeekV4ExpertAllowListJson(
+            const DeepSeekV4ExpertAllowList &policy) {
+        std::ostringstream output;
+        output << "[";
+        for (size_t i = 0; i < policy.experts.size(); ++i) {
+            if (i != 0) {
+                output << ",";
+            }
+            output << policy.experts[i];
+        }
+        output << "]";
+        return output.str();
+    }
+
+    DeepSeekV4HashRemapResult RemapDeepSeekV4HashRoutes(
+            const std::vector<float> &routerRows,
+            const std::vector<int> &routes,
+            int expertCount, int rowWidth, int topk,
+            const DeepSeekV4ExpertAllowList &policy) {
+        if (!policy.configured) {
+            return {routes, (uint64_t)routes.size(), 0};
+        }
+        if (expertCount <= 0 || rowWidth <= 0 || topk <= 0 ||
+            (int)policy.mask.size() != expertCount ||
+            (int)policy.experts.size() < topk ||
+            routes.size() % (size_t)topk != 0 ||
+            (size_t)expertCount > std::numeric_limits<size_t>::max() /
+                                  (size_t)rowWidth ||
+            routerRows.size() != (size_t)expertCount * (size_t)rowWidth) {
+            throw std::runtime_error(
+                "DeepSeek V4 hash expert remap received invalid routing metadata.");
+        }
+
+        std::vector<double> norms(expertCount, 0.0);
+        for (int expert = 0; expert < expertCount; ++expert) {
+            const float *row = routerRows.data() + (size_t)expert * rowWidth;
+            double sum = 0.0;
+            for (int column = 0; column < rowWidth; ++column) {
+                if (!std::isfinite(row[column])) {
+                    throw std::runtime_error(
+                        "DeepSeek V4 hash expert remap contains a non-finite router row.");
+                }
+                sum += (double)row[column] * row[column];
+            }
+            norms[expert] = std::sqrt(sum);
+        }
+
+        std::vector<std::vector<int> > candidates(expertCount);
+        for (int source = 0; source < expertCount; ++source) {
+            std::vector<std::pair<double, int> > similarities;
+            similarities.reserve(policy.experts.size());
+            const float *sourceRow =
+                routerRows.data() + (size_t)source * rowWidth;
+            for (int allowed : policy.experts) {
+                const float *allowedRow =
+                    routerRows.data() + (size_t)allowed * rowWidth;
+                double dot = 0.0;
+                for (int column = 0; column < rowWidth; ++column) {
+                    dot += (double)sourceRow[column] * allowedRow[column];
+                }
+                const double divisor = norms[source] * norms[allowed];
+                const double similarity = divisor > 0.0 ? dot / divisor : 0.0;
+                similarities.emplace_back(similarity, allowed);
+            }
+            std::sort(similarities.begin(), similarities.end(),
+                      [](const std::pair<double, int> &left,
+                         const std::pair<double, int> &right) {
+                if (left.first != right.first) {
+                    return left.first > right.first;
+                }
+                return left.second < right.second;
+            });
+            for (const auto &candidate : similarities) {
+                candidates[source].push_back(candidate.second);
+            }
+        }
+
+        DeepSeekV4HashRemapResult result;
+        result.routes.resize(routes.size());
+        result.entries = routes.size();
+        for (size_t rowStart = 0; rowStart < routes.size();
+             rowStart += (size_t)topk) {
+            std::vector<uint8_t> reserved(expertCount, 0);
+            std::vector<uint8_t> used(expertCount, 0);
+            for (int slot = 0; slot < topk; ++slot) {
+                const int source = routes[rowStart + slot];
+                if (source < 0 || source >= expertCount) {
+                    throw std::runtime_error(
+                        "DeepSeek V4 hash route table contains an out-of-range physical expert ID.");
+                }
+                if (policy.Allows(source)) {
+                    reserved[source] = 1;
+                }
+            }
+
+            for (int slot = 0; slot < topk; ++slot) {
+                const int source = routes[rowStart + slot];
+                int target = -1;
+                if (policy.Allows(source) && used[source] == 0) {
+                    target = source;
+                } else {
+                    for (int candidate : candidates[source]) {
+                        if (used[candidate] == 0 && reserved[candidate] == 0) {
+                            target = candidate;
+                            break;
+                        }
+                    }
+                    if (target < 0) {
+                        for (int candidate : candidates[source]) {
+                            if (used[candidate] == 0) {
+                                target = candidate;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (target < 0 || !policy.Allows(target) || used[target] != 0) {
+                    throw std::runtime_error(
+                        "DeepSeek V4 hash expert remap could not produce a unique allowed top-k row.");
+                }
+                result.routes[rowStart + slot] = target;
+                used[target] = 1;
+                if (target != source) {
+                    result.remapped++;
+                }
+            }
+        }
+        return result;
+    }
+
+    void ValidateDeepSeekV4AllowedExpertIndices(
+            const std::vector<int> &indices,
+            const DeepSeekV4ExpertAllowList *policy) {
+        if (policy == nullptr || !policy->configured) {
+            return;
+        }
+        for (int expert : indices) {
+            if (!policy->Allows(expert)) {
+                throw std::runtime_error(
+                    "DeepSeek V4 routing selected a disallowed physical expert ID.");
+            }
+        }
+    }
+
+    void DeepSeekV4BuildMoERoutingDataForTesting(
+            WeightMap &weight, const std::string &prefix, const Data &x,
+            const std::vector<int> &inputIds, int nRoutedExperts, int topk,
+            const std::string &scoreFunc, float routeScale,
+            Data &expertIndex, Data &expertScore,
+            const Data *decodeMeta,
+            const DeepSeekV4ExpertAllowList *expertPolicy,
+            Data *hashRouteTable) {
+        BuildMoERoutingData(weight, prefix, x, inputIds, nRoutedExperts,
+                            topk, scoreFunc, routeScale, expertIndex,
+                            expertScore, decodeMeta, expertPolicy,
+                            hashRouteTable);
+    }
+
+    void SelectDeepSeekV4AllowedExperts(
+            const std::vector<float> &rawScores,
+            int tokens, int expertCount, int topk,
+            const std::string &scoreFunc, float routeScale,
+            const std::vector<float> *gateBias,
+            const DeepSeekV4ExpertAllowList *policy,
+            std::vector<int> &indices,
+            std::vector<float> &scores) {
+        const bool restricted = policy != nullptr && policy->configured;
+        if (tokens <= 0 || expertCount <= 0 || topk <= 0 || topk > expertCount ||
+            rawScores.size() != (size_t)tokens * expertCount ||
+            (gateBias != nullptr && gateBias->size() < (size_t)expertCount) ||
+            (restricted && ((int)policy->mask.size() != expertCount ||
+                            (int)policy->experts.size() < topk)) ||
+            (scoreFunc != "softmax" && scoreFunc != "sigmoid" &&
+             scoreFunc != "sqrtsoftplus")) {
+            throw std::runtime_error(
+                "DeepSeek V4 learned expert routing received invalid metadata.");
+        }
+
+        indices.assign((size_t)tokens * topk, 0);
+        scores.assign((size_t)tokens * topk, 0.0f);
+        for (int token = 0; token < tokens; ++token) {
+            std::vector<float> transformed(expertCount, 0.0f);
+            if (scoreFunc == "softmax") {
+                float maximum = -std::numeric_limits<float>::infinity();
+                for (int expert = 0; expert < expertCount; ++expert) {
+                    if (!restricted || policy->Allows(expert)) {
+                        maximum = std::max(
+                            maximum,
+                            rawScores[(size_t)token * expertCount + expert]);
+                    }
+                }
+                double sum = 0.0;
+                for (int expert = 0; expert < expertCount; ++expert) {
+                    if (restricted && !policy->Allows(expert)) {
+                        continue;
+                    }
+                    const double value = std::exp(
+                        (double)rawScores[(size_t)token * expertCount + expert] -
+                        maximum);
+                    transformed[expert] = (float)value;
+                    sum += value;
+                }
+                if (!(sum > 0.0) || !std::isfinite(sum)) {
+                    throw std::runtime_error(
+                        "DeepSeek V4 learned expert routing produced an invalid softmax sum.");
+                }
+                for (int expert = 0; expert < expertCount; ++expert) {
+                    transformed[expert] /= (float)sum;
+                }
+            } else {
+                for (int expert = 0; expert < expertCount; ++expert) {
+                    if (restricted && !policy->Allows(expert)) {
+                        continue;
+                    }
+                    const float raw =
+                        rawScores[(size_t)token * expertCount + expert];
+                    transformed[expert] = scoreFunc == "sigmoid"
+                        ? SigmoidFloat(raw)
+                        : std::sqrt(SoftplusFloat(raw));
+                }
+            }
+
+            std::vector<float> selectionScores = transformed;
+            if (gateBias != nullptr) {
+                for (int expert = 0; expert < expertCount; ++expert) {
+                    if (!restricted || policy->Allows(expert)) {
+                        selectionScores[expert] += (*gateBias)[expert];
+                    }
+                }
+            }
+            for (int slot = 0; slot < topk; ++slot) {
+                int best = -1;
+                float bestScore = -std::numeric_limits<float>::infinity();
+                for (int expert = 0; expert < expertCount; ++expert) {
+                    if (restricted && !policy->Allows(expert)) {
+                        continue;
+                    }
+                    if (selectionScores[expert] > bestScore) {
+                        best = expert;
+                        bestScore = selectionScores[expert];
+                    }
+                }
+                if (best < 0) {
+                    throw std::runtime_error(
+                        "DeepSeek V4 learned expert routing ran out of allowed experts.");
+                }
+                indices[(size_t)token * topk + slot] = best;
+                selectionScores[best] = -std::numeric_limits<float>::infinity();
+            }
+
+            float selectedSum = 0.0f;
+            for (int slot = 0; slot < topk; ++slot) {
+                selectedSum += transformed[indices[(size_t)token * topk + slot]];
+            }
+            if (scoreFunc != "softmax" && !(selectedSum > 0.0f)) {
+                throw std::runtime_error(
+                    "DeepSeek V4 learned expert routing produced an invalid selected score sum.");
+            }
+            for (int slot = 0; slot < topk; ++slot) {
+                float value = transformed[indices[(size_t)token * topk + slot]];
+                if (scoreFunc != "softmax") {
+                    value /= selectedSum;
+                }
+                scores[(size_t)token * topk + slot] = value * routeScale;
+            }
+        }
+        ValidateDeepSeekV4AllowedExpertIndices(indices, policy);
+    }
+
     DeepSeekV4Model::DeepSeekV4Model() {
         this->canDoBatchForward = false;
         this->canDoConcurrentForward = true;
@@ -4533,6 +5185,118 @@ namespace fastllm {
             "mtp.*.ffn.shared_experts.w3.weight",
             "mtp.*.e_proj.weight", "mtp.*.h_proj.weight",
         };
+    }
+
+    std::string DeepSeekV4Model::SelectSpecialWeightDevice(
+            const std::string &weightName, int layerId) const {
+        const bool routedExpert = weightName.find(".ffn.experts.") != std::string::npos;
+        const bool sharedExpert =
+            weightName.find(".ffn.shared_experts.") != std::string::npos;
+        if (routedExpert || (sharedExpert && !GetCudaSharedExpert())) {
+            return this->SelectMoeDeviceForLayer(layerId);
+        }
+
+        if (this->deviceMap.empty()) {
+            return "";
+        }
+        const int totalLayers = std::max(1, this->block_cnt);
+        const int currentLayer = weightName == "head.weight" ? totalLayers :
+            std::min(std::max(layerId + 1, 1), totalLayers);
+        return SelectDeviceFromMap(this->deviceMap, currentLayer, totalLayers);
+    }
+
+    void DeepSeekV4Model::OnModelWeightsLoaded() {
+#ifdef USE_CUDA
+        if (!EnvFlagEnabled("FASTLLM_TP") ||
+            !DeepSeekV4DeviceMapUsesMultiCuda(this->deviceMap)) {
+            return;
+        }
+
+        int expectedShards = 0;
+        int validShards = 0;
+        std::set<int> devices;
+        std::string firstInvalidWeight;
+        for (const auto &specialWeight : this->specialWeights) {
+            const std::string &name = specialWeight.first;
+            if (name.find(".ffn.experts.") != std::string::npos) {
+                continue;
+            }
+            auto layerIt = this->specialWeightLayerIds.find(name);
+            if (layerIt == this->specialWeightLayerIds.end() ||
+                !DeepSeekV4DeviceSpecUsesType(
+                    this->SelectSpecialWeightDevice(name, layerIt->second),
+                    "multicuda")) {
+                continue;
+            }
+            expectedShards++;
+            auto weightIt = this->weight.weight.find(name);
+            bool valid = weightIt != this->weight.weight.end();
+            const std::string &splitType = specialWeight.second;
+            const int splitAxis = splitType == "linearColumn" ? 1 : 0;
+            const TensorParallelLinearType expectedLinearType =
+                splitType == "linearColumn" ? TP_LINEAR_COLUMN : TP_LINEAR_ROW;
+            if (valid) {
+                const Data &shardedWeight = weightIt->second;
+                valid = shardedWeight.multiDeviceData &&
+                        shardedWeight.multiDeviceDatas.size() >= 2 &&
+                        shardedWeight.dims.size() == 2 &&
+                        shardedWeight.tpLinearType == expectedLinearType;
+                int splitLength = 0;
+                for (const auto &local : shardedWeight.multiDeviceDatas) {
+                    const Data *localWeight = local.second;
+                    bool localValid =
+                        localWeight != nullptr && localWeight->dims.size() == 2 &&
+                        localWeight->dataDevice == DataDevice::CUDA &&
+                        localWeight->cudaData != nullptr &&
+                        GetPointerDeviceId(localWeight->cudaData) == local.first &&
+                        localWeight->tpLinearType == expectedLinearType &&
+                        localWeight->dims[1 - splitAxis] ==
+                            shardedWeight.dims[1 - splitAxis];
+                    if (!localValid) {
+                        valid = false;
+                        break;
+                    }
+                    splitLength += localWeight->dims[splitAxis];
+                }
+                valid = valid && splitLength == shardedWeight.dims[splitAxis];
+            }
+            if (!valid) {
+                if (firstInvalidWeight.empty()) {
+                    firstInvalidWeight = name;
+                }
+                continue;
+            }
+            validShards++;
+            for (const auto &local : weightIt->second.multiDeviceDatas) {
+                if (local.second != nullptr) {
+                    devices.insert(local.first);
+                }
+            }
+        }
+
+        AssertInFastLLM(
+            expectedShards > 0 && validShards == expectedShards && devices.size() > 1,
+            "DeepSeek-V4 tensor parallel weight validation failed: " +
+            std::to_string(validShards) + "/" + std::to_string(expectedShards) +
+            " non-routed weights are sharded" +
+            (firstInvalidWeight.empty() ? std::string(".") :
+             std::string(", first invalid weight: ") + firstInvalidWeight + "."));
+
+        std::ostringstream deviceNames;
+        bool first = true;
+        for (int device : devices) {
+            if (!first) {
+                deviceNames << ",";
+            }
+            first = false;
+            deviceNames << device;
+        }
+        printf("[Fastllm] DeepSeek-V4 TP validated: %d non-routed weights are "
+               "sharded across CUDA devices [%s]; routed experts use %s.\n",
+               validShards, deviceNames.str().c_str(),
+               this->SelectMoeDeviceForLayer(0).c_str());
+        fflush(stdout);
+#endif
     }
 
     void DeepSeekV4Model::InitParams() {
@@ -4618,6 +5382,48 @@ namespace fastllm {
         // -------- Hash 路由 / MTP --------
         num_hash_layers = GetIntWithFallback(this->weight, {"num_hash_layers", "n_hash_layers"}, num_hash_layers);
         num_nextn_predict_layers = GetIntWithFallback(this->weight, {"num_nextn_predict_layers", "n_mtp_layers"}, num_nextn_predict_layers);
+
+        const std::string globalAllowList = GetStringWithFallback(
+            this->weight, {"expert_allow_list"}, "");
+        std::string backboneAllowList = GetStringWithFallback(
+            this->weight, {"expert_allow_list.backbone"}, globalAllowList);
+        std::string mtpAllowList = GetStringWithFallback(
+            this->weight, {"expert_allow_list.mtp"}, globalAllowList);
+        const char *globalAllowListEnv =
+            std::getenv("FASTLLM_DSV4_EXPERT_ALLOWLIST");
+        const char *backboneAllowListEnv =
+            std::getenv("FASTLLM_DSV4_BACKBONE_EXPERT_ALLOWLIST");
+        const char *mtpAllowListEnv =
+            std::getenv("FASTLLM_DSV4_MTP_EXPERT_ALLOWLIST");
+        if (globalAllowListEnv != nullptr && globalAllowListEnv[0] != '\0') {
+            backboneAllowList = globalAllowListEnv;
+            mtpAllowList = globalAllowListEnv;
+        }
+        if (backboneAllowListEnv != nullptr && backboneAllowListEnv[0] != '\0') {
+            backboneAllowList = backboneAllowListEnv;
+        }
+        if (mtpAllowListEnv != nullptr && mtpAllowListEnv[0] != '\0') {
+            mtpAllowList = mtpAllowListEnv;
+        }
+        backboneExpertAllowList = ParseDeepSeekV4ExpertAllowList(
+            backboneAllowList, num_experts, num_experts_per_tok, "backbone");
+        mtpExpertAllowList = ParseDeepSeekV4ExpertAllowList(
+            mtpAllowList, num_experts, num_experts_per_tok, "mtp");
+        auto writeAllowMask = [](const DeepSeekV4ExpertAllowList &policy,
+                                 Data &maskData) {
+            if (!policy.configured) {
+                ResetData(maskData);
+                return;
+            }
+            std::vector<int> mask(policy.mask.begin(), policy.mask.end());
+            WriteIntData(mask, {(int)mask.size()}, maskData);
+            maskData.lockInCPU = true;
+        };
+        writeAllowMask(backboneExpertAllowList, backboneExpertAllowMaskData);
+        writeAllowMask(mtpExpertAllowList, mtpExpertAllowMaskData);
+        remappedHashRouteTables.clear();
+        hashRemapCoverage.clear();
+        UpdateExpertAllowListMetadata();
 
         // -------- Hyper-Connections --------
         hc_mult = GetIntWithFallback(this->weight, {"hc_mult"}, hc_mult);
@@ -4733,6 +5539,179 @@ namespace fastllm {
         }
     }
 
+    const DeepSeekV4ExpertAllowList &
+    DeepSeekV4Model::GetExpertAllowListForPrefix(
+            const std::string &prefix) const {
+        return prefix.rfind("mtp.", 0) == 0
+            ? mtpExpertAllowList
+            : backboneExpertAllowList;
+    }
+
+    Data *DeepSeekV4Model::GetExpertAllowMaskDataForPrefix(
+            const std::string &prefix) {
+        const DeepSeekV4ExpertAllowList &policy =
+            GetExpertAllowListForPrefix(prefix);
+        if (!policy.configured) {
+            return nullptr;
+        }
+        return prefix.rfind("mtp.", 0) == 0
+            ? &mtpExpertAllowMaskData
+            : &backboneExpertAllowMaskData;
+    }
+
+    void DeepSeekV4Model::UpdateExpertAllowListMetadata() {
+        this->weight.AddDict(
+            "expert_allow_list.physical_expert_count",
+            std::to_string(num_experts));
+        this->weight.AddDict(
+            "expert_allow_list.backbone.configured",
+            backboneExpertAllowList.configured ? "true" : "false");
+        this->weight.AddDict(
+            "expert_allow_list.backbone.effective",
+            DeepSeekV4ExpertAllowListJson(backboneExpertAllowList));
+        this->weight.AddDict(
+            "expert_allow_list.mtp.configured",
+            mtpExpertAllowList.configured ? "true" : "false");
+        this->weight.AddDict(
+            "expert_allow_list.mtp.effective",
+            DeepSeekV4ExpertAllowListJson(mtpExpertAllowList));
+
+        json11::Json::object coverage;
+        uint64_t totalEntries = 0;
+        uint64_t totalRemapped = 0;
+        for (const auto &entry : hashRemapCoverage) {
+            coverage[entry.first] = json11::Json::object {
+                {"entries", (double)entry.second.first},
+                {"remapped", (double)entry.second.second},
+                {"complete", true}
+            };
+            totalEntries += entry.second.first;
+            totalRemapped += entry.second.second;
+        }
+        this->weight.AddDict(
+            "expert_allow_list.hash_remap_coverage",
+            json11::Json(coverage).dump());
+        this->weight.AddDict(
+            "expert_allow_list.hash_remap_entries",
+            std::to_string(totalEntries));
+        this->weight.AddDict(
+            "expert_allow_list.hash_remapped_entries",
+            std::to_string(totalRemapped));
+    }
+
+    Data *DeepSeekV4Model::GetEffectiveHashRouteTable(
+            const std::string &prefix) {
+        const DeepSeekV4ExpertAllowList &policy =
+            GetExpertAllowListForPrefix(prefix);
+        if (!policy.configured) {
+            return nullptr;
+        }
+
+        const std::string routeName = prefix + ".gate.tid2eid";
+        auto sourceRoute = this->weight.weight.find(routeName);
+        if (sourceRoute == this->weight.weight.end()) {
+            return nullptr;
+        }
+
+        std::lock_guard<std::mutex> guard(expertAllowListMutex);
+        auto cached = remappedHashRouteTables.find(prefix);
+        if (cached != remappedHashRouteTables.end()) {
+            return cached->second.get();
+        }
+
+        const std::string gateName = prefix + ".gate.weight";
+        auto gate = this->weight.weight.find(gateName);
+        if (gate == this->weight.weight.end()) {
+            throw std::runtime_error(
+                "DeepSeek V4 hash expert remap is missing router weights for " +
+                prefix + ".");
+        }
+        if (num_experts <= 0 || num_experts_per_tok <= 0 ||
+            gate->second.Count(0) % (uint64_t)num_experts != 0) {
+            throw std::runtime_error(
+                "DeepSeek V4 hash expert remap has incompatible router dimensions for " +
+                prefix + ".");
+        }
+        const uint64_t rowWidthValue =
+            gate->second.Count(0) / (uint64_t)num_experts;
+        if (rowWidthValue == 0 ||
+            rowWidthValue > (uint64_t)std::numeric_limits<int>::max()) {
+            throw std::runtime_error(
+                "DeepSeek V4 hash expert remap has an invalid router row width for " +
+                prefix + ".");
+        }
+
+        auto routerRows = ReadWeightFloatDataCached(gate->second);
+        auto sourceRoutes = ReadWeightFloatDataCached(sourceRoute->second);
+        std::vector<int> integerRoutes;
+        integerRoutes.reserve(sourceRoutes->size());
+        for (float value : *sourceRoutes) {
+            const float rounded = std::round(value);
+            if (!std::isfinite(value) || std::fabs(value - rounded) > 1e-4f ||
+                rounded < 0.0f || rounded >= (float)num_experts) {
+                throw std::runtime_error(
+                    "DeepSeek V4 hash route table contains an invalid physical expert ID for " +
+                    prefix + ".");
+            }
+            integerRoutes.push_back((int)rounded);
+        }
+
+        const DeepSeekV4HashRemapResult remapped =
+            RemapDeepSeekV4HashRoutes(
+                *routerRows, integerRoutes, num_experts,
+                (int)rowWidthValue, num_experts_per_tok, policy);
+        auto routeTable = std::make_shared<Data>();
+        WriteIntData(remapped.routes, sourceRoute->second.dims, *routeTable);
+        remappedHashRouteTables[prefix] = routeTable;
+        hashRemapCoverage[prefix] =
+            std::make_pair(remapped.entries, remapped.remapped);
+        UpdateExpertAllowListMetadata();
+        return routeTable.get();
+    }
+
+    void DeepSeekV4Model::PrepareExpertAllowListRouting() {
+        if (!backboneExpertAllowList.configured &&
+            !mtpExpertAllowList.configured) {
+            return;
+        }
+
+        std::set<std::string> hashPrefixes;
+        if (backboneExpertAllowList.configured) {
+            for (int layer = 0; layer < num_hash_layers; ++layer) {
+                const std::string prefix =
+                    "layers." + std::to_string(layer) + ".ffn";
+                if (this->weight.weight.find(prefix + ".gate.tid2eid") ==
+                    this->weight.weight.end()) {
+                    throw std::runtime_error(
+                        "DeepSeek V4 configured backbone expert allow-list is missing hash route table " +
+                        prefix + ".gate.tid2eid.");
+                }
+                hashPrefixes.insert(prefix);
+            }
+        }
+        const std::string suffix = ".gate.tid2eid";
+        for (const auto &entry : this->weight.weight) {
+            if (entry.first.size() <= suffix.size() ||
+                entry.first.compare(entry.first.size() - suffix.size(),
+                                    suffix.size(), suffix) != 0) {
+                continue;
+            }
+            const std::string prefix =
+                entry.first.substr(0, entry.first.size() - suffix.size());
+            if (GetExpertAllowListForPrefix(prefix).configured) {
+                hashPrefixes.insert(prefix);
+            }
+        }
+        for (const std::string &prefix : hashPrefixes) {
+            if (GetEffectiveHashRouteTable(prefix) == nullptr) {
+                throw std::runtime_error(
+                    "DeepSeek V4 failed to prepare configured hash expert allow-list for " +
+                    prefix + ".");
+            }
+        }
+        UpdateExpertAllowListMetadata();
+    }
+
     std::pair<std::vector<float>, std::vector<float>> DeepSeekV4Model::UpdateRotaryPosEmb(float base, float factor, int seqLen) {
         int dim = rotary_dim;
         std::vector <float> freqExtra, freqInter;
@@ -4838,6 +5817,14 @@ namespace fastllm {
             startPos = pids.empty() ? 0 : pids[0];
         }
         int originalStartPos = startPos;
+#ifdef USE_CUDA
+        // MultiCUDA helpers operate on one physical rank at a time and some
+        // requests recursively split prefill at a prefix-cache boundary.  Every
+        // ForwardBatch invocation starts from the same physical root so a new
+        // workspace can never be allocated on the rank selected by the preceding
+        // cache operation.
+        SelectDeepSeekV4TensorParallelRoot(this->deviceMap);
+#endif
         std::shared_ptr<DeepSeekV4RequestState> requestState =
             deepSeekV4ForwardRequestStateOverride ?
                 deepSeekV4ForwardRequestStateOverride : GetRequestState(pastKeyValues);
@@ -4952,6 +5939,9 @@ namespace fastllm {
 #endif
             activeDecodeLayerCaches.clear();
             activeDecodeLayerCaches.resize(block_cnt);
+            if (requestState != nullptr) {
+                requestState->restoredHistoryCache = false;
+            }
         }
 
         std::vector<int> tokenIds;
@@ -5312,8 +6302,20 @@ namespace fastllm {
         Data &samplingGreedyScores = decodeWorkspace->samplingGreedyScores;
 
 #ifdef USE_CUDA
-        bool persistentTpAsync = batch == 1 && seqlen == 1 && originalStartPos > 0 &&
-                                 DeepSeekV4DeviceMapUsesMultiCuda(this->deviceMap);
+        const bool multiCudaTensorParallel =
+            DeepSeekV4DeviceMapUsesMultiCuda(this->deviceMap);
+        // The fused decode helpers use graphDevices as their TP rank set even
+        // when full-step CUDA graph capture is disabled.  Leaving it empty made
+        // HcPre+Norm silently execute on one root GPU, and the following Linear
+        // then consumed a cross-device/root-only tensor instead of TP replicas.
+        if (multiCudaTensorParallel && graphDevices.empty()) {
+            std::map<int, int> tpRatios;
+            FastllmGetMulticudaDeviceAndRatio(
+                graphDevices, tpRatios, true);
+        }
+        bool persistentTpAsync = multiCudaTensorParallel && batch == 1 &&
+                                 ((seqlen == 1 && originalStartPos > 0) ||
+                                  seqlen > 1);
         // The decode-only HcPre+RMSNorm kernel preserves the BF16 tensor
         // boundary between both operators while avoiding a second global
         // memory round trip.  Keep prefill and non-CUDA execution on the
@@ -5361,14 +6363,13 @@ namespace fastllm {
                 embeddingInputIds = &graphState->graphInputIds;
             }
 #endif
-            Embedding(*embeddingInputIds, weight["embed.weight"],
-                      hiddenStatesBeforeHcExpand);
-            // The official ParallelEmbedding output follows the checkpoint's
-            // BF16 dtype.  The generic CPU Embedding operator returns FLOAT32,
-            // which would otherwise skip the first hc_pre BF16 boundary.
-            if (hiddenStatesBeforeHcExpand.dataType != DataType::BFLOAT16) {
-                ToDataType(hiddenStatesBeforeHcExpand, DataType::BFLOAT16);
-            }
+            // ParallelEmbedding returns the checkpoint dtype.  EmbeddingDirect
+            // preserves the BF16 payload instead of materializing FP32 and
+            // converting it back in-place.  Besides avoiding that round trip,
+            // the fixed dtype keeps the persistent decode workspace allocation
+            // stable across CUDA-graph warmup and capture.
+            EmbeddingDirect(*embeddingInputIds, weight["embed.weight"],
+                            hiddenStatesBeforeHcExpand);
             hiddenStatesBeforeHcExpand.Reshape({bsz, seqlen, 1, dim});
             bool repeatedToTpReplicas = false;
 #ifdef USE_CUDA
@@ -5422,7 +6423,6 @@ namespace fastllm {
             attnMix.b = bsz;
             attnMix.s = seqlen;
             attnMix.hc = hc_mult;
-
             DeepSeekV4Linear(attnInput, weight[pre + ".attn.wq_a.weight"], Data(), qr, true);
             RMSNormReference(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm, DataType::BFLOAT16);
             weight[pre + ".attn.wq_b.weight"].tpLinearType = TP_LINEAR_ROW;
@@ -5532,7 +6532,21 @@ namespace fastllm {
             if (compressRatio > 0) {
                 if (decodeCache != nullptr) {
                     ComputeCompressorRaw(weight, pre + ".attn.compressor", attnInput, compressorKV, compressorScore);
+                    bool restoredMultiTokenCompressedBuild =
+                        requestState != nullptr &&
+                        requestState->restoredHistoryCache &&
+                        startPos > 0 && seqlen > 1;
 #ifdef USE_CUDA
+                    if (restoredMultiTokenCompressedBuild) {
+                        // Compressor projections finish on the persistent
+                        // MultiCUDA worker streams, while the restored raw-tail
+                        // append below is issued by this scheduler thread.  Make
+                        // the producer-to-copy handoff explicit; synchronizing
+                        // only after CatDirect can preserve data that was already
+                        // copied before its producer completed.
+                        SynchronizeDeepSeekV4TensorParallelDevices(
+                            this->deviceMap);
+                    }
                     bool graphCompressedUpdated = false;
                     if (graphSafeDecode) {
                         graphCompressedUpdated = decodeMeta != nullptr &&
@@ -5605,6 +6619,20 @@ namespace fastllm {
                         decodeCompressedCount = decodeCache->compressedBlocks;
                         decodeCompressedKVForAttention = &decodeCache->compressedKV;
                     } else {
+#ifdef USE_CUDA
+                        if (restoredMultiTokenCompressedBuild) {
+                            // CatDirect appends each restored compressor tail on
+                            // the scheduler thread's per-device stream.  The
+                            // compressed-KV operator is dispatched to dedicated
+                            // MultiCUDA worker streams, so make the handoff
+                            // explicit before either worker consumes the newly
+                            // appended rows.  Synchronizing after the build is
+                            // too late: it only waits for a consumer that may
+                            // already have read the old allocation contents.
+                            SynchronizeDeepSeekV4TensorParallelDevices(
+                                this->deviceMap);
+                        }
+#endif
                         bool builtCompressed = BuildCompressedKVFromRaw(
                             weight, pre + ".attn.compressor", *compressorKVForBuild,
                             *compressorScoreForBuild, bsz, compressorRawTokenBaseForBuild,
@@ -5688,6 +6716,18 @@ namespace fastllm {
                     }
                 }
             }
+#ifdef USE_CUDA
+            if (requestState != nullptr && requestState->restoredHistoryCache &&
+                decodeCache != nullptr && compressRatio > 0 &&
+                startPos > 0 && seqlen > 1) {
+                // Restoring a prefix moves the compressed cache back to both
+                // CUDA ranks.  The rebuild above runs on the per-rank worker
+                // streams, while the following Cat can be dispatched from the
+                // caller stream immediately.  Complete both producers before
+                // the restored cache is consumed by sparse prefill attention.
+                SynchronizeDeepSeekV4TensorParallelDevices(this->deviceMap);
+            }
+#endif
             Data sparsePrefillKV;
             Data *sparsePrefillKVPtr = &kv;
             int sparsePrefillPrefixLen = 0;
@@ -5792,14 +6832,26 @@ namespace fastllm {
             }
             std::vector<int> ffnDims = ffnInput.dims;
             ffnInput.Reshape({bsz * seqlen, dim});
+            Data *expertAllowMaskData = nullptr;
             {
-                BuildMoERoutingData(weight, pre + ".ffn", ffnInput, tokenIds, num_experts,
-                                    num_experts_per_tok, scoring_func, routed_scaling_factor,
-                                    expertIndex, expertScore
+                const std::string routePrefix = pre + ".ffn";
+                const DeepSeekV4ExpertAllowList &expertPolicy =
+                    GetExpertAllowListForPrefix(routePrefix);
+                expertAllowMaskData =
+                    GetExpertAllowMaskDataForPrefix(routePrefix);
+                Data *effectiveHashRouteTable =
+                    GetEffectiveHashRouteTable(routePrefix);
+                BuildMoERoutingData(weight, routePrefix, ffnInput, tokenIds,
+                                    num_experts, num_experts_per_tok,
+                                    scoring_func, routed_scaling_factor,
+                                    expertIndex, expertScore,
 #ifdef USE_CUDA
-                                    , graphSafeDecode ? decodeMeta : nullptr
+                                    graphSafeDecode ? decodeMeta : nullptr,
+#else
+                                    nullptr,
 #endif
-                                    );
+                                    expertPolicy.configured ? &expertPolicy : nullptr,
+                                    effectiveHashRouteTable);
             }
             {
                 // MOE
@@ -5819,14 +6871,11 @@ namespace fastllm {
                 bool canPreCopyNumasMoeInputs =
                     std::getenv(
                         "FASTLLM_DSV4_DISABLE_NUMAS_MOE_PRECOPY") == nullptr &&
-                    cudaSe && ffnInput.dims.size() > 0 &&
-                    ffnInput.dims[0] == 1 &&
-                    sharedGateupIt != weight.weight.end() &&
-                    sharedDownIt != weight.weight.end() &&
-                    !DeepSeekV4DeviceMapUsesMultiCuda(this->deviceMap) &&
+                    ffnInput.dims.size() > 0 &&
                     moeWeights.size() > 2 &&
                     moeWeights[2] != nullptr &&
-                    !moeWeights[2]->IsTensorParallelSharded();
+                    !moeWeights[2]->IsTensorParallelSharded() &&
+                    GetTensorCudaDevice(ffnInput) >= 0;
                 if (canPreCopyNumasMoeInputs) {
                     std::string selectedMoeDevice =
                         this->SelectMoeDeviceForLayer(layer);
@@ -5849,11 +6898,12 @@ namespace fastllm {
                             expertIndex, preCopiedExpertIndex) &&
                         CopyDeepSeekV4CudaTensorToCpu(
                             expertScore, preCopiedExpertScore);
-                    if (preCopiedNumasMoeInputs) {
-                        routedMoeInput = &preCopiedMoeInput;
-                        routedExpertIndex = &preCopiedExpertIndex;
-                        routedExpertScore = &preCopiedExpertScore;
-                    }
+                    AssertInFastLLM(
+                        preCopiedNumasMoeInputs,
+                        "DeepSeek-V4 failed to copy tensor-parallel MoE inputs to NUMA.");
+                    routedMoeInput = &preCopiedMoeInput;
+                    routedExpertIndex = &preCopiedExpertIndex;
+                    routedExpertScore = &preCopiedExpertScore;
                 }
 #endif
                 {
@@ -5865,7 +6915,8 @@ namespace fastllm {
                         bool routedTensorParallel = moeWeights.size() > 2 && moeWeights[2] != nullptr &&
                                                     moeWeights[2]->IsTensorParallelSharded();
                         bool routedExpertParallel =
-                            DeepSeekV4DeviceMapUsesMultiCuda(this->deviceMap);
+                            DeepSeekV4DeviceSpecUsesType(
+                                this->SelectMoeDeviceForLayer(layer), "multicuda");
                         fuseSharedExpert = (routedTensorParallel || routedExpertParallel) &&
                                            ffnInput.dims.size() > 0 && ffnInput.dims[0] == 1;
                         if (!fuseSharedExpert) {
@@ -5890,10 +6941,10 @@ namespace fastllm {
                     DataType effectiveMoeAtype = ffnInput.dataType;
                     Data moeQuantizedInput;
                     Data *moeInput = routedMoeInput;
-                    if (!DeepSeekV4PreferCuda() && ffnInput.dataDevice == DataDevice::CPU &&
+                    if (!DeepSeekV4PreferCuda() && moeInput->dataDevice == DataDevice::CPU &&
                         moeWeights.size() > 2 && moeWeights[2] != nullptr &&
                         IsDeepSeekV4QuantizedLinearWeight(*moeWeights[2])) {
-                        DeepSeekV4QuantizeLinearActivationCpu(ffnInput, moeQuantizedInput);
+                        DeepSeekV4QuantizeLinearActivationCpu(*moeInput, moeQuantizedInput);
                         moeInput = &moeQuantizedInput;
                     }
                     MergeMOEBlock(moeInput, routedExpertIndex, routedExpertScore,
@@ -5902,7 +6953,8 @@ namespace fastllm {
                                   1.0f, &ffnOut, layer,
                                   ffnInput.dataType, effectiveMoeAtype,
                                   &moeInputTemp, &moeOutputTemp,
-                                  MoeGateSwiglu, true, swiglu_limit, true);
+                                  MoeGateSwiglu, true, swiglu_limit, true,
+                                  expertAllowMaskData);
                     ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
                 }
                 {
@@ -6060,6 +7112,16 @@ namespace fastllm {
                 }
             }
 #endif
+#ifdef USE_CUDA
+            if (persistentTpAsync && seqlen > 1) {
+                // Multi-token TP uses the same ordered worker-stream handoff as
+                // decode.  Drain once at the model-body boundary so prefill
+                // temporaries and cache views cannot be released while a rank
+                // still consumes them, without paying a device synchronize at
+                // every replicated/sharded operator.
+                SynchronizeDeepSeekV4TensorParallelDevices(this->deviceMap);
+            }
+#endif
         };
 
         bool modelBodyDone = false;
@@ -6170,8 +7232,24 @@ namespace fastllm {
                 }
             } else {
                 syncGraphDevices();
-                bool captureOk = FastllmCudaGraphMemoryPoolBegin();
-                const char *failureStage = captureOk ? nullptr : "workspace reservation";
+                // The graph allocation-failure sentinel is one real cudaMalloc
+                // per device. Resolve all of them before starting rank 0's
+                // stream capture; lazily allocating rank 1's sentinel while
+                // rank 0 is already capturing invalidates rank 0's graph.
+                bool captureOk = true;
+                const char *failureStage = nullptr;
+                for (auto &deviceState : graphState->devices) {
+                    FastllmCudaSetDevice(deviceState->device);
+                    if (!FastllmCudaGraphPrepareCaptureDevice()) {
+                        captureOk = false;
+                        failureStage = "prepare capture devices";
+                        break;
+                    }
+                }
+                if (captureOk && !FastllmCudaGraphMemoryPoolBegin()) {
+                    captureOk = false;
+                    failureStage = "workspace reservation";
+                }
                 int begunCaptures = 0;
                 if (captureOk) {
                     for (auto &deviceState : graphState->devices) {
@@ -6426,6 +7504,13 @@ namespace fastllm {
         if (this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
             batch == 1 && finalTotalLen % 256 == 0 &&
             (int)activeHistoryTokens.size() >= finalTotalLen) {
+#ifdef USE_CUDA
+            // The recursive chunk owns a temporary workspace, while MultiCUDA
+            // kernels use per-thread streams.  Drain every rank before copying
+            // the cache snapshot and before that workspace is destroyed/reused
+            // by the suffix chunk.
+            SynchronizeDeepSeekV4TensorParallelDevices(this->deviceMap);
+#endif
             this->RecordHistorySnapshot(activeHistoryTokens, finalTotalLen, activeDecodeLayerCaches);
         } else if (this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
                    batch == 1 && finalTotalLen % 256 == 0 && DeepSeekV4PrefixCacheDebugEnabled()) {
@@ -6812,9 +7897,17 @@ namespace fastllm {
             RMSNormReference(ffnMix.y, weight[pre + ".ffn_norm.weight"], rms_norm_eps, ffnInput, DataType::BFLOAT16);
             std::vector<int> ffnDims = ffnInput.dims;
             ffnInput.Reshape({bsz * seqlen, dim});
-            BuildMoERoutingData(weight, pre + ".ffn", ffnInput, tokenIds, num_experts,
-                                num_experts_per_tok, scoring_func, routed_scaling_factor,
-                                expertIndex, expertScore);
+            const std::string routePrefix = pre + ".ffn";
+            const DeepSeekV4ExpertAllowList &expertPolicy =
+                GetExpertAllowListForPrefix(routePrefix);
+            Data *effectiveHashRouteTable =
+                GetEffectiveHashRouteTable(routePrefix);
+            BuildMoERoutingData(weight, routePrefix, ffnInput, tokenIds,
+                                num_experts, num_experts_per_tok,
+                                scoring_func, routed_scaling_factor,
+                                expertIndex, expertScore, nullptr,
+                                expertPolicy.configured ? &expertPolicy : nullptr,
+                                effectiveHashRouteTable);
             {
                 Data sharedExpertOut;
                 bool hasSharedExpertOut = false;
@@ -6822,6 +7915,39 @@ namespace fastllm {
                 std::vector<Data*> moeWeights = weights[layer];
                 auto sharedGateupIt = weight.weight.find(pre + ".ffn.shared_experts.gateup.weight");
                 auto sharedDownIt = weight.weight.find(pre + ".ffn.shared_experts.w2.weight");
+                Data preCopiedMoeInput;
+                Data preCopiedExpertIndex;
+                Data preCopiedExpertScore;
+                Data *routedMoeInput = &ffnInput;
+                Data *routedExpertIndex = &expertIndex;
+                Data *routedExpertScore = &expertScore;
+#ifdef USE_CUDA
+                bool canPreCopyNumasMoeInputs =
+                    std::getenv(
+                        "FASTLLM_DSV4_DISABLE_NUMAS_MOE_PRECOPY") == nullptr &&
+                    ffnInput.dims.size() > 0 &&
+                    moeWeights.size() > 2 &&
+                    moeWeights[2] != nullptr &&
+                    !moeWeights[2]->IsTensorParallelSharded() &&
+                    GetTensorCudaDevice(ffnInput) >= 0 &&
+                    DeepSeekV4DeviceSpecUsesType(
+                        this->SelectMoeDeviceForLayer(layer), "numa");
+                if (canPreCopyNumasMoeInputs) {
+                    bool copied =
+                        CopyDeepSeekV4CudaTensorToCpu(
+                            ffnInput, preCopiedMoeInput) &&
+                        CopyDeepSeekV4CudaTensorToCpu(
+                            expertIndex, preCopiedExpertIndex) &&
+                        CopyDeepSeekV4CudaTensorToCpu(
+                            expertScore, preCopiedExpertScore);
+                    AssertInFastLLM(
+                        copied,
+                        "DeepSeek-V4 failed to copy batched tensor-parallel MoE inputs to NUMA.");
+                    routedMoeInput = &preCopiedMoeInput;
+                    routedExpertIndex = &preCopiedExpertIndex;
+                    routedExpertScore = &preCopiedExpertScore;
+                }
+#endif
                 if (cudaSe && sharedGateupIt != weight.weight.end() && sharedDownIt != weight.weight.end() &&
                     !IsDiskWeight(&sharedGateupIt->second) && !IsDiskWeight(&sharedDownIt->second)) {
                     sharedGateupIt->second.tpLinearType = TP_LINEAR_ROW;
@@ -6829,7 +7955,10 @@ namespace fastllm {
                     sharedDownIt->second.tpLinearType = TP_LINEAR_COLUMN;
                     bool routedTensorParallel = moeWeights.size() > 2 && moeWeights[2] != nullptr &&
                                                 moeWeights[2]->IsTensorParallelSharded();
-                    fuseSharedExpert = routedTensorParallel &&
+                    bool routedExpertParallel =
+                        DeepSeekV4DeviceSpecUsesType(
+                            this->SelectMoeDeviceForLayer(layer), "multicuda");
+                    fuseSharedExpert = (routedTensorParallel || routedExpertParallel) &&
                                        ffnInput.dims.size() > 0 && ffnInput.dims[0] == 1;
                     if (!fuseSharedExpert) {
                         Data ww1, ww3;
@@ -6850,20 +7979,21 @@ namespace fastllm {
                 {
                     DataType effectiveMoeAtype = ffnInput.dataType;
                     Data moeQuantizedInput;
-                    Data *moeInput = &ffnInput;
-                    if (!DeepSeekV4PreferCuda() && ffnInput.dataDevice == DataDevice::CPU &&
+                    Data *moeInput = routedMoeInput;
+                    if (!DeepSeekV4PreferCuda() && moeInput->dataDevice == DataDevice::CPU &&
                         moeWeights.size() > 2 && moeWeights[2] != nullptr &&
                         IsDeepSeekV4QuantizedLinearWeight(*moeWeights[2])) {
-                        DeepSeekV4QuantizeLinearActivationCpu(ffnInput, moeQuantizedInput);
+                        DeepSeekV4QuantizeLinearActivationCpu(*moeInput, moeQuantizedInput);
                         moeInput = &moeQuantizedInput;
                     }
-                    MergeMOEBlock(moeInput, &expertIndex, &expertScore,
+                    MergeMOEBlock(moeInput, routedExpertIndex, routedExpertScore,
                                   &moeWeights, &biass[layer],
                                   &w1, &w2, &w3, &tempInput, &tempOutput,
                                   1.0f, &ffnOut, layer,
                                   ffnInput.dataType, effectiveMoeAtype,
                                   &moeInputTemp, &moeOutputTemp,
-                                  MoeGateSwiglu, true, swiglu_limit, true);
+                                  MoeGateSwiglu, true, swiglu_limit, true,
+                                  GetExpertAllowMaskDataForPrefix(routePrefix));
                 }
                 ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
                 if (hasSharedExpertOut) {
@@ -6908,6 +8038,9 @@ namespace fastllm {
             if (this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
                 finalTotalLen % 256 == 0 &&
                 (int)requestStates[b]->historyTokens.size() >= finalTotalLen) {
+#ifdef USE_CUDA
+                SynchronizeDeepSeekV4TensorParallelDevices(this->deviceMap);
+#endif
                 this->RecordHistorySnapshot(requestStates[b]->historyTokens, finalTotalLen,
                                             requestStates[b]->decodeLayerCaches);
             } else if (this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
@@ -6996,6 +8129,7 @@ namespace fastllm {
 
     void DeepSeekV4Model::WarmUp() {
         printf("Warmup...\n");
+        PrepareExpertAllowListRouting();
 
         Data inputIds = Data(DataType::FLOAT32, {1, 1}, {1});
         Data attentionMask = Data(DataType::FLOAT32, {1, 1}, {0});

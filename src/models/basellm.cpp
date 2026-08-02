@@ -13,6 +13,14 @@
 #include <exception>
 #include <set>
 #include <tuple>
+#include <cmath>
+#include <filesystem>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
+
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
@@ -419,6 +427,16 @@ namespace fastllm {
     }
 
     ResponseContext::~ResponseContext() {
+        // A tensor-parallel cache descriptor mirrors the first local shard's
+        // page metadata without owning an additional page reference.  Release
+        // the root and all local descriptors as one deduplicated unit before
+        // their Data destructors run, otherwise rank 0 pages are released
+        // twice and can invalidate a retained prefix snapshot.
+        for (auto &kv : pastKeyValues) {
+            ReleasePagedCachePages(kv.first);
+            ReleasePagedCachePages(kv.second);
+        }
+
         for (auto &item : multimodalInput) {
             for (auto *data : item.second) {
                 delete data;
@@ -539,6 +557,7 @@ namespace fastllm {
     void basellm::RemoveResponseContext(int handleId) {
         ResponseContext *context = responseContextDict.GetHandle(handleId);
         if (context != nullptr) {
+            this->EraseResponseContextCpuSnapshot(context);
             this->OnResponseContextRemoved(context);
         }
         responseContextDict.RemoveHandle(handleId);
@@ -546,19 +565,76 @@ namespace fastllm {
 
     void ResponseContext::TryRecordPagedCache(basellm *model) {
         bool hasLinearAttentionCache = false;
+        bool hasBoundedAttentionCache = false;
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
             auto &kvFirst = this->pastKeyValues[i].first;
             auto &kvSecond = this->pastKeyValues[i].second;
             if (kvFirst.isLinearAttention || kvSecond.isLinearAttention) {
                 hasLinearAttentionCache = true;
-                break;
+            }
+            if (model != nullptr &&
+                model->GetKVCacheRetainedTokens(i) >= 0) {
+                hasBoundedAttentionCache = true;
             }
         }
         bool recordedPrefixExtra =
             model != nullptr && model->TryRecordPagedPrefixCacheExtra(this);
-        if (hasLinearAttentionCache && !recordedPrefixExtra) {
+        if ((hasLinearAttentionCache || hasBoundedAttentionCache) &&
+            !recordedPrefixExtra) {
             return;
         }
+
+        std::function<int(const Data&)> pagedCacheTokenLen =
+                [&](const Data &cache) -> int {
+            if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
+                int minLocalLen = INT_MAX;
+                bool foundLocal = false;
+                for (const auto &it : cache.multiDeviceDatas) {
+                    if (it.second == nullptr) {
+                        continue;
+                    }
+                    int localLen = pagedCacheTokenLen(*it.second);
+                    if (localLen <= 0) {
+                        return 0;
+                    }
+                    minLocalLen = std::min(minLocalLen, localLen);
+                    foundLocal = true;
+                }
+                return foundLocal ? minLocalLen : 0;
+            }
+            if (!cache.isPagedKVCache || cache.pagedKVCacheData == nullptr ||
+                cache.pageIndex.empty() || cache.pageLen <= 0) {
+                return 0;
+            }
+            return ((int)cache.pageIndex.size() - 1) * cache.pageLen +
+                   cache.lastPageLen;
+        };
+
+        // Bounded caches contain a suffix after compaction, not page zero of the
+        // token sequence.  Use an unbounded attention layer to identify the
+        // reusable prefix length and only put a bounded layer into the trie when
+        // its physical page chain still covers that complete prefix (the CUDA
+        // Graph path deliberately keeps those chains token-growing).
+        int reusablePrefixLen = INT_MAX;
+        bool foundUnboundedCache = false;
+        if (model != nullptr) {
+            for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
+                if (model->GetKVCacheRetainedTokens(i) >= 0) {
+                    continue;
+                }
+                int keyLen = pagedCacheTokenLen(this->pastKeyValues[i].first);
+                int valueLen = pagedCacheTokenLen(this->pastKeyValues[i].second);
+                if (keyLen > 0 && valueLen > 0) {
+                    reusablePrefixLen = std::min(
+                        reusablePrefixLen, std::min(keyLen, valueLen));
+                    foundUnboundedCache = true;
+                }
+            }
+        }
+        if (!foundUnboundedCache) {
+            reusablePrefixLen = 0;
+        }
+
         std::function<void(Data&)> recordPagedCache = [&](Data &cache) {
             if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
                 bool recordedLocal = false;
@@ -580,6 +656,12 @@ namespace fastllm {
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
             auto &kvFirst = this->pastKeyValues[i].first;
             auto &kvSecond = this->pastKeyValues[i].second;
+            if (model != nullptr && model->GetKVCacheRetainedTokens(i) >= 0 &&
+                (reusablePrefixLen <= 0 ||
+                 pagedCacheTokenLen(kvFirst) < reusablePrefixLen ||
+                 pagedCacheTokenLen(kvSecond) < reusablePrefixLen)) {
+                continue;
+            }
             recordPagedCache(kvFirst);
             recordPagedCache(kvSecond);
         }
@@ -620,6 +702,1197 @@ namespace fastllm {
         (void)context;
         (void)cachedLen;
         return true;
+    }
+
+    ResponseContext *SelectCpuRequestSwapVictim(
+            const std::vector<std::pair<int, ResponseContext*> >
+                &candidates,
+            const ResponseContext *excluded) {
+        ResponseContext *best = nullptr;
+        size_t bestTokens = 0;
+        int bestHandle = INT_MAX;
+        for (const auto &candidate : candidates) {
+            ResponseContext *context = candidate.second;
+            if (context == nullptr || context == excluded ||
+                context->isEnding || context->isAbort ||
+                context->preTokens <= 0) {
+                continue;
+            }
+            const size_t tokens = context->allTokens.size();
+            if (best == nullptr || tokens > bestTokens ||
+                (tokens == bestTokens &&
+                 candidate.first < bestHandle)) {
+                best = context;
+                bestTokens = tokens;
+                bestHandle = candidate.first;
+            }
+        }
+        return best;
+    }
+
+    bool CpuRequestSwapQuantumExpired(
+            int resumedGeneratedTokens,
+            int currentGeneratedTokens,
+            int quantumTokens,
+            size_t suspendedRequests) {
+        return suspendedRequests > 0 &&
+               quantumTokens > 0 &&
+               currentGeneratedTokens >= resumedGeneratedTokens &&
+               currentGeneratedTokens - resumedGeneratedTokens >=
+                   quantumTokens;
+    }
+    bool CpuRequestSwapShouldSpillToDisk(
+            size_t tokens,
+            size_t storedBytes,
+            size_t minTokens,
+            size_t minBytes,
+            double diskReadMegabytesPerSecond,
+            double recomputeTokensPerSecond) {
+        if (tokens < minTokens || storedBytes < minBytes ||
+            diskReadMegabytesPerSecond <= 0.0 ||
+            recomputeTokensPerSecond <= 0.0 ||
+            !std::isfinite(diskReadMegabytesPerSecond) ||
+            !std::isfinite(recomputeTokensPerSecond)) {
+            return false;
+        }
+        const double restoreSeconds =
+            (double)storedBytes /
+            (1024.0 * 1024.0 * diskReadMegabytesPerSecond);
+        const double recomputeSeconds =
+            (double)tokens / recomputeTokensPerSecond;
+        return restoreSeconds < recomputeSeconds;
+    }
+    double UpdateCpuRequestSwapDiskReadRate(
+            double previousMegabytesPerSecond,
+            size_t bytes,
+            double seconds) {
+        if (bytes == 0 || seconds <= 0.0 ||
+            !std::isfinite(seconds)) {
+            return previousMegabytesPerSecond;
+        }
+        const double observed =
+            (double)bytes /
+            (1024.0 * 1024.0 * seconds);
+        if (!std::isfinite(observed) || observed <= 0.0) {
+            return previousMegabytesPerSecond;
+        }
+        if (!std::isfinite(previousMegabytesPerSecond) ||
+            previousMegabytesPerSecond <= 0.0) {
+            return observed;
+        }
+        return previousMegabytesPerSecond * 0.8 +
+               observed * 0.2;
+    }
+
+
+    static bool CpuRequestSwapEnvEnabled(const char *value) {
+        if (value == nullptr || value[0] == 0) {
+            return false;
+        }
+        std::string lowered(value);
+        std::transform(
+            lowered.begin(), lowered.end(), lowered.begin(),
+            [](unsigned char c) { return (char)std::tolower(c); });
+        return lowered == "1" || lowered == "true" ||
+               lowered == "on" || lowered == "yes";
+    }
+
+    static uint64_t CpuRequestSwapClockMilliseconds() {
+        return (uint64_t)std::chrono::duration_cast<
+            std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+    }
+
+    static long CpuRequestSwapLongEnv(
+            const char *name,
+            long defaultValue,
+            long minimum,
+            long maximum) {
+        const char *value = std::getenv(name);
+        if (value == nullptr || value[0] == 0) {
+            return defaultValue;
+        }
+        char *end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end == value || *end != 0) {
+            return defaultValue;
+        }
+        return std::max(minimum, std::min(maximum, parsed));
+    }
+    static double CpuRequestSwapDoubleEnv(
+            const char *name,
+            double defaultValue,
+            double minimum,
+            double maximum) {
+        const char *value = std::getenv(name);
+        if (value == nullptr || value[0] == 0) {
+            return defaultValue;
+        }
+        char *end = nullptr;
+        const double parsed = std::strtod(value, &end);
+        if (end == value || *end != 0 || !std::isfinite(parsed)) {
+            return defaultValue;
+        }
+        return std::max(minimum, std::min(maximum, parsed));
+    }
+
+
+    static void SetCpuRequestSnapshotError(
+            std::string *error, const std::string &message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+    }
+
+    static void ApplyCacheSnapshotMetadata(
+            const CacheSnapshotMetadata &metadata,
+            Data &cache) {
+        cache.isFake = false;
+        cache.cacheUid = metadata.cacheUid;
+        cache.isKVCache = metadata.isKVCache;
+        cache.isLinearAttention = metadata.isLinearAttention;
+        cache.isLinearAttentionTransposed =
+            metadata.isLinearAttentionTransposed;
+        cache.pageLen = metadata.pageLen;
+        cache.lastPageLen = metadata.lastPageLen;
+        cache.dataType = metadata.dataType;
+        cache.UpdateUnitSize();
+        cache.dims = metadata.dims;
+        cache.strides = metadata.strides;
+        cache.expansionSize = metadata.expansionSize;
+        cache.expansionBytes = metadata.expansionBytes;
+        cache.expansionDims = metadata.expansionDims;
+        cache.dataDevice = metadata.dataDevice;
+        cache.dataDeviceIds = metadata.dataDeviceIds;
+        cache.tpLayout = metadata.tpLayout;
+        cache.tpAxis = metadata.tpAxis;
+        cache.tpGlobalDims = metadata.tpGlobalDims;
+        cache.tpRanges = metadata.tpRanges;
+        cache.tpLinearType = metadata.tpLinearType;
+        cache.tpPackType = metadata.tpPackType;
+        cache.tpQHeads = metadata.tpQHeads;
+        cache.tpKVHeads = metadata.tpKVHeads;
+        cache.tpHeadDim = metadata.tpHeadDim;
+    }
+
+    static bool CaptureCacheToCpu(
+            const Data &cache,
+            CacheCpuSnapshot &snapshot,
+            size_t &hostBytes,
+            std::string *error) {
+        if (cache.multiDeviceData || !cache.multiDeviceDatas.empty()) {
+            SetCpuRequestSnapshotError(
+                error,
+                "multi-device request cache snapshots are not supported");
+            return false;
+        }
+
+        snapshot.metadata = CaptureCacheSnapshotMetadata(cache);
+        if (cache.isPagedKVCache) {
+            std::string pagedError;
+            if (!SnapshotPagedCacheToCpu(
+                    cache, snapshot.pagedData, &pagedError)) {
+                SetCpuRequestSnapshotError(
+                    error, "paged cache snapshot failed: " + pagedError);
+                return false;
+            }
+            snapshot.paged = true;
+            hostBytes += snapshot.pagedData.single.bytes.size();
+            snapshot.valid = true;
+            return true;
+        }
+
+        if (cache.dims.empty()) {
+            if (cache.cpuData != nullptr || cache.cudaData != nullptr ||
+                cache.deviceData != nullptr) {
+                SetCpuRequestSnapshotError(
+                    error,
+                    "empty request cache unexpectedly owns storage");
+                return false;
+            }
+            snapshot.empty = true;
+            snapshot.valid = true;
+            return true;
+        }
+        if ((cache.dataDevice == DataDevice::CUDA &&
+             cache.cudaData == nullptr) ||
+            (cache.dataDevice == DataDevice::CPU &&
+             cache.cpuData == nullptr)) {
+            SetCpuRequestSnapshotError(
+                error, "request cache storage is unavailable");
+            return false;
+        }
+
+        try {
+            // Data intentionally has deep-copy construction but no move
+            // assignment. Populate the owning snapshot in place; assigning a
+            // temporary CacheCpuSnapshot would shallow-copy Data's raw storage.
+            snapshot.tensorData.CopyFrom(cache);
+            snapshot.tensorData.isKVCache = cache.isKVCache;
+            snapshot.tensorData.isLinearAttention =
+                cache.isLinearAttention;
+            snapshot.tensorData.isLinearAttentionTransposed =
+                cache.isLinearAttentionTransposed;
+            snapshot.tensorData.isPagedKVCache = false;
+            snapshot.tensorData.pagedKVCacheData = nullptr;
+            snapshot.tensorData.pageIndex.clear();
+            snapshot.tensorData.lastPageLen = 0;
+            snapshot.tensorData.multiDeviceData = false;
+            snapshot.tensorData.multiDeviceDatas.clear();
+            snapshot.tensorData.ClearTensorParallelLayout();
+            snapshot.tensorData.ToDevice(DataDevice::CPU, true);
+        } catch (const std::exception &exc) {
+            SetCpuRequestSnapshotError(
+                error,
+                std::string("tensor cache snapshot failed: ") +
+                    exc.what());
+            return false;
+        }
+        hostBytes += (size_t)snapshot.tensorData.GetBytes();
+        snapshot.valid = true;
+        return true;
+    }
+
+    static void ClearCacheDeviceStorage(Data &cache) {
+        if (cache.isPagedKVCache) {
+            ReleasePagedCacheStorage(cache);
+            return;
+        }
+        if (cache.multiDeviceData) {
+            for (auto &it : cache.multiDeviceDatas) {
+                delete it.second;
+            }
+            cache.multiDeviceDatas.clear();
+            cache.multiDeviceData = false;
+        }
+        cache.FreeSpace();
+        cache.dims.clear();
+        cache.strides.clear();
+        cache.expansionDims.clear();
+        cache.expansionSize = 0;
+        cache.expansionBytes = 0;
+        cache.isPagedKVCache = false;
+        cache.pagedKVCacheData = nullptr;
+        cache.pageIndex.clear();
+        cache.lastPageLen = 0;
+        cache.ClearTensorParallelLayout();
+    }
+
+    static bool RestoreCacheFromCpu(
+            const CacheCpuSnapshot &snapshot,
+            Data &cache,
+            std::string *error) {
+        if (!snapshot.valid) {
+            SetCpuRequestSnapshotError(
+                error, "request cache snapshot is invalid");
+            return false;
+        }
+        if (cache.isPagedKVCache || cache.cpuData != nullptr ||
+            cache.cudaData != nullptr || cache.deviceData != nullptr ||
+            cache.multiDeviceData || !cache.multiDeviceDatas.empty() ||
+            !cache.dims.empty()) {
+            SetCpuRequestSnapshotError(
+                error, "request cache restore destination is not empty");
+            return false;
+        }
+        if (snapshot.paged) {
+            std::string pagedError;
+            if (!RestorePagedCacheFromCpu(
+                    snapshot.pagedData, cache, &pagedError)) {
+                SetCpuRequestSnapshotError(
+                    error, "paged cache restore failed: " + pagedError);
+                return false;
+            }
+            return true;
+        }
+        if (snapshot.empty) {
+            ApplyCacheSnapshotMetadata(snapshot.metadata, cache);
+            cache.dims.clear();
+            cache.strides.clear();
+            cache.expansionDims.clear();
+            cache.expansionSize = 0;
+            cache.expansionBytes = 0;
+            cache.isPagedKVCache = false;
+            cache.pagedKVCacheData = nullptr;
+            cache.pageIndex.clear();
+            cache.lastPageLen = 0;
+            return true;
+        }
+
+        try {
+            cache.CopyFrom(snapshot.tensorData);
+            cache.ToDevice(
+                snapshot.metadata.dataDevice,
+                snapshot.metadata.dataDeviceIds,
+                true);
+            ApplyCacheSnapshotMetadata(snapshot.metadata, cache);
+            cache.isPagedKVCache = false;
+            cache.pagedKVCacheData = nullptr;
+            cache.pageIndex.clear();
+            cache.lastPageLen = 0;
+        } catch (const std::exception &exc) {
+            ClearCacheDeviceStorage(cache);
+            SetCpuRequestSnapshotError(
+                error,
+                std::string("tensor cache restore failed: ") +
+                    exc.what());
+            return false;
+        }
+        return true;
+    }
+
+    bool basellm::CanSuspendResponseContextToCpu(
+            const ResponseContext *context,
+            std::string *error) const {
+        if (context == nullptr || context->isEnding ||
+            context->isAbort) {
+            SetCpuRequestSnapshotError(
+                error, "request is not active");
+            return false;
+        }
+        if ((int)context->pastKeyValues.size() < this->block_cnt) {
+            SetCpuRequestSnapshotError(
+                error, "request cache list is incomplete");
+            return false;
+        }
+        return true;
+    }
+
+    bool basellm::CaptureResponseContextExtraCpuState(
+            ResponseContext *context,
+            std::unique_ptr<ModelResponseContextCpuState> &state,
+            size_t &hostBytes,
+            std::string *error) {
+        (void)context;
+        (void)hostBytes;
+        (void)error;
+        state.reset();
+        return true;
+    }
+
+    bool basellm::RestoreResponseContextExtraCpuState(
+            ResponseContext *context,
+            const ModelResponseContextCpuState *state,
+            std::string *error) {
+        (void)context;
+        (void)state;
+        (void)error;
+        return true;
+    }
+
+    void basellm::ClearResponseContextExtraDeviceState(
+            ResponseContext *context) noexcept {
+        (void)context;
+    }
+
+    bool basellm::IsCpuRequestSwapEnabled() const {
+        const char *value =
+            std::getenv("FASTLLM_CPU_REQUEST_SWAP");
+        if (value != nullptr && value[0] != 0) {
+            return CpuRequestSwapEnvEnabled(value);
+        }
+        // Keep the original Qwen3.5 experiment name as an opt-in alias while
+        // deployment profiles migrate to the engine-wide gate.
+        return CpuRequestSwapEnvEnabled(
+            std::getenv("FASTLLM_QWEN35_CPU_REQUEST_SWAP"));
+    }
+
+    int basellm::GetCpuRequestSwapQuantumTokens() const {
+        const char *value = std::getenv(
+            "FASTLLM_CPU_REQUEST_SWAP_QUANTUM_TOKENS");
+        if (value == nullptr || value[0] == 0) {
+            value = std::getenv(
+                "FASTLLM_QWEN35_CPU_REQUEST_SWAP_QUANTUM_TOKENS");
+        }
+        if (value == nullptr || value[0] == 0) {
+            return 128;
+        }
+        char *end = nullptr;
+        long parsed = std::strtol(value, &end, 10);
+        if (end == value || *end != 0) {
+            return 128;
+        }
+        return std::max(16, std::min(65536, (int)parsed));
+    }
+
+    bool basellm::IsCpuRequestSwapZstdEnabled() const {
+#ifdef FASTLLM_USE_ZSTD
+        return CpuRequestSwapEnvEnabled(std::getenv(
+            "FASTLLM_CPU_REQUEST_SWAP_ZSTD"));
+#else
+        return false;
+#endif
+    }
+    bool basellm::IsCpuRequestSwapDiskEnabled() const {
+        const char *directory = std::getenv(
+            "FASTLLM_CPU_REQUEST_SWAP_DISK_DIR");
+        return directory != nullptr && directory[0] != 0;
+    }
+
+    size_t basellm::CompressColdResponseContextCpuSnapshots() {
+        if (!IsCpuRequestSwapZstdEnabled()) {
+            return 0;
+        }
+        const uint64_t now = CpuRequestSwapClockMilliseconds();
+        const uint64_t last =
+            responseContextCpuSnapshotLastZstdScanMilliseconds.load();
+        if (last != 0 && now >= last && now - last < 1000) {
+            return 0;
+        }
+        responseContextCpuSnapshotLastZstdScanMilliseconds.store(now);
+        const uint64_t coldMilliseconds = (uint64_t)
+            CpuRequestSwapLongEnv(
+                "FASTLLM_CPU_REQUEST_SWAP_ZSTD_COLD_MS",
+                30000, 0, 86400000);
+        const int compressionLevel = (int)CpuRequestSwapLongEnv(
+            "FASTLLM_CPU_REQUEST_SWAP_ZSTD_LEVEL",
+            1, 1, 19);
+
+        std::vector<std::shared_ptr<ResponseContextCpuSnapshot> >
+            coldSnapshots;
+        {
+            std::lock_guard<std::mutex> guard(
+                responseContextCpuSnapshotMutex);
+            if (responseContextCpuSnapshots.size() < 2) {
+                return 0;
+            }
+            uint64_t nextRestoreTicket = UINT64_MAX;
+            for (const auto &item : responseContextCpuSnapshots) {
+                if (item.second != nullptr) {
+                    nextRestoreTicket = std::min(
+                        nextRestoreTicket, item.second->ticket);
+                }
+            }
+            for (auto &item : responseContextCpuSnapshots) {
+                const std::shared_ptr<ResponseContextCpuSnapshot>
+                    &snapshot = item.second;
+                if (snapshot == nullptr ||
+                    snapshot->ticket == nextRestoreTicket ||
+                    snapshot->zstdAttempted ||
+                    now < snapshot->suspendedAtMilliseconds ||
+                    now - snapshot->suspendedAtMilliseconds <
+                        coldMilliseconds) {
+                    continue;
+                }
+                snapshot->zstdAttempted = true;
+                coldSnapshots.push_back(snapshot);
+            }
+        }
+
+        size_t compressedSnapshots = 0;
+        for (const auto &ownedSnapshot : coldSnapshots) {
+            std::lock_guard<std::mutex> snapshotGuard(
+                ownedSnapshot->storageMutex);
+            ResponseContextCpuSnapshot *snapshot =
+                ownedSnapshot.get();
+            size_t pagedBytesBefore = 0;
+            size_t pagedBytesAfter = 0;
+            bool compressedAny = false;
+            std::string compressionError;
+            auto compressCache = [&](CacheCpuSnapshot &cache) {
+                if (!cache.valid || !cache.paged ||
+                    !cache.pagedData.valid) {
+                    return;
+                }
+                const size_t before =
+                    GetPagedCacheCpuSnapshotStoredBytes(
+                        cache.pagedData);
+                pagedBytesBefore += before;
+                std::string partError;
+                if (TryCompressPagedCacheCpuSnapshot(
+                        cache.pagedData,
+                        compressionLevel,
+                        &partError)) {
+                    compressedAny = true;
+                } else if (!partError.empty() &&
+                           compressionError.empty()) {
+                    compressionError = partError;
+                }
+                pagedBytesAfter +=
+                    GetPagedCacheCpuSnapshotStoredBytes(
+                        cache.pagedData);
+            };
+            for (auto &layer : snapshot->caches) {
+                compressCache(layer.first);
+                compressCache(layer.second);
+            }
+            if (snapshot->hostBytes >= pagedBytesBefore) {
+                snapshot->hostBytes =
+                    snapshot->hostBytes - pagedBytesBefore +
+                    pagedBytesAfter;
+            }
+            if (compressedAny) {
+                compressedSnapshots++;
+            }
+            printf(
+                "[FastLLM swap] cold snapshot ticket=%llu zstd %s: "
+                "paged_bytes=%zu, stored_bytes=%zu%s%s.\n",
+                (unsigned long long)snapshot->ticket,
+                compressedAny ? "compressed" : "kept raw",
+                pagedBytesBefore,
+                pagedBytesAfter,
+                compressionError.empty() ? "" : ", error=",
+                compressionError.empty() ? "" :
+                    compressionError.c_str());
+            fflush(stdout);
+        }
+        return compressedSnapshots;
+    }
+
+    size_t basellm::SpillColdResponseContextCpuSnapshotsToDisk() {
+        if (!IsCpuRequestSwapDiskEnabled()) {
+            return 0;
+        }
+        const uint64_t now = CpuRequestSwapClockMilliseconds();
+        const uint64_t last =
+            responseContextCpuSnapshotLastDiskScanMilliseconds.load();
+        if (last != 0 && now >= last && now - last < 1000) {
+            return 0;
+        }
+        responseContextCpuSnapshotLastDiskScanMilliseconds.store(now);
+
+        const uint64_t coldMilliseconds = (uint64_t)
+            CpuRequestSwapLongEnv(
+                "FASTLLM_CPU_REQUEST_SWAP_DISK_COLD_MS",
+                120000, 0, 86400000);
+        const size_t minTokens = (size_t)CpuRequestSwapLongEnv(
+            "FASTLLM_CPU_REQUEST_SWAP_DISK_MIN_TOKENS",
+            65536, 1, LONG_MAX);
+        const size_t minBytes = (size_t)CpuRequestSwapLongEnv(
+            "FASTLLM_CPU_REQUEST_SWAP_DISK_MIN_BYTES",
+            256L * 1024L * 1024L, 1, LONG_MAX);
+        const size_t maxDiskBytes = (size_t)CpuRequestSwapLongEnv(
+            "FASTLLM_CPU_REQUEST_SWAP_DISK_MAX_BYTES",
+            (long)(64ULL * 1024ULL * 1024ULL * 1024ULL),
+            0, LONG_MAX);
+        const size_t minFreeBytes = (size_t)CpuRequestSwapLongEnv(
+            "FASTLLM_CPU_REQUEST_SWAP_DISK_MIN_FREE_BYTES",
+            1L * 1024L * 1024L * 1024L, 0, LONG_MAX);
+        const double configuredDiskReadMegabytesPerSecond =
+            CpuRequestSwapDoubleEnv(
+                "FASTLLM_CPU_REQUEST_SWAP_DISK_READ_MBPS",
+                300.0, 1.0, 1000000.0);
+        const double measuredDiskReadMegabytesPerSecond =
+            responseContextCpuSnapshotDiskReadMiBPerSecond.load();
+        const double diskReadMegabytesPerSecond =
+            measuredDiskReadMegabytesPerSecond > 0.0
+                ? measuredDiskReadMegabytesPerSecond
+                : configuredDiskReadMegabytesPerSecond;
+        const double recomputeTokensPerSecond =
+            CpuRequestSwapDoubleEnv(
+                "FASTLLM_CPU_REQUEST_SWAP_RECOMPUTE_TPS",
+                800.0, 0.01, 1000000.0);
+
+        std::vector<std::shared_ptr<ResponseContextCpuSnapshot> >
+            allSnapshots;
+        uint64_t nextRestoreTicket = UINT64_MAX;
+        {
+            std::lock_guard<std::mutex> guard(
+                responseContextCpuSnapshotMutex);
+            if (responseContextCpuSnapshots.size() < 2) {
+                return 0;
+            }
+            for (const auto &item : responseContextCpuSnapshots) {
+                if (item.second == nullptr) {
+                    continue;
+                }
+                allSnapshots.push_back(item.second);
+                nextRestoreTicket = std::min(
+                    nextRestoreTicket, item.second->ticket);
+            }
+        }
+
+        auto partDiskBytes =
+            [](const CacheCpuSnapshot &cache) -> size_t {
+                if (!cache.valid || !cache.paged ||
+                    !cache.pagedData.valid ||
+                    cache.pagedData.single.diskFile == nullptr) {
+                    return 0;
+                }
+                return cache.pagedData.single.diskFile->bytes;
+            };
+        size_t diskBytesInUse = 0;
+        for (const auto &snapshot : allSnapshots) {
+            std::lock_guard<std::mutex> snapshotGuard(
+                snapshot->storageMutex);
+            for (const auto &layer : snapshot->caches) {
+                diskBytesInUse += partDiskBytes(layer.first);
+                diskBytesInUse += partDiskBytes(layer.second);
+            }
+        }
+
+        auto getSessionDirectory =
+            [&](std::string &directory,
+                std::string &directoryError) -> bool {
+                std::lock_guard<std::mutex> directoryGuard(
+                    responseContextCpuSnapshotDiskDirectoryMutex);
+                if (!responseContextCpuSnapshotDiskSessionDirectory.
+                        empty()) {
+                    directory =
+                        responseContextCpuSnapshotDiskSessionDirectory;
+                    return true;
+                }
+                const char *configured = std::getenv(
+                    "FASTLLM_CPU_REQUEST_SWAP_DISK_DIR");
+                if (configured == nullptr || configured[0] == 0) {
+                    directoryError =
+                        "CPU request swap disk directory is disabled";
+                    return false;
+                }
+                std::error_code filesystemError;
+                const std::filesystem::path baseDirectory(configured);
+                std::filesystem::create_directories(
+                    baseDirectory, filesystemError);
+                if (filesystemError) {
+                    directoryError =
+                        "failed to create CPU request swap disk directory: " +
+                        filesystemError.message();
+                    return false;
+                }
+#ifndef _WIN32
+                for (const auto &entry :
+                     std::filesystem::directory_iterator(
+                         baseDirectory,
+                         std::filesystem::directory_options::
+                             skip_permission_denied,
+                         filesystemError)) {
+                    if (filesystemError) {
+                        break;
+                    }
+                    const std::string name =
+                        entry.path().filename().string();
+                    if (!entry.is_directory() ||
+                        name.rfind("fastllm-swap-", 0) != 0) {
+                        continue;
+                    }
+                    const std::filesystem::path lockPath =
+                        entry.path() / ".lock";
+                    const int staleLockFd = open(
+                        lockPath.c_str(),
+                        O_CREAT | O_RDWR | O_CLOEXEC,
+                        0600);
+                    if (staleLockFd < 0) {
+                        continue;
+                    }
+                    if (flock(
+                            staleLockFd,
+                            LOCK_EX | LOCK_NB) == 0) {
+                        std::error_code cleanupError;
+                        std::filesystem::remove_all(
+                            entry.path(), cleanupError);
+                        flock(staleLockFd, LOCK_UN);
+                    }
+                    close(staleLockFd);
+                }
+#endif
+                uint64_t nonce = (uint64_t)
+                    std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().
+                                time_since_epoch()).count();
+                nonce ^= (uint64_t)(uintptr_t)this;
+                for (int attempt = 0; attempt < 100; attempt++) {
+                    const std::filesystem::path candidate =
+                        baseDirectory /
+                        ("fastllm-swap-" + std::to_string(nonce) +
+                         "-" + std::to_string(attempt));
+                    filesystemError.clear();
+                    if (!std::filesystem::create_directory(
+                            candidate, filesystemError)) {
+                        if (filesystemError) {
+                            directoryError =
+                                "failed to create CPU request swap session "
+                                "directory: " +
+                                filesystemError.message();
+                            return false;
+                        }
+                        continue;
+                    }
+#ifndef _WIN32
+                    const std::filesystem::path lockPath =
+                        candidate / ".lock";
+                    const int sessionLockFd = open(
+                        lockPath.c_str(),
+                        O_CREAT | O_RDWR | O_CLOEXEC,
+                        0600);
+                    if (sessionLockFd < 0 ||
+                        flock(
+                            sessionLockFd,
+                            LOCK_EX | LOCK_NB) != 0) {
+                        if (sessionLockFd >= 0) {
+                            close(sessionLockFd);
+                        }
+                        std::filesystem::remove_all(
+                            candidate, filesystemError);
+                        directoryError =
+                            "failed to lock CPU request swap session "
+                            "directory";
+                        return false;
+                    }
+                    responseContextCpuSnapshotDiskSessionLockFd =
+                        sessionLockFd;
+#endif
+                    responseContextCpuSnapshotDiskSessionDirectory =
+                        candidate.string();
+                    directory =
+                        responseContextCpuSnapshotDiskSessionDirectory;
+                    return true;
+                }
+                directoryError =
+                    "failed to allocate a unique CPU request swap "
+                    "session directory";
+                return false;
+            };
+
+        size_t spilledSnapshots = 0;
+        for (const auto &snapshot : allSnapshots) {
+            std::lock_guard<std::mutex> snapshotGuard(
+                snapshot->storageMutex);
+            if (snapshot->ticket == nextRestoreTicket ||
+                snapshot->diskSpillAttempted ||
+                now < snapshot->suspendedAtMilliseconds ||
+                now - snapshot->suspendedAtMilliseconds <
+                    coldMilliseconds) {
+                continue;
+            }
+
+            size_t storedBytes = 0;
+            size_t residentPagedBytes = 0;
+            auto countCache = [&](const CacheCpuSnapshot &cache) {
+                if (!cache.valid || !cache.paged ||
+                    !cache.pagedData.valid) {
+                    return;
+                }
+                storedBytes += GetPagedCacheCpuSnapshotStoredBytes(
+                    cache.pagedData);
+                const PagedCacheCpuSnapshotPart &part =
+                    cache.pagedData.single;
+                residentPagedBytes +=
+                    part.bytes.size() + part.compressedBytes.size();
+            };
+            for (const auto &layer : snapshot->caches) {
+                countCache(layer.first);
+                countCache(layer.second);
+            }
+            if (!CpuRequestSwapShouldSpillToDisk(
+                    snapshot->contextTokens,
+                    storedBytes,
+                    minTokens,
+                    minBytes,
+                    diskReadMegabytesPerSecond,
+                    recomputeTokensPerSecond)) {
+                continue;
+            }
+            if (maxDiskBytes != 0 &&
+                (diskBytesInUse > maxDiskBytes ||
+                 storedBytes > maxDiskBytes - diskBytesInUse)) {
+                continue;
+            }
+
+            std::string sessionDirectory;
+            std::string spillError;
+            if (!getSessionDirectory(
+                    sessionDirectory, spillError)) {
+                snapshot->diskSpillAttempted = true;
+                fprintf(
+                    stderr,
+                    "[FastLLM swap] cold snapshot ticket=%llu disk "
+                    "spill failed: %s.\n",
+                    (unsigned long long)snapshot->ticket,
+                    spillError.c_str());
+                continue;
+            }
+            std::error_code spaceError;
+            const std::filesystem::space_info space =
+                std::filesystem::space(
+                    sessionDirectory, spaceError);
+            if (spaceError ||
+                space.available < storedBytes ||
+                space.available - storedBytes < minFreeBytes) {
+                continue;
+            }
+
+            snapshot->diskSpillAttempted = true;
+            size_t writtenBytes = 0;
+            bool spilledAny = false;
+            auto spillCache = [&](
+                    CacheCpuSnapshot &cache,
+                    int layer,
+                    char side) {
+                if (!cache.valid || !cache.paged ||
+                    !cache.pagedData.valid) {
+                    return;
+                }
+                PagedCacheCpuSnapshotPart &part =
+                    cache.pagedData.single;
+                if (part.diskFile != nullptr ||
+                    (part.bytes.empty() &&
+                     part.compressedBytes.empty())) {
+                    return;
+                }
+                const std::filesystem::path spillPath =
+                    std::filesystem::path(sessionDirectory) /
+                    (std::to_string(snapshot->ticket) + "-" +
+                     std::to_string(layer) + "-" + side + ".bin");
+                std::string partError;
+                if (SpillPagedCacheCpuSnapshotPartToDisk(
+                        part, spillPath.string(), &partError)) {
+                    spilledAny = true;
+                    writtenBytes += part.diskFile->bytes;
+                } else if (spillError.empty()) {
+                    spillError = partError;
+                }
+            };
+            for (size_t layer = 0;
+                 layer < snapshot->caches.size(); layer++) {
+                spillCache(
+                    snapshot->caches[layer].first,
+                    (int)layer, 'k');
+                spillCache(
+                    snapshot->caches[layer].second,
+                    (int)layer, 'v');
+            }
+
+            size_t residentPagedBytesAfter = 0;
+            for (const auto &layer : snapshot->caches) {
+                auto countResident = [&](const CacheCpuSnapshot &cache) {
+                    if (!cache.valid || !cache.paged ||
+                        !cache.pagedData.valid) {
+                        return;
+                    }
+                    const PagedCacheCpuSnapshotPart &part =
+                        cache.pagedData.single;
+                    residentPagedBytesAfter +=
+                        part.bytes.size() +
+                        part.compressedBytes.size();
+                };
+                countResident(layer.first);
+                countResident(layer.second);
+            }
+            const size_t releasedResidentBytes =
+                residentPagedBytes - residentPagedBytesAfter;
+            snapshot->hostBytes =
+                snapshot->hostBytes >= releasedResidentBytes
+                    ? snapshot->hostBytes - releasedResidentBytes
+                    : 0;
+            diskBytesInUse += writtenBytes;
+            if (spilledAny) {
+                spilledSnapshots++;
+                responseContextCpuSnapshotDiskWriteBytes.fetch_add(
+                    writtenBytes);
+                responseContextCpuSnapshotDiskSpillCount.fetch_add(1);
+            }
+            printf(
+                "[FastLLM swap] cold snapshot ticket=%llu disk %s: "
+                "stored_bytes=%zu, resident_bytes=%zu%s%s.\n",
+                (unsigned long long)snapshot->ticket,
+                spilledAny ? "spilled" : "kept resident",
+                writtenBytes,
+                snapshot->hostBytes,
+                spillError.empty() ? "" : ", error=",
+                spillError.empty() ? "" : spillError.c_str());
+            fflush(stdout);
+        }
+        return spilledSnapshots;
+    }
+
+    void basellm::
+            ScheduleColdResponseContextCpuSnapshotTiering() {
+        const bool zstdEnabled = IsCpuRequestSwapZstdEnabled();
+        const bool diskEnabled = IsCpuRequestSwapDiskEnabled();
+        if ((!zstdEnabled && !diskEnabled) ||
+            GetSuspendedResponseContextCount() < 2) {
+            return;
+        }
+        const uint64_t now = CpuRequestSwapClockMilliseconds();
+        auto scanDue = [&](uint64_t last) {
+            return last == 0 || now < last || now - last >= 1000;
+        };
+        if ((!zstdEnabled ||
+             !scanDue(responseContextCpuSnapshotLastZstdScanMilliseconds.
+                          load())) &&
+            (!diskEnabled ||
+             !scanDue(responseContextCpuSnapshotLastDiskScanMilliseconds.
+                          load()))) {
+            return;
+        }
+        bool expected = false;
+        if (!responseContextCpuSnapshotColdTierWorkerRunning.
+                compare_exchange_strong(expected, true)) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> threadGuard(
+            responseContextCpuSnapshotColdTierThreadMutex);
+        if (responseContextCpuSnapshotColdTierThread.joinable()) {
+            responseContextCpuSnapshotColdTierThread.join();
+        }
+        try {
+            responseContextCpuSnapshotColdTierThread = std::thread(
+                [this, zstdEnabled, diskEnabled]() {
+                    try {
+                        if (zstdEnabled) {
+                            CompressColdResponseContextCpuSnapshots();
+                        }
+                        if (diskEnabled) {
+                            SpillColdResponseContextCpuSnapshotsToDisk();
+                        }
+                    } catch (const std::exception &exc) {
+                        fprintf(
+                            stderr,
+                            "[FastLLM swap] cold tier worker failed: %s.\n",
+                            exc.what());
+                    } catch (...) {
+                        fprintf(
+                            stderr,
+                            "[FastLLM swap] cold tier worker failed with "
+                            "an unknown error.\n");
+                    }
+                    responseContextCpuSnapshotColdTierWorkerRunning.store(
+                        false);
+                });
+        } catch (const std::exception &exc) {
+            responseContextCpuSnapshotColdTierWorkerRunning.store(false);
+            fprintf(
+                stderr,
+                "[FastLLM swap] failed to start cold tier worker: %s.\n",
+                exc.what());
+        }
+    }
+
+    bool basellm::SuspendResponseContextToCpu(
+            ResponseContext *context,
+            std::string *error) {
+        if (error != nullptr) {
+            error->clear();
+        }
+        if (!CanSuspendResponseContextToCpu(context, error)) {
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> guard(
+                responseContextCpuSnapshotMutex);
+            if (responseContextCpuSnapshots.find(context) !=
+                responseContextCpuSnapshots.end()) {
+                SetCpuRequestSnapshotError(
+                    error, "request is already suspended");
+                return false;
+            }
+        }
+
+        std::shared_ptr<ResponseContextCpuSnapshot> snapshot(
+            new ResponseContextCpuSnapshot());
+        snapshot->ticket = ++responseContextCpuSnapshotTicket;
+        snapshot->suspendedAtMilliseconds =
+            CpuRequestSwapClockMilliseconds();
+        snapshot->contextTokens = context->allTokens.size();
+        snapshot->generatedTokens = context->curTokens;
+        snapshot->caches.resize(this->block_cnt);
+        for (int layer = 0; layer < this->block_cnt; layer++) {
+            if (!CaptureCacheToCpu(
+                    context->pastKeyValues[layer].first,
+                    snapshot->caches[layer].first,
+                    snapshot->hostBytes,
+                    error) ||
+                !CaptureCacheToCpu(
+                    context->pastKeyValues[layer].second,
+                    snapshot->caches[layer].second,
+                    snapshot->hostBytes,
+                    error)) {
+                return false;
+            }
+        }
+        if (!CaptureResponseContextExtraCpuState(
+                context, snapshot->modelState,
+                snapshot->hostBytes, error)) {
+            return false;
+        }
+
+        const uint64_t ticket = snapshot->ticket;
+        const size_t hostBytes = snapshot->hostBytes;
+        {
+            std::lock_guard<std::mutex> guard(
+                responseContextCpuSnapshotMutex);
+            if (responseContextCpuSnapshots.find(context) !=
+                responseContextCpuSnapshots.end()) {
+                SetCpuRequestSnapshotError(
+                    error, "request was suspended concurrently");
+                return false;
+            }
+            responseContextCpuSnapshots[context] =
+                std::move(snapshot);
+        }
+        for (int layer = 0; layer < this->block_cnt; layer++) {
+            ClearCacheDeviceStorage(
+                context->pastKeyValues[layer].first);
+            ClearCacheDeviceStorage(
+                context->pastKeyValues[layer].second);
+        }
+        ClearResponseContextExtraDeviceState(context);
+        if (this->verbose) {
+            printf("[FastLLM swap] suspended request ticket=%llu, "
+                   "tokens=%zu, generated=%d, host_bytes=%zu.\n",
+                   (unsigned long long)ticket,
+                   context->allTokens.size(),
+                   context->curTokens,
+                   hostBytes);
+            fflush(stdout);
+        }
+        return true;
+    }
+
+    bool basellm::RestoreResponseContextFromCpu(
+            ResponseContext *context,
+            std::string *error) {
+        if (error != nullptr) {
+            error->clear();
+        }
+        if (context == nullptr) {
+            SetCpuRequestSnapshotError(
+                error, "request restore got a null context");
+            return false;
+        }
+
+        std::lock_guard<std::mutex> guard(
+            responseContextCpuSnapshotMutex);
+        auto snapshotIt =
+            responseContextCpuSnapshots.find(context);
+        if (snapshotIt == responseContextCpuSnapshots.end() ||
+            snapshotIt->second == nullptr ||
+            (int)snapshotIt->second->caches.size() <
+                this->block_cnt) {
+            SetCpuRequestSnapshotError(
+                error, "request has no complete CPU snapshot");
+            return false;
+        }
+        std::shared_ptr<ResponseContextCpuSnapshot> snapshot =
+            snapshotIt->second;
+        std::lock_guard<std::mutex> snapshotGuard(
+            snapshot->storageMutex);
+        size_t diskBytes = 0;
+        for (const auto &layer : snapshot->caches) {
+            auto countDisk = [&](const CacheCpuSnapshot &cache) {
+                if (cache.valid && cache.paged &&
+                    cache.pagedData.valid &&
+                    cache.pagedData.single.diskFile != nullptr) {
+                    diskBytes +=
+                        cache.pagedData.single.diskFile->bytes;
+                }
+            };
+            countDisk(layer.first);
+            countDisk(layer.second);
+        }
+        const auto restoreStarted =
+            std::chrono::steady_clock::now();
+        auto clearPartialRestore = [&]() {
+            for (int layer = 0; layer < this->block_cnt; layer++) {
+                ClearCacheDeviceStorage(
+                    context->pastKeyValues[layer].first);
+                ClearCacheDeviceStorage(
+                    context->pastKeyValues[layer].second);
+            }
+            ClearResponseContextExtraDeviceState(context);
+        };
+
+        for (int layer = 0; layer < this->block_cnt; layer++) {
+            if (!RestoreCacheFromCpu(
+                    snapshot->caches[layer].first,
+                    context->pastKeyValues[layer].first,
+                    error) ||
+                !RestoreCacheFromCpu(
+                    snapshot->caches[layer].second,
+                    context->pastKeyValues[layer].second,
+                    error)) {
+                clearPartialRestore();
+                return false;
+            }
+        }
+        if (!RestoreResponseContextExtraCpuState(
+                context, snapshot->modelState.get(), error)) {
+            clearPartialRestore();
+            return false;
+        }
+
+        const uint64_t ticket = snapshot->ticket;
+        const size_t hostBytes = snapshot->hostBytes;
+        if (diskBytes > 0) {
+            const double elapsedSeconds =
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() -
+                    restoreStarted).count();
+            const double updatedReadRate =
+                UpdateCpuRequestSwapDiskReadRate(
+                    responseContextCpuSnapshotDiskReadMiBPerSecond.load(),
+                    diskBytes,
+                    elapsedSeconds);
+            responseContextCpuSnapshotDiskReadMiBPerSecond.store(
+                updatedReadRate);
+            responseContextCpuSnapshotDiskReadBytes.fetch_add(
+                diskBytes);
+            responseContextCpuSnapshotDiskRestoreCount.fetch_add(1);
+            printf(
+                "[FastLLM swap] disk snapshot hit ticket=%llu: "
+                "read_bytes=%zu, restore_seconds=%.3f, "
+                "read_mib_per_second=%.2f.\n",
+                (unsigned long long)snapshot->ticket,
+                diskBytes,
+                elapsedSeconds,
+                elapsedSeconds > 0.0
+                    ? (double)diskBytes /
+                        (1024.0 * 1024.0 * elapsedSeconds)
+                    : 0.0);
+            fflush(stdout);
+        }
+        responseContextCpuSnapshots.erase(snapshotIt);
+        if (this->verbose) {
+            printf("[FastLLM swap] restored request ticket=%llu, "
+                   "tokens=%zu, generated=%d, host_bytes=%zu.\n",
+                   (unsigned long long)ticket,
+                   context->allTokens.size(),
+                   context->curTokens,
+                   hostBytes);
+            fflush(stdout);
+        }
+        return true;
+    }
+
+    bool basellm::IsResponseContextSuspended(
+            const ResponseContext *context) const {
+        std::lock_guard<std::mutex> guard(
+            responseContextCpuSnapshotMutex);
+        return responseContextCpuSnapshots.find(
+                   const_cast<ResponseContext*>(context)) !=
+               responseContextCpuSnapshots.end();
+    }
+
+    ResponseContext *basellm::GetOldestSuspendedResponseContext()
+            const {
+        std::lock_guard<std::mutex> guard(
+            responseContextCpuSnapshotMutex);
+        ResponseContext *best = nullptr;
+        uint64_t bestTicket = UINT64_MAX;
+        for (const auto &it : responseContextCpuSnapshots) {
+            if (it.first != nullptr && it.second != nullptr &&
+                it.second->ticket < bestTicket) {
+                best = it.first;
+                bestTicket = it.second->ticket;
+            }
+        }
+        return best;
+    }
+
+    size_t basellm::GetSuspendedResponseContextCount() const {
+        std::lock_guard<std::mutex> guard(
+            responseContextCpuSnapshotMutex);
+        return responseContextCpuSnapshots.size();
+    }
+
+    void basellm::EraseResponseContextCpuSnapshot(
+            ResponseContext *context) {
+        std::lock_guard<std::mutex> guard(
+            responseContextCpuSnapshotMutex);
+        responseContextCpuSnapshots.erase(context);
     }
 
     PastKVCacheMemory::PastKVCacheMemory(const std::vector <int> &inputToken, int tokens, long long flushTime, std::vector<std::pair<Data, Data> > *kv) {
@@ -775,13 +2048,50 @@ namespace fastllm {
         }
 
         {
+            std::lock_guard<std::mutex> guard(
+                responseContextCpuSnapshotColdTierThreadMutex);
+            if (responseContextCpuSnapshotColdTierThread.joinable()) {
+                responseContextCpuSnapshotColdTierThread.join();
+            }
+        }
+
+        {
             std::lock_guard<std::mutex> guard(responseContextDict.locker);
             for (auto &item : responseContextDict.dicts) {
+                this->EraseResponseContextCpuSnapshot(item.second);
                 this->OnResponseContextRemoved(item.second);
                 delete item.second;
             }
             responseContextDict.dicts.clear();
         }
+        {
+            std::lock_guard<std::mutex> guard(
+                responseContextCpuSnapshotMutex);
+            responseContextCpuSnapshots.clear();
+        }
+        std::string diskSessionDirectory;
+        int diskSessionLockFd = -1;
+        {
+            std::lock_guard<std::mutex> guard(
+                responseContextCpuSnapshotDiskDirectoryMutex);
+            diskSessionDirectory =
+                responseContextCpuSnapshotDiskSessionDirectory;
+            responseContextCpuSnapshotDiskSessionDirectory.clear();
+            diskSessionLockFd =
+                responseContextCpuSnapshotDiskSessionLockFd;
+            responseContextCpuSnapshotDiskSessionLockFd = -1;
+        }
+        if (!diskSessionDirectory.empty()) {
+            std::error_code filesystemError;
+            std::filesystem::remove_all(
+                diskSessionDirectory, filesystemError);
+        }
+#ifndef _WIN32
+        if (diskSessionLockFd >= 0) {
+            flock(diskSessionLockFd, LOCK_UN);
+            close(diskSessionLockFd);
+        }
+#endif
     }
 
     basellm::~basellm() {
@@ -1182,6 +2492,22 @@ namespace fastllm {
         exit(0);
     }
 
+    std::string basellm::GetImagePlaceholder() const {
+        return "";
+    }
+
+    bool basellm::PrepareMultimodalImageInputs(
+            std::string &prompt,
+            const std::vector<MultimodalImage> &images,
+            std::map<std::string, std::vector<Data*> > &multimodalInput,
+            std::string &error) const {
+        (void)prompt;
+        (void)images;
+        multimodalInput.clear();
+        error = "the loaded model does not support native image inputs";
+        return false;
+    }
+
     void basellm::NewMainLoop() {
         RunNewMainLoop(false);
     }
@@ -1206,6 +2532,34 @@ namespace fastllm {
         int prefillChunkSize = model->GetChunkedPrefillSize();
         int batchedPrefillTokenLimit = std::max(
             prefillChunkSize, model->GetBatchedPrefillTokenLimit());
+        const bool boundedCacheUsesTokenGrowingStorage =
+            useGPUForward && model->BoundedKVCacheUsesTokenGrowingStorage();
+        // The first forward of an idle burst benefits from the model's full
+        // prefill batch: it keeps the ragged kernels efficient.  Once decode
+        // becomes active, however, repeatedly draining full prefill batches
+        // can starve existing requests long enough for newly admitted requests
+        // to form another large burst.  Use a smaller budget for those
+        // add-prefills and yield one scheduler iteration to decode after each
+        // such forward.  This is the non-mixed-forward equivalent of reserving
+        // decode tokens in a continuous-batching token budget.
+        int activePrefillTokenLimit = batchedPrefillTokenLimit;
+        bool interleaveActivePrefill = false;
+        if (useGPUForward && maxBatch > 1 && model->model_type == "qwen3_5") {
+            activePrefillTokenLimit = std::min(batchedPrefillTokenLimit, 8192);
+            interleaveActivePrefill = true;
+        }
+        if (const char *limitEnv =
+                std::getenv("FASTLLM_ACTIVE_PREFILL_TOKEN_LIMIT")) {
+            int configuredLimit = std::atoi(limitEnv);
+            if (configuredLimit <= 0) {
+                activePrefillTokenLimit = batchedPrefillTokenLimit;
+                interleaveActivePrefill = false;
+            } else {
+                activePrefillTokenLimit = std::min(
+                    batchedPrefillTokenLimit, configuredLimit);
+                interleaveActivePrefill = true;
+            }
+        }
 
         // 辅助lambda：释放一个请求占用的所有KV Cache分页，并以allTokens重新初始化为pending prefill状态
         auto releaseAndReinitRequest = [&](ResponseContext *ctx) {
@@ -1369,9 +2723,9 @@ namespace fastllm {
             }
         };
 
-        auto addManagerPageNeed = [](PagedCacheManager *manager, int currentTokens,
-                                     int currentPages, int appendTokens,
-                                     PageNeedState &state) {
+        auto addManagerPageNeed = [&](PagedCacheManager *manager, int currentTokens,
+                                      int currentPages, int appendTokens,
+                                      int retainedTokens, PageNeedState &state) {
             if (manager == nullptr || appendTokens <= 0 ||
                 manager->type != PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE ||
                 manager->pageLen <= 0) {
@@ -1379,7 +2733,18 @@ namespace fastllm {
             }
             currentTokens = std::max(0, currentTokens);
             currentPages = std::max(0, currentPages);
-            int totalTokens = currentTokens + appendTokens;
+            long long totalTokens = (long long)currentTokens + appendTokens;
+            if (retainedTokens >= 0 && prefillChunkSize > 0) {
+                // Bounded (for example sliding-window) caches are compacted
+                // after every prefill chunk.  Reserving the whole prompt here
+                // incorrectly rejects any prompt longer than their small
+                // per-layer pool even though those pages are reused by later
+                // chunks.  Include one partial retained page because trimming
+                // releases only complete pages.
+                long long peakTokens = (long long)retainedTokens +
+                                       prefillChunkSize + manager->pageLen - 1;
+                totalTokens = std::min(totalTokens, peakTokens);
+            }
             int totalPages = (totalTokens + manager->pageLen - 1) / manager->pageLen;
             if (totalPages > manager->maxPages) {
                 state.impossible = true;
@@ -1397,13 +2762,15 @@ namespace fastllm {
                 return state;
             }
 
-            std::function<bool(Data&, int, PageNeedState&)> addExistingCacheNeed =
-                    [&](Data &cache, int tokens, PageNeedState &out) -> bool {
+            std::function<bool(Data&, int, int, PageNeedState&)> addExistingCacheNeed =
+                    [&](Data &cache, int tokens, int retainedTokens,
+                        PageNeedState &out) -> bool {
                 if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
                     bool usedLocal = false;
                     for (auto &it : cache.multiDeviceDatas) {
                         if (it.second != nullptr) {
-                            usedLocal = addExistingCacheNeed(*it.second, tokens, out) || usedLocal;
+                            usedLocal = addExistingCacheNeed(
+                                *it.second, tokens, retainedTokens, out) || usedLocal;
                         }
                     }
                     if (usedLocal) {
@@ -1417,20 +2784,27 @@ namespace fastllm {
                 int cachePageLen = cache.pageLen > 0 ? cache.pageLen : cache.pagedKVCacheData->pageLen;
                 int currentTokens = currentPages > 0 ?
                         (currentPages - 1) * cachePageLen + cache.lastPageLen : 0;
-                addManagerPageNeed(cache.pagedKVCacheData, currentTokens, currentPages, tokens, out);
+                addManagerPageNeed(cache.pagedKVCacheData, currentTokens,
+                                   currentPages, tokens, retainedTokens, out);
                 return true;
             };
 
             for (int li = 0; li < model->block_cnt && li < (int)ctx->pastKeyValues.size(); li++) {
+                int retainedTokens = model->GetKVCacheRetainedTokens(li);
+                if (retainedTokens >= 0 && boundedCacheUsesTokenGrowingStorage) {
+                    retainedTokens = -1;
+                }
                 for (int keyFlag = 0; keyFlag < 2; keyFlag++) {
                     bool isKey = keyFlag == 0;
                     Data &cache = isKey ? ctx->pastKeyValues[li].first : ctx->pastKeyValues[li].second;
-                    if (addExistingCacheNeed(cache, appendTokens, state)) {
+                    if (addExistingCacheNeed(cache, appendTokens,
+                                             retainedTokens, state)) {
                         continue;
                     }
                     auto refs = model->GetPagedKVCacheManagers(li, isKey);
                     for (auto &ref : refs) {
-                        addManagerPageNeed(ref.second, 0, 0, appendTokens, state);
+                        addManagerPageNeed(ref.second, 0, 0, appendTokens,
+                                           retainedTokens, state);
                     }
                 }
             }
@@ -1492,6 +2866,13 @@ namespace fastllm {
         std::chrono::steady_clock::time_point idlePrefillBatchDeadline;
         std::chrono::steady_clock::time_point idlePrefillBatchHardDeadline;
         size_t idlePrefillBatchObservedSize = 0;
+        bool activePrefillNeedsDecode = false;
+        std::set<int> idleBurstPrefillHandles;
+        if (model->verbose && interleaveActivePrefill) {
+            printf("Fastllm Active AddPrefill token limit: %d "
+                   "(full idle burst, decode interleave enabled).\n",
+                   activePrefillTokenLimit);
+        }
         while (true) {
             if (model->isFree) {
                 break;
@@ -1513,6 +2894,8 @@ namespace fastllm {
             static const std::vector<int> decodeScalarDims = {1, 1};
             const int reserveBatch = std::max(1, maxBatch);
             bool selectedNeedLastTokens = false;
+            bool selectedHasPrompt = false;
+            bool selectedHasDecode = false;
             attentionMasks.reserve(reserveBatch);
             positionIds.reserve(reserveBatch);
             ownedAttentionMasks.reserve(reserveBatch);
@@ -1576,6 +2959,13 @@ namespace fastllm {
                 return a.handle < b.handle;
             });
 
+            if (currentActivate == 0) {
+                activePrefillNeedsDecode = false;
+                if (!hasPrefill) {
+                    idleBurstPrefillHandles.clear();
+                }
+            }
+
             // When the GPU is completely idle, the first HTTP request can wake
             // this loop and take dictLocker before the sibling requests in the
             // same burst have registered.  That turns one uniform batched
@@ -1610,6 +3000,32 @@ namespace fastllm {
             idlePrefillBatchDeadline = std::chrono::steady_clock::time_point();
             idlePrefillBatchHardDeadline = std::chrono::steady_clock::time_point();
             idlePrefillBatchObservedSize = 0;
+            // Keep the whole burst collected while idle on the efficient full
+            // prefill budget. Without remembering burst membership, the
+            // second through last groups of that burst are indistinguishable
+            // from latency-sensitive add-prefills once its first group starts
+            // decoding.
+            if (interleaveActivePrefill && currentActivate == 0 && hasPrefill) {
+                idleBurstPrefillHandles.clear();
+                for (auto &order : orders) {
+                    if (order.context->preTokens == 0) {
+                        idleBurstPrefillHandles.insert(order.handle);
+                    }
+                }
+            } else if (!idleBurstPrefillHandles.empty()) {
+                for (auto it = idleBurstPrefillHandles.begin();
+                     it != idleBurstPrefillHandles.end();) {
+                    auto contextIt = model->responseContextDict.dicts.find(*it);
+                    if (contextIt == model->responseContextDict.dicts.end() ||
+                        contextIt->second->isAbort ||
+                        contextIt->second->isEnding ||
+                        contextIt->second->preTokens != 0) {
+                        it = idleBurstPrefillHandles.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
 
             // 通过PagedCacheManager获取实际使用的物理页数（复用的页只算一次）
             if (totalPages > 0) {
@@ -1626,8 +3042,21 @@ namespace fastllm {
 
             // 当busyPages未超过pagesLimit时可以开启新的Prefill；超过时只做Decode
             bool canAddPrefill = (pagesLimit > 0) ? (busyPages < pagesLimit) : true;
+            int activeBeforeSelection = currentActivate;
+            bool isActiveAddPrefill = interleaveActivePrefill &&
+                hasPrefill &&
+                activeBeforeSelection > 0;
+            bool forceDecodeThisIteration = activeBeforeSelection > 0 &&
+                isActiveAddPrefill && activePrefillNeedsDecode;
+            bool hasIdleBurstPrefill = !idleBurstPrefillHandles.empty();
+            int currentPrefillTokenLimit =
+                isActiveAddPrefill && !hasIdleBurstPrefill ?
+                activePrefillTokenLimit : batchedPrefillTokenLimit;
 
             for (int isPrompt = 1; isPrompt >= 0; isPrompt--) {
+                if (isPrompt == 1 && forceDecodeThisIteration) {
+                    continue;
+                }
                 if (isPrompt == 0 && seqLens.size() > 0) {
                     continue;
                 }
@@ -1636,7 +3065,8 @@ namespace fastllm {
                     continue;
                 }
                 // 未超过阈值且有pending的prefill请求时，优先尝试prefill；但如果prefill阶段没收集到任何请求，回退做decode
-                if (isPrompt == 0 && hasPrefill && canAddPrefill && seqLens.size() > 0) {
+                if (isPrompt == 0 && hasPrefill && canAddPrefill &&
+                    seqLens.size() > 0) {
                     continue;
                 }
 
@@ -1684,13 +3114,32 @@ namespace fastllm {
                     }
 
                     if (isPrompt) {
-                        if (ctx->cacheLen == 0) {
-                            auto probeRefs = model->GetPagedKVCacheManagers(model->kvCacheId, true);
+                        if (ctx->cacheLen == 0 &&
+                            ctx->intParams.find("paged_prefix_restore_disabled") ==
+                                ctx->intParams.end()) {
                             PagedCacheManager *probeManager = nullptr;
-                            for (auto &ref : probeRefs) {
-                                if (ref.second != nullptr) {
-                                    probeManager = ref.second;
-                                    break;
+                            bool queryUnboundedLayersOnly = false;
+                            for (int li = 0; li < model->block_cnt && probeManager == nullptr; li++) {
+                                if (model->GetKVCacheRetainedTokens(li) >= 0) {
+                                    continue;
+                                }
+                                auto refs = model->GetPagedKVCacheManagers(li, true);
+                                for (auto &ref : refs) {
+                                    if (ref.second != nullptr) {
+                                        probeManager = ref.second;
+                                        queryUnboundedLayersOnly = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (probeManager == nullptr) {
+                                auto probeRefs = model->GetPagedKVCacheManagers(
+                                    model->kvCacheId, true);
+                                for (auto &ref : probeRefs) {
+                                    if (ref.second != nullptr) {
+                                        probeManager = ref.second;
+                                        break;
+                                    }
                                 }
                             }
                             if (probeManager != nullptr) {
@@ -1708,6 +3157,10 @@ namespace fastllm {
                                 int minCachedPages = (int)queryManager(probeManager).size();
                                 if (minCachedPages > 0) {
                                     for (int li = 0; li < model->block_cnt; li++) {
+                                        if (queryUnboundedLayersOnly &&
+                                            model->GetKVCacheRetainedTokens(li) >= 0) {
+                                            continue;
+                                        }
                                         for (int keyFlag = 0; keyFlag < 2; keyFlag++) {
                                             bool isKey = keyFlag == 0;
                                             auto refs = model->GetPagedKVCacheManagers(li, isKey);
@@ -1738,9 +3191,6 @@ namespace fastllm {
                                 }
                                 if (minCachedPages > 0) {
                                     int cachedLen = minCachedPages * probeManager->pageLen;
-                                    if (!model->RestorePagedPrefixCacheExtra(ctx, cachedLen)) {
-                                        continue;
-                                    }
                                     auto managerDevice = [](PagedCacheManager *manager) {
                                         if (manager == nullptr) {
                                             return -1;
@@ -1761,6 +3211,20 @@ namespace fastllm {
                                         if (managerData->dims.size() < 4) {
                                             return;
                                         }
+                                        // Model-specific extra state may have
+                                        // restored a bounded fallback tail before
+                                        // this generic full-prefix restore. Drop
+                                        // that cache-owned reference before
+                                        // replacing its page chain; the snapshot
+                                        // keeps its own independent references.
+                                        if (cache.isPagedKVCache &&
+                                            cache.pagedKVCacheData != nullptr &&
+                                            !cache.pageIndex.empty()) {
+                                            cache.pagedKVCacheData->ReleasePageIndices(
+                                                cache.pageIndex);
+                                            cache.pageIndex.clear();
+                                            cache.lastPageLen = 0;
+                                        }
                                         cache.isKVCache = true;
                                         cache.isPagedKVCache = true;
                                         cache.pagedKVCacheData = manager;
@@ -1776,11 +3240,23 @@ namespace fastllm {
                                         int headDim = managerData->dims[3];
                                         cache.Resize({numHeads, minCachedPages * manager->pageLen, headDim});
                                     };
-                                    auto restorePagedCache = [&](Data &cache,
-                                                                 const std::vector<std::pair<int, PagedCacheManager*> > &refs) {
+
+                                    struct PagedCacheRestorePlan {
+                                        Data *cache = nullptr;
+                                        bool multiDevice = false;
+                                        std::vector<std::pair<int, PagedCacheManager*> > refs;
+                                    };
+                                    std::vector<PagedCacheRestorePlan> restorePlans;
+                                    auto buildRestorePlan = [&](Data &cache,
+                                                                const std::vector<std::pair<int, PagedCacheManager*> > &refs,
+                                                                bool required) -> bool {
                                         std::vector<std::pair<int, PagedCacheManager*> > validRefs;
                                         for (auto ref : refs) {
                                             if (ref.second == nullptr || ref.second->pageLen != probeManager->pageLen) {
+                                                continue;
+                                            }
+                                            Data *managerData = (Data*)ref.second;
+                                            if (managerData->dims.size() < 4) {
                                                 continue;
                                             }
                                             if ((int)queryManager(ref.second).size() < minCachedPages) {
@@ -1789,11 +3265,89 @@ namespace fastllm {
                                             validRefs.push_back(ref);
                                         }
                                         if (validRefs.empty()) {
-                                            return;
+                                            return !required;
                                         }
-                                        if (validRefs.size() == 1) {
-                                            restoreOne(cache, validRefs[0].second, queryManager(validRefs[0].second));
-                                            return;
+
+                                        bool restoreAsMultiDevice =
+                                            cache.multiDeviceData ||
+                                            !cache.multiDeviceDatas.empty() ||
+                                            refs.size() > 1;
+                                        if (!restoreAsMultiDevice) {
+                                            restorePlans.push_back(
+                                                {&cache, false, std::move(validRefs)});
+                                            return true;
+                                        }
+
+                                        // TP cache restore is collective. Restoring only the
+                                        // ranks whose trie entries survived would leave the root
+                                        // metadata describing a subset while stale local caches
+                                        // and page references remain on the other ranks. Keep the
+                                        // model-specific fallback state unless every expected
+                                        // device can be restored together.
+                                        if (validRefs.size() != refs.size()) {
+                                            return !required;
+                                        }
+                                        std::set<int> restoreDevices;
+                                        for (auto &ref : validRefs) {
+                                            int device = ref.first >= 0
+                                                ? ref.first : managerDevice(ref.second);
+                                            if (device < 0 || !restoreDevices.insert(device).second) {
+                                                return !required;
+                                            }
+                                            ref.first = device;
+                                        }
+                                        std::set<int> currentDevices;
+                                        for (auto &it : cache.multiDeviceDatas) {
+                                            if (it.second != nullptr) {
+                                                currentDevices.insert(it.first);
+                                            }
+                                        }
+                                        if (currentDevices.empty()) {
+                                            for (int device : cache.dataDeviceIds) {
+                                                if (device >= 0) {
+                                                    currentDevices.insert(device);
+                                                }
+                                            }
+                                        }
+                                        if (!currentDevices.empty() &&
+                                            currentDevices != restoreDevices) {
+                                            return !required;
+                                        }
+
+                                        restorePlans.push_back(
+                                            {&cache, true, std::move(validRefs)});
+                                        return true;
+                                    };
+
+                                    bool restorePlanReady = true;
+                                    for (int li = 0; li < model->block_cnt; li++) {
+                                        auto &kvFirst = ctx->pastKeyValues[li].first;
+                                        auto &kvSecond = ctx->pastKeyValues[li].second;
+                                        bool unbounded = queryUnboundedLayersOnly &&
+                                            model->GetKVCacheRetainedTokens(li) < 0;
+                                        restorePlanReady =
+                                            buildRestorePlan(
+                                                kvFirst,
+                                                model->GetPagedKVCacheManagers(li, true),
+                                                unbounded && !kvFirst.isLinearAttention) &&
+                                            restorePlanReady;
+                                        restorePlanReady =
+                                            buildRestorePlan(
+                                                kvSecond,
+                                                model->GetPagedKVCacheManagers(li, false),
+                                                unbounded && !kvSecond.isLinearAttention) &&
+                                            restorePlanReady;
+                                    }
+
+                                    auto applyRestorePlan = [&](PagedCacheRestorePlan &plan) -> bool {
+                                        if (plan.cache == nullptr || plan.refs.empty()) {
+                                            return false;
+                                        }
+                                        Data &cache = *plan.cache;
+                                        if (!plan.multiDevice) {
+                                            restoreOne(cache, plan.refs[0].second,
+                                                       queryManager(plan.refs[0].second));
+                                            return true;
                                         }
 
                                         cache.multiDeviceData = true;
@@ -1802,11 +3356,8 @@ namespace fastllm {
                                         cache.isKVCache = true;
                                         cache.isPagedKVCache = true;
                                         Data *firstLocal = nullptr;
-                                        for (auto &ref : validRefs) {
-                                            int device = ref.first >= 0 ? ref.first : managerDevice(ref.second);
-                                            if (device < 0) {
-                                                continue;
-                                            }
+                                        for (auto &ref : plan.refs) {
+                                            int device = ref.first;
                                             cache.dataDeviceIds.push_back(device);
                                             Data *managerData = (Data*)ref.second;
                                             Data *&local = cache.multiDeviceDatas[device];
@@ -1821,11 +3372,7 @@ namespace fastllm {
                                             }
                                         }
                                         if (firstLocal == nullptr) {
-                                            cache.multiDeviceData = false;
-                                            cache.isPagedKVCache = false;
-                                            cache.pagedKVCacheData = nullptr;
-                                            cache.pageIndex.clear();
-                                            return;
+                                            return false;
                                         }
                                         cache.dataType = firstLocal->dataType;
                                         cache.UpdateUnitSize();
@@ -1835,15 +3382,38 @@ namespace fastllm {
                                         cache.lastPageLen = firstLocal->lastPageLen;
                                         cache.pagedKVCacheData = firstLocal->pagedKVCacheData;
                                         cache.dims = firstLocal->dims;
+                                        return true;
                                     };
-                                    for (int li = 0; li < model->block_cnt; li++) {
-                                        auto &kvFirst = ctx->pastKeyValues[li].first;
-                                        auto &kvSecond = ctx->pastKeyValues[li].second;
-                                        restorePagedCache(kvFirst, model->GetPagedKVCacheManagers(li, true));
-                                        restorePagedCache(kvSecond, model->GetPagedKVCacheManagers(li, false));
+
+                                    bool restoredPrefix = false;
+                                    if (restorePlanReady &&
+                                        model->RestorePagedPrefixCacheExtra(ctx, cachedLen)) {
+                                        restoredPrefix = true;
+                                        for (auto &plan : restorePlans) {
+                                            if (!applyRestorePlan(plan)) {
+                                                restoredPrefix = false;
+                                                break;
+                                            }
+                                        }
                                     }
-                                    ctx->currentTokens.erase(ctx->currentTokens.begin(), ctx->currentTokens.begin() + cachedLen);
-                                    ctx->cacheLen = cachedLen;
+
+                                    if (restoredPrefix) {
+                                        ctx->currentTokens.erase(
+                                            ctx->currentTokens.begin(),
+                                            ctx->currentTokens.begin() + cachedLen);
+                                        ctx->cacheLen = cachedLen;
+                                    } else {
+                                        // A prefix hit is useful only when its
+                                        // complete model state can be restored.
+                                        // Drop any model-specific partial state
+                                        // and let this request prefill normally.
+                                        for (auto &kv : ctx->pastKeyValues) {
+                                            ReleasePagedCachePages(kv.first, true);
+                                            ReleasePagedCachePages(kv.second, true);
+                                        }
+                                        ctx->cacheLen = 0;
+                                        ctx->intParams["paged_prefix_restore_disabled"] = 1;
+                                    }
                                     {
                                         std::lock_guard<std::mutex> guard(probeManager->pageIndexLocker);
                                         curBusyPages = probeManager->maxPages - probeManager->FreePageCount() + pendingNewPages;
@@ -1895,7 +3465,7 @@ namespace fastllm {
                                 continue;
                             }
                         } else {
-                            if (prefillTokenCount + thisLen > batchedPrefillTokenLimit && seqLens.size() > 0) {
+                            if (prefillTokenCount + thisLen > currentPrefillTokenLimit && seqLens.size() > 0) {
                                 continue;
                             }
                         }
@@ -1919,6 +3489,8 @@ namespace fastllm {
 
                     tokenContexts.push_back(ctx);
                     handles.push_back(ii.handle);
+                    selectedHasPrompt |= isPrompt != 0;
+                    selectedHasDecode |= isPrompt == 0;
                     if (isMultimodal) {
                         selectedMultimodal = true;
                     }
@@ -1988,6 +3560,21 @@ namespace fastllm {
                 }
             }
 
+            if (!seqLens.empty()) {
+                if (selectedHasPrompt && interleaveActivePrefill) {
+                    // If an idle burst did not fit in its first full-sized
+                    // forward, let the newly active requests decode before
+                    // admitting the remainder.  Burst membership decides
+                    // whether that remainder retains the full prefill budget.
+                    activePrefillNeedsDecode =
+                        isActiveAddPrefill ||
+                        (activeBeforeSelection == 0 &&
+                         handles.size() < orders.size());
+                } else if (selectedHasDecode) {
+                    activePrefillNeedsDecode = false;
+                }
+            }
+
             if (selectedNeedLastTokens) {
                 tokensManager.units.reserve(tokenContexts.size());
                 for (auto *ctx : tokenContexts) {
@@ -1996,7 +3583,7 @@ namespace fastllm {
             }
 
             // Decode阶段：检查空闲分页是否足够，不够时释放资源
-            if (seqLens.size() > 0 && seqLens[0] == 1) {
+            if (seqLens.size() > 0 && selectedHasDecode) {
                 auto pageNeeds = collectDecodePageNeeds(tokenContexts);
                 if (!pageNeeds.empty()) {
                     while (hasPagedManagerShortage(pageNeeds)) {
@@ -2163,15 +3750,33 @@ namespace fastllm {
                             curPastKeyValues.push_back(std::make_pair(&(*pastKeyValue1)[i].first,
                                                                       &(*pastKeyValue1)[i].second));
                         }
-                        if (useGPUForward) {
-                            ret = model->ForwardGPU(1, curInput, curAttentionMasks,
-                                                     curPositionIdsVec, curSeqLens, curPastKeyValues, generationConfigs,
-                                                     tokensManager, &logits);
-                        } else {
-                            ret = model->ForwardV2(1, curInput, curAttentionMasks,
-                                                   curPositionIdsVec, curSeqLens, curPastKeyValues, generationConfigs,
-                                                   tokensManager, &logits);
+                        bool oldIntermediateChunkedPrefill =
+                            model->isIntermediateChunkedPrefill;
+                        model->isIntermediateChunkedPrefill =
+                            st + curLen < len &&
+                            generationConfigs.size() == 1 &&
+                            generationConfigs[0].IsSimpleGreedy();
+                        try {
+                            if (useGPUForward) {
+                                ret = model->ForwardGPU(
+                                    1, curInput, curAttentionMasks,
+                                    curPositionIdsVec, curSeqLens,
+                                    curPastKeyValues, generationConfigs,
+                                    tokensManager, &logits);
+                            } else {
+                                ret = model->ForwardV2(
+                                    1, curInput, curAttentionMasks,
+                                    curPositionIdsVec, curSeqLens,
+                                    curPastKeyValues, generationConfigs,
+                                    tokensManager, &logits);
+                            }
+                        } catch (...) {
+                            model->isIntermediateChunkedPrefill =
+                                oldIntermediateChunkedPrefill;
+                            throw;
                         }
+                        model->isIntermediateChunkedPrefill =
+                            oldIntermediateChunkedPrefill;
                         st += curLen;
                         if (st < len) {
                             dictLocker.lock();
@@ -2182,11 +3787,17 @@ namespace fastllm {
                             }
                             dictLocker.unlock();
                         }
+                        const auto chunkEndTime =
+                            std::chrono::system_clock::now();
+                        const float chunkSpend =
+                            GetSpan(chunkStartTime, chunkEndTime);
+                        ObservePagedPrefixCacheRecompute(
+                            (size_t)curLen, chunkSpend);
                         if (model->verbose) {
-                            auto chunkEndTime = std::chrono::system_clock::now();
-                            float chunkSpend = GetSpan(chunkStartTime, chunkEndTime);
+                            float chunkSpendForLog = chunkSpend;
                             float totalSpend = GetSpan(prefillStartTime, chunkEndTime);
-                            float chunkSpeed = chunkSpend > 0 ? curLen / chunkSpend : 0;
+                            float chunkSpeed = chunkSpendForLog > 0
+                                ? curLen / chunkSpendForLog : 0;
                             float avgSpeed = totalSpend > 0 ? st / totalSpend : 0;
                             printf("[Prompt] Long Prefill ... (%d/%d, %d%%). Speed: %f tokens / s.\n",
                                    st, len, st * 100 / len, chunkSpeed);
@@ -2203,19 +3814,25 @@ namespace fastllm {
                                                positionIds, seqLens, pastKeyValues, generationConfigs,
                                                tokensManager, &logits);
                     }
-                    if (model->verbose) {
-                        int prefillTokens = 0;
-                        for (int i = 0; i < seqLens.size(); i++) {
-                            if (seqLens[i] > 1) {
-                                prefillTokens += seqLens[i];
-                            }
+                    const auto batchEndTime =
+                        std::chrono::system_clock::now();
+                    int prefillTokens = 0;
+                    for (int len : seqLens) {
+                        if (len > 1) {
+                            prefillTokens += len;
                         }
-                        if (prefillTokens > 0) {
-                            auto batchEndTime = std::chrono::system_clock::now();
-                            float batchSpend = GetSpan(batchStartTime, batchEndTime);
-                            float prefillSpeed = batchSpend > 0 ? prefillTokens / batchSpend : 0;
-                            printf("[Prompt] %d Tokens. Speed: %f tokens / s.\n", prefillTokens, prefillSpeed);
-                        }
+                    }
+                    const float batchSpend =
+                        GetSpan(batchStartTime, batchEndTime);
+                    if (prefillTokens > 0) {
+                        ObservePagedPrefixCacheRecompute(
+                            (size_t)prefillTokens, batchSpend);
+                    }
+                    if (model->verbose && prefillTokens > 0) {
+                        const float prefillSpeed = batchSpend > 0
+                            ? prefillTokens / batchSpend : 0;
+                        printf("[Prompt] %d Tokens. Speed: %f tokens / s.\n",
+                               prefillTokens, prefillSpeed);
                     }
                 }
                 if (printProfile) {
@@ -3187,6 +4804,7 @@ namespace fastllm {
                             this->model_struct == "pangu_moe" ||
                             this->model_struct == "glm4_moe" ||
                             this->model_struct == "qwen3_next" ||
+                            this->model_struct == "kimi_k3" ||
                             this->model_struct == "gemma4",
                             this->model_struct + " doesn't support bfloat16");
         } else {
@@ -3276,7 +4894,23 @@ namespace fastllm {
             ret = MakeInput(ret, round, user);
             return ret;
         }
-        return ApplyChatTemplate(ChatMessagesToJinjaVar(messages));
+        try {
+            return ApplyChatTemplate(ChatMessagesToJinjaVar(messages));
+        } catch (const std::exception &e) {
+            printf("[FastLLM] Jinja chat_template failed (%s), using MakeInput fallback.\n", e.what());
+            std::string ret = "";
+            std::string user = "";
+            int round = 0;
+            for (auto &message : messages) {
+                if (message.first == "user") {
+                    user = message.second;
+                } else if (message.first == "assistant") {
+                    ret = MakeHistory(ret, round++, user, message.second);
+                }
+            }
+            ret = MakeInput(ret, round, user);
+            return ret;
+        }
     }
 
     std::vector <int> basellm::ApplyChatTemplateToTokens(const ChatMessages &messages) {
@@ -3582,6 +5216,28 @@ namespace fastllm {
 
         int pageLen = fastllm::GetPageLen();
         int len = this->GetChunkedPrefillSize();
+        int cacheSizingLen = len;
+        auto usesDiskDevice = [](const std::map<std::string, int> &deviceMap) {
+            for (const auto &it : deviceMap) {
+                if (it.second > 0 &&
+                    (it.first == "disk" ||
+                     (it.first.size() > 5 && it.first.compare(0, 5, "disk:") == 0))) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (usesDiskDevice(this->deviceMap) ||
+            usesDiskDevice(this->moeDeviceMap) ||
+            usesDiskDevice(this->layeredMoeDeviceMap)) {
+            // A long synthetic prefill touches nearly every MoE expert and
+            // defeats transient disk loading. One token is enough to establish
+            // cache shapes; real prefills still use their full request length.
+            if (len > 1 && this->verbose) {
+                printf("[Fastllm] AutoWarmup disk prefill length clamped from %d to 1.\n", len);
+            }
+            len = 1;
+        }
         bool autoCalcPages = (fastllm::GetMaxTokens() <= 0);
         if (!autoCalcPages && fastllm::GetMaxTokens() > 0 && pageLen > 0) {
             int maxWarmupLen = std::max(1, fastllm::GetMaxTokens() - pageLen);
@@ -3636,7 +5292,9 @@ namespace fastllm {
         };
 
         if (autoCalcPages) {
-            minPages = len / pageLen + 2;
+            // Disk mode may shorten only the synthetic forward. Preserve the
+            // normal KV-cache capacity derived from the configured chunk size.
+            minPages = cacheSizingLen / pageLen + 2;
             fastllm::SetMaxTokens(minPages * pageLen);
         }
 
@@ -3741,6 +5399,9 @@ namespace fastllm {
         int tokenGrowingLayerCount = 0, linearLayerCount = 0;
         int boundedLayerCount = 0;
         long long linearFixedBytes = 0;
+        const bool boundedCacheUsesTokenGrowingStorage =
+            useGPUForwardForWarmup &&
+            this->BoundedKVCacheUsesTokenGrowingStorage();
 #ifdef USE_CUDA
         std::map<int, long long> deviceLinearFixedBytes;
         auto accountCudaLinearFixedBytes = [&](const Data &cache) {
@@ -3768,7 +5429,16 @@ namespace fastllm {
             auto &pastValue = pastKeyValuesStorage[i].second;
             if (pastKey.isLinearAttention || pastValue.isLinearAttention) {
                 linearLayerCount++;
-                linearFixedBytes += pastKey.GetBytes() + pastValue.GetBytes();
+                // Some hybrid linear-attention implementations only use one
+                // member of the key/value pair for their recurrent state.  The
+                // unused member is deliberately left with an empty shape, for
+                // which Data::GetBytes() is undefined.
+                if (!pastKey.dims.empty()) {
+                    linearFixedBytes += pastKey.GetBytes();
+                }
+                if (!pastValue.dims.empty()) {
+                    linearFixedBytes += pastValue.GetBytes();
+                }
 #ifdef USE_CUDA
                 accountCudaLinearFixedBytes(pastKey);
                 accountCudaLinearFixedBytes(pastValue);
@@ -3779,15 +5449,23 @@ namespace fastllm {
                 continue;
             }
             int retainedTokens = this->GetKVCacheRetainedTokens(i);
+            if (retainedTokens >= 0 && boundedCacheUsesTokenGrowingStorage) {
+                retainedTokens = -1;
+            }
             if (retainedTokens >= 0) {
                 boundedLayerCount++;
                 // The generic non-paged path compacts in blocks to avoid a
-                // memmove on every decode token. Reserve one such block on top
-                // of the retained tail.
+                // memmove on every decode token. A paged GPU path can also
+                // hold one complete prefill chunk before reclaiming old pages,
+                // so reserve the larger of those two transient tails.
                 int compactBlock = 64;
 #ifdef USE_CUDA
                 compactBlock = 128;
 #endif
+                int prefillChunk = this->GetChunkedPrefillSize();
+                if (prefillChunk > 0) {
+                    compactBlock = std::max(compactBlock, prefillChunk);
+                }
                 int capacityTokens = retainedTokens + compactBlock;
                 long long keyElements =
                     (long long)pastKey.dims[0] * pastKey.dims[2];

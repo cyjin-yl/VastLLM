@@ -251,6 +251,24 @@ extern "C" {
         if (!error.empty() || root.is_null()) {
             return false;
         }
+        json11::Json contentSampling = root["content_sampling"];
+        if (contentSampling.is_object() &&
+            contentSampling["type"].string_value() == "tool_content_sampling" &&
+            contentSampling["format"].string_value() == "kimi_k3_xtml") {
+            int topK = contentSampling["top_k"].int_value();
+            double topP = contentSampling["top_p"].number_value();
+            double temperature = contentSampling["temperature"].number_value();
+            if (topK <= 0 || topP <= 0.0 || topP > 1.0 ||
+                temperature <= 0.0) {
+                return false;
+            }
+            config.tool_call_content_sampling_enabled = true;
+            config.tool_call_content_top_k = topK;
+            config.tool_call_content_top_p = (float)topP;
+            config.tool_call_content_temperature = (float)temperature;
+            config.tool_call_allowed_token_ids.clear();
+            return true;
+        }
         json11::Json nameConstraint = root["name_constraint"];
         if (!nameConstraint.is_object()) {
             nameConstraint = root;
@@ -511,10 +529,13 @@ extern "C" {
 #ifdef USE_ROCM
             model->SetDataType(fastllm::DataType::FLOAT32);
 #else
-            if (model->model_type == "laguna") {
+            if (model->model_type == "laguna" ||
+                model->model_type == "kimi_k3") {
                 // Laguna's late-layer activations exceed the finite FP16
-                // range, so its automatic CUDA activation type must retain
-                // the checkpoint's BF16 exponent range.
+                // range, while Kimi-K3's dedicated CUDA kernels consume
+                // BF16.  Preserve BF16 for both models in auto mode; this
+                // also keeps Kimi-K3's KV capacity accounting consistent
+                // with the cache tensors created by its attention path.
                 model->SetDataType(fastllm::DataType::BFLOAT16);
             } else if (model->model_type == "glm_moe_dsa") {
                 model->SetDataType(fastllm::DataType::FLOAT32);
@@ -732,6 +753,25 @@ extern "C" {
         apply_pending_tool_call_constraint(config);
         for(int i = 0; i < stop_token_len; i++ )
         {
+            config.stop_token_ids.insert(stop_token_ids[i]);
+        }
+        config.input_token_length = input.size();
+        auto model = models.GetModel(modelId);
+        return model->LaunchResponseTokens(input, config);
+    }
+
+    DLL_EXPORT int launch_raw_prompt_llm_model(int modelId, int len, int *values,
+                                  int max_length, int min_length, bool do_sample, float top_p, int top_k,
+                                  float temperature, float repeat_penalty, bool output_logits,
+                                  int stop_token_len, int * stop_token_ids) {
+        std::vector <int> input;
+        for (int i = 0; i < len; i++) {
+            input.push_back(values[i]);
+        }
+        auto config = make_config(max_length, min_length, do_sample, top_p, top_k,
+                                  temperature, repeat_penalty, output_logits, true);
+        apply_pending_tool_call_constraint(config);
+        for (int i = 0; i < stop_token_len; i++) {
             config.stop_token_ids.insert(stop_token_ids[i]);
         }
         config.input_token_length = input.size();

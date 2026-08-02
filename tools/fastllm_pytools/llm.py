@@ -348,6 +348,12 @@ fastllm_lib.launch_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ct
                                                   ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
 fastllm_lib.launch_response_llm_model.restype = ctypes.c_int
 
+fastllm_lib.launch_raw_prompt_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                                                    ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
+                                                    ctypes.c_float, ctypes.c_float, ctypes.c_bool,
+                                                    ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+fastllm_lib.launch_raw_prompt_llm_model.restype = ctypes.c_int
+
 fastllm_lib.launch_response_llm_model_multimodal.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
                                                             ctypes.c_char_p, ctypes.c_void_p, 
                                                             ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
@@ -369,10 +375,10 @@ fastllm_lib.response_str_llm_model.argtypes = [ctypes.c_int, ctypes.c_char_p,
                                                ctypes.c_float, ctypes.c_float, ctypes.c_bool]
 fastllm_lib.response_str_llm_model.restype = ctypes.c_char_p
 
-fastllm_lib.launch_response_str_llm_model.argtype = [ctypes.c_int, ctypes.c_char_p,
-                                                     ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
-                                                     ctypes.c_float, ctypes.c_float, ctypes.c_bool,
-                                                     ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+fastllm_lib.launch_response_str_llm_model.argtypes = [ctypes.c_int, ctypes.c_char_p,
+                                                      ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
+                                                      ctypes.c_float, ctypes.c_float, ctypes.c_bool,
+                                                      ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
 fastllm_lib.launch_response_str_llm_model.restype = ctypes.c_int
 
 fastllm_lib.fetch_response_str_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
@@ -1004,17 +1010,24 @@ def encode_hf_prompt(tokenizer, prompt: str):
 
 def apply_hf_chat_template(tokenizer, conversation, add_generation_prompt = True,
                            tokenize = False, enable_thinking = None, tools = None,
-                           thinking_alias = False):
+                           thinking_alias = False, thinking_effort = None,
+                           tool_choice = None, chat_template_kwargs = None):
     kwargs = {
         "add_generation_prompt": add_generation_prompt,
         "tokenize": tokenize,
     }
+    if chat_template_kwargs:
+        kwargs.update(chat_template_kwargs)
     if enable_thinking is not None:
         kwargs["enable_thinking"] = enable_thinking
         if thinking_alias:
             kwargs["thinking"] = enable_thinking
     if tools is not None:
         kwargs["tools"] = tools
+    if thinking_effort is not None:
+        kwargs["thinking_effort"] = thinking_effort
+    if tool_choice is not None:
+        kwargs["tool_choice"] = tool_choice
     try:
         ret = tokenizer.apply_chat_template(conversation, **kwargs)
     except TypeError:
@@ -1023,6 +1036,8 @@ def apply_hf_chat_template(tokenizer, conversation, add_generation_prompt = True
             ret = tokenizer.apply_chat_template(conversation, **kwargs)
         except TypeError:
             kwargs.pop("enable_thinking", None)
+            kwargs.pop("thinking_effort", None)
+            kwargs.pop("tool_choice", None)
             kwargs.pop("tools", None)
             ret = tokenizer.apply_chat_template(conversation, **kwargs)
     if tokenize and hasattr(ret, "keys") and "input_ids" in ret.keys():
@@ -1385,11 +1400,36 @@ class model:
         except Exception:
             return False
 
+    def _is_kimi_k3(self) -> bool:
+        if self._get_architecture() == "KimiK3ForConditionalGeneration":
+            return True
+        try:
+            model_type = (
+                self.config.get("model_type", "")
+                if isinstance(getattr(self, "config", None), dict) else "")
+            return str(model_type) == "kimi_k3"
+        except Exception:
+            return False
+
     def _has_hf_chat_template(self) -> bool:
         if self.hf_tokenizer is None:
             return False
         chat_template = getattr(self.hf_tokenizer, "chat_template", None)
         return isinstance(chat_template, str) and chat_template != ""
+
+    def _can_apply_hf_chat_template(self) -> bool:
+        if self._has_hf_chat_template():
+            return True
+        # Kimi K3 deliberately ships a Python XTML renderer instead of a
+        # Jinja chat_template.  Its tokenizer overrides apply_chat_template,
+        # so a missing tokenizer.chat_template does not mean rendering is
+        # unavailable.
+        return (
+            self._is_kimi_k3()
+            and self.hf_tokenizer is not None
+            and callable(getattr(self.hf_tokenizer,
+                                 "apply_chat_template", None))
+        )
 
     def _build_messages(self, query: str, history: List[Tuple[str, str]]) -> List[Dict[str, str]]:
         messages = []
@@ -1421,7 +1461,7 @@ class model:
             thinking_mode = "thinking" if self.enable_thinking else "chat"
             return encode_messages(self._build_messages(query, history), thinking_mode=thinking_mode)
 
-        if self._has_hf_chat_template():
+        if self._can_apply_hf_chat_template():
             if (self.system_prompt != ""):
                 messages.append({"role": "system", "content": self.system_prompt})
             for his in history:
@@ -1567,7 +1607,9 @@ class model:
         return conversation
 
     def get_input_token_len(self, conversation: List[Dict[str, str]], add_generation_prompt = True,
-                            enable_thinking = None, images: List = None, videos: List = None) -> int:
+                            enable_thinking = None, images: List = None, videos: List = None,
+                            tools: List = None, thinking_effort = None,
+                            tool_choice = None, chat_template_kwargs = None) -> int:
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
         multimodal_images = list(images or [])
@@ -1640,7 +1682,7 @@ class model:
             architecture = self.config["architectures"][0]
         except:
             architecture = ""
-        if self._has_hf_chat_template():
+        if self._can_apply_hf_chat_template():
             template_conversation = self.trans_conversation(
                 copy.deepcopy(conversation))
             cache_key = None
@@ -1648,7 +1690,8 @@ class model:
                 try:
                     cache_key = json.dumps(
                         [template_conversation, add_generation_prompt,
-                         enable_thinking],
+                         enable_thinking, tools, thinking_effort, tool_choice,
+                         chat_template_kwargs],
                         ensure_ascii = False,
                         sort_keys = True,
                         separators = (",", ":"))
@@ -1681,7 +1724,12 @@ class model:
                         template_conversation,
                         add_generation_prompt = add_generation_prompt,
                         tokenize = True,
-                        enable_thinking = enable_thinking)
+                        enable_thinking = enable_thinking,
+                        tools = tools,
+                        thinking_alias = self._is_kimi_k3(),
+                        thinking_effort = thinking_effort,
+                        tool_choice = tool_choice,
+                        chat_template_kwargs = chat_template_kwargs)
                 except BaseException as error:
                     if cache_key is not None:
                         with self.text_input_token_cache_lock:
@@ -1707,6 +1755,10 @@ class model:
                 "conversation": copy.deepcopy(template_conversation),
                 "add_generation_prompt": add_generation_prompt,
                 "enable_thinking": enable_thinking,
+                "tools": copy.deepcopy(tools),
+                "thinking_effort": thinking_effort,
+                "tool_choice": copy.deepcopy(tool_choice),
+                "chat_template_kwargs": copy.deepcopy(chat_template_kwargs),
                 "input_ids": list(input_ids),
             }
             return len(input_ids)
@@ -1866,7 +1918,7 @@ class model:
         conversation = None
         if (isinstance(query, List)):
             conversation = query
-        if self._has_hf_chat_template():
+        if self._can_apply_hf_chat_template():
             tokenizer = self.hf_tokenizer
             type = None
             if (hasattr(tokenizer, "name") 
@@ -1992,13 +2044,30 @@ class model:
                         top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
                         one_by_one = True, stop_token_ids: List[int] = None, add_generation_prompt = True, 
                         images: List = None, videos: List = None, tools: List = None, enable_thinking = None,
-                        tool_call_constraint: Optional[Dict[str, Any]] = None):
+                        thinking_effort = None, tool_choice = None,
+                        chat_template_kwargs = None,
+                        tool_call_constraint: Optional[Dict[str, Any]] = None,
+                        raw_prompt: bool = False,
+                        raw_prompt_tokens: Optional[List[int]] = None):
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
         pending_text_input_token_cache = getattr(
             self.thread_local_obj, "pending_text_input_token_cache", None)
         self.thread_local_obj.pending_text_input_token_cache = None
         self._apply_tool_call_constraint_to_native(tool_call_constraint)
+        if raw_prompt:
+            if not isinstance(query, str):
+                raise ValueError("raw_prompt requires a string prompt")
+            if images or videos:
+                raise ValueError("raw_prompt does not support images or videos")
+            input = (list(raw_prompt_tokens) if raw_prompt_tokens is not None
+                     else self.encode(query))
+            stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
+            return fastllm_lib.launch_raw_prompt_llm_model(
+                self.model, len(input), (ctypes.c_int * len(input))(*input),
+                max_length, min_length, do_sample, top_p, top_k, temperature,
+                repeat_penalty, False, stop_token_len, stop_token_list)
+
         conversation = None
         if (isinstance(query, List)):
             conversation = query
@@ -2179,7 +2248,7 @@ class model:
                 print("Error: can't support architectures: " + architecture)
                 exit(0)
 
-        if self._has_hf_chat_template():
+        if self._can_apply_hf_chat_template():
             tokenizer = self.hf_tokenizer
             type = None
             if (hasattr(tokenizer, "name") 
@@ -2192,26 +2261,51 @@ class model:
                 input = tokenizer.build_chat_input(query, history=history)["input_ids"].reshape(-1).tolist()
             else:
                 prompt = ""
+                direct_template_tokens = None
                 can_reuse_token_count = (
                     conversation is not None and len(conversation) != 0 and
-                    not tools and not self.save_history and
+                    not self.save_history and
                     pending_text_input_token_cache is not None and
                     pending_text_input_token_cache.get("conversation") == conversation and
                     pending_text_input_token_cache.get("add_generation_prompt") == add_generation_prompt and
-                    pending_text_input_token_cache.get("enable_thinking") == enable_thinking)
+                    pending_text_input_token_cache.get("enable_thinking") == enable_thinking and
+                    pending_text_input_token_cache.get("tools") == tools and
+                    pending_text_input_token_cache.get("thinking_effort") == thinking_effort and
+                    pending_text_input_token_cache.get("tool_choice") == tool_choice and
+                    pending_text_input_token_cache.get("chat_template_kwargs") == chat_template_kwargs)
                 if can_reuse_token_count:
                     input = pending_text_input_token_cache["input_ids"]
                 elif (conversation != None and len(conversation) != 0):
-                    prompt = apply_hf_chat_template(tokenizer, self.trans_conversation(conversation),
-                                                    add_generation_prompt = add_generation_prompt,
-                                                    tokenize = False,
-                                                    enable_thinking = enable_thinking,
-                                                    tools = tools,
-                                                    thinking_alias = True)
+                    if self._is_kimi_k3():
+                        direct_template_tokens = apply_hf_chat_template(
+                            tokenizer,
+                            self.trans_conversation(conversation),
+                            add_generation_prompt = add_generation_prompt,
+                            tokenize = True,
+                            enable_thinking = enable_thinking,
+                            tools = tools,
+                            thinking_alias = True,
+                            thinking_effort = thinking_effort,
+                            tool_choice = tool_choice,
+                            chat_template_kwargs = chat_template_kwargs)
+                    else:
+                        prompt = apply_hf_chat_template(
+                            tokenizer,
+                            self.trans_conversation(conversation),
+                            add_generation_prompt = add_generation_prompt,
+                            tokenize = False,
+                            enable_thinking = enable_thinking,
+                            tools = tools,
+                            thinking_alias = True,
+                            thinking_effort = thinking_effort,
+                            tool_choice = tool_choice,
+                            chat_template_kwargs = chat_template_kwargs)
                 else:
                     prompt = query if self.direct_query else self.get_prompt(query, history)
                 if not can_reuse_token_count:
-                    if (self.save_history):
+                    if direct_template_tokens is not None:
+                        input = direct_template_tokens
+                    elif (self.save_history):
                         input = self.tokenizer_cache.tokenize_with_cache(tokenizer, prompt)
                     else:
                         input = encode_hf_prompt(tokenizer, prompt)
@@ -2296,7 +2390,7 @@ class model:
         }
     
     def stream_response_handle(self, handle):
-        if self._has_hf_chat_template():
+        if self._can_apply_hf_chat_template():
             tokenizer = self.hf_tokenizer
             tokens = []
             while True:
@@ -2368,7 +2462,7 @@ class model:
             if statistics is not None:
                 response_statistics.update(statistics)
 
-        if self._has_hf_chat_template():
+        if self._can_apply_hf_chat_template():
             tokenizer = self.hf_tokenizer
             tokens = []
             while True:

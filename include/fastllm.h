@@ -173,6 +173,14 @@ namespace fastllm {
         std::map <std::string, std::vector <std::string> > tool_call_allowed_parameter_names;
         std::vector <std::string> tool_call_parameter_name_prefixes;
         std::vector <int> tool_call_allowed_token_ids;
+        bool tool_call_content_sampling_enabled = false;
+        // Set on the per-step config after Kimi-K3 has drained DSpark's
+        // scheduler-ahead queue. DSpark then samples from its batched target
+        // verification logits while keeping target and draft caches aligned.
+        bool tool_call_content_sampling_active = false;
+        int tool_call_content_top_k = 1;
+        float tool_call_content_top_p = 1.0f;
+        float tool_call_content_temperature = 1.0f;
 
         bool IsSimpleGreedy() const {
             if (!tool_call_allowed_token_ids.empty()) {
@@ -523,6 +531,7 @@ namespace fastllm {
         int tpQHeads = 0;
         int tpKVHeads = 0;
         int tpHeadDim = 0;
+        int tpSplitUnit = 0;
 
         int weightId;
         bool isRegistered = false;
@@ -634,17 +643,43 @@ namespace fastllm {
         void ResetMultiDeviceState();
     };
 
+    struct PagedPrefixCacheTierPayload {
+        std::vector<uint8_t> bytes;
+        size_t uncompressedBytes = 0;
+        bool zstdCompressed = false;
+        uint64_t checksum = 0;
+
+        bool accounted = false;
+        ~PagedPrefixCacheTierPayload();
+    };
+
+    struct PagedPrefixCacheTierDiskRef {
+        uint64_t offset = 0;
+        size_t storedBytes = 0;
+        size_t uncompressedBytes = 0;
+        bool zstdCompressed = false;
+        uint64_t checksum = 0;
+    };
+
     struct CacheTrieNode {
         int pageId = -1;
         long long timestamp = 0;
+        uint64_t accessCount = 0;
+        long long lastAccessTimestamp = 0;
+        int depthPages = 0;
+        int maxPrefixDepthPages = 0;
         std::unordered_map<uint64_t, CacheTrieNode*> children;
         CacheTrieNode *parent = nullptr;
         uint64_t edgeHash = 0;
+        std::vector<int> edgeTokens;
+        std::shared_ptr<PagedPrefixCacheTierPayload> tierPayload;
+        std::shared_ptr<PagedPrefixCacheTierDiskRef> tierDisk;
     };
 
     // 一个带PageCache功能的Data，可以管理多个PageCache
     class PagedCacheManager : public Data {
         public:
+            ~PagedCacheManager();
             enum PagedCacheManagerType {
                 PAGED_CACHE_MANAGER_TYPE_KV_CACHE = 0,
                 PAGED_CACHE_MANAGER_TYPE_MLP_CACHE = 1
@@ -682,6 +717,13 @@ namespace fastllm {
             void SetMaxPages(int maxPages);
             int GetUnusedPageIndex(bool pick);
             void EvictTrieSubtree(CacheTrieNode *node);
+            int GetUnusedPageIndexLocked(
+                bool pick,
+                const std::unordered_set<int> *protectedPages);
+            bool PageOutTrieNode(CacheTrieNode *node);
+            bool MaterializeTrieNode(
+                CacheTrieNode *node,
+                const std::unordered_set<int> &protectedPages);
             void ReleasePageIndex(int pageIndex);
             void ReleasePageIndices(const std::vector<int> &pageIndices);
             void Pick(std::vector<int> &pageIds);
@@ -690,6 +732,143 @@ namespace fastllm {
             void Record(const std::vector<int> &tokens, const std::vector<int> &pages);
             void Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds);
     };
+
+    bool PagedPrefixCacheCpuTierEnabled();
+    bool PagedPrefixCacheDiskTierEnabled();
+    uint64_t GetPagedPrefixCacheGpuHitPages();
+    uint64_t GetPagedPrefixCacheCpuHitPages();
+    uint64_t GetPagedPrefixCacheCpuTierBytes();
+    uint64_t GetPagedPrefixCacheDiskWriteBytes();
+    uint64_t GetPagedPrefixCacheDiskLiveBytes();
+    uint64_t GetPagedPrefixCacheDiskReadBytes();
+    uint64_t GetPagedPrefixCacheDiskHitCount();
+    double GetPagedPrefixCacheDiskReadMegabytesPerSecond();
+    void ObservePagedPrefixCacheRecompute(
+        size_t tokens, double seconds);
+    double GetPagedPrefixCacheRecomputeTokensPerSecond();
+    double GetPagedPrefixCacheZstdDecompressMegabytesPerSecond();
+    uint64_t GetPagedPrefixCacheZstdCompressCalls();
+    uint64_t GetPagedPrefixCacheZstdCompressInputBytes();
+    uint64_t GetPagedPrefixCacheZstdCompressOutputBytes();
+    double GetPagedPrefixCacheZstdCompressSeconds();
+    uint64_t GetPagedPrefixCacheZstdDecompressCalls();
+    uint64_t GetPagedPrefixCacheZstdDecompressInputBytes();
+    uint64_t GetPagedPrefixCacheZstdDecompressOutputBytes();
+    double GetPagedPrefixCacheZstdDecompressSeconds();
+    struct CacheSnapshotMetadata {
+        long long cacheUid = 0;
+        bool isKVCache = false;
+        bool isLinearAttention = false;
+        bool isLinearAttentionTransposed = false;
+        int pageLen = 0;
+        int lastPageLen = 0;
+        DataType dataType = DataType::FLOAT32;
+        std::vector<int> dims;
+        std::vector<uint64_t> strides;
+        uint64_t expansionSize = 0;
+        uint64_t expansionBytes = 0;
+        std::vector<int> expansionDims;
+        DataDevice dataDevice = DataDevice::CPU;
+        std::vector<int> dataDeviceIds;
+        TensorParallelLayoutType tpLayout = TP_LAYOUT_NONE;
+        int tpAxis = -1;
+        std::vector<int> tpGlobalDims;
+        std::map<int, std::vector<std::pair<int, int> > > tpRanges;
+        TensorParallelLinearType tpLinearType = TP_LINEAR_NONE;
+        TensorParallelPackType tpPackType = TP_PACK_NONE;
+        int tpQHeads = 0;
+        int tpKVHeads = 0;
+        int tpHeadDim = 0;
+    };
+
+    // Shared ownership keeps copied snapshot descriptors from unlinking a
+    // spill file while another descriptor can still restore it.
+    struct PagedCacheCpuSnapshotDiskFile {
+        std::string path;
+        size_t bytes = 0;
+        uint64_t checksum = 0;
+
+        bool ownsPath = false;
+        ~PagedCacheCpuSnapshotDiskFile();
+    };
+
+    struct PagedCacheCpuSnapshotPart {
+        bool valid = false;
+        CacheSnapshotMetadata metadata;
+        PagedCacheManager *manager = nullptr;
+        int pageCount = 0;
+        size_t pageBytes = 0;
+        size_t uncompressedBytes = 0;
+        bool zstdCompressed = false;
+        bool zstdContentChecksum = false;
+        std::vector<uint8_t> compressedBytes;
+        std::vector<uint8_t> bytes;
+        std::shared_ptr<PagedCacheCpuSnapshotDiskFile> diskFile;
+
+    };
+
+    struct PagedCacheCpuSnapshot {
+        bool valid = false;
+        bool multiDeviceData = false;
+        PagedCacheCpuSnapshotPart single;
+    };
+    CacheSnapshotMetadata CaptureCacheSnapshotMetadata(
+        const Data &cache);
+
+    // Copies the physical bytes of a single-device paged cache to pageable
+    // host storage without changing page ownership. Multi-device roots are
+    // rejected so callers can retain the resident cache as a safe fallback.
+    bool SnapshotPagedCacheToCpu(
+        const Data &cache,
+        PagedCacheCpuSnapshot &snapshot,
+        std::string *error = nullptr);
+
+    // Compresses each physical-page byte stream only when zstd produces a
+    // smaller representation. Unsupported builds and incompressible input
+    // remain byte-for-byte raw and restorable.
+    bool TryCompressPagedCacheCpuSnapshot(
+        PagedCacheCpuSnapshot &snapshot,
+        int compressionLevel = 1,
+        std::string *error = nullptr);
+    struct PagedCacheCpuSnapshotZstdMetrics {
+        uint64_t compressCalls = 0;
+        uint64_t compressInputBytes = 0;
+        uint64_t compressOutputBytes = 0;
+        uint64_t compressNanoseconds = 0;
+        uint64_t decompressCalls = 0;
+        uint64_t decompressInputBytes = 0;
+        uint64_t decompressOutputBytes = 0;
+        uint64_t decompressNanoseconds = 0;
+    };
+    PagedCacheCpuSnapshotZstdMetrics
+        GetPagedCacheCpuSnapshotZstdMetrics();
+    bool PagedCacheCpuSnapshotZstdAvailable();
+    size_t GetPagedCacheCpuSnapshotStoredBytes(
+        const PagedCacheCpuSnapshot &snapshot);
+
+    // Atomically writes the currently stored raw or zstd stream, records a
+    // checksum, and releases its resident vector. The shared disk descriptor
+    // unlinks the transient file after the last snapshot owner is destroyed.
+    bool SpillPagedCacheCpuSnapshotPartToDisk(
+        PagedCacheCpuSnapshotPart &part,
+        const std::string &path,
+        std::string *error = nullptr);
+    bool LoadPagedCacheCpuSnapshotPartFromDisk(
+        const PagedCacheCpuSnapshotPart &part,
+        std::vector<uint8_t> &storedBytes,
+        std::string *error = nullptr);
+
+    // Allocates fresh physical pages in the original manager and restores the
+    // logical page order and packed bytes captured by SnapshotPagedCacheToCpu.
+    // The destination must not own live storage.
+    bool RestorePagedCacheFromCpu(
+        const PagedCacheCpuSnapshot &snapshot,
+        Data &cache,
+        std::string *error = nullptr);
+
+    // Releases every paged reference reachable from cache exactly once, then
+    // resets it to an empty, non-owning cache descriptor.
+    void ReleasePagedCacheStorage(Data &cache);
 
     struct PartitionLinkNode {
         std::pair <int, int> *cur = nullptr;
@@ -892,15 +1071,18 @@ namespace fastllm {
     void CopyKVCache(Data &oldCache, Data &newCache, int oldBsStart, int newBsStart, int bs, int offset);
 
     bool CanRunMergeMOE(const Data &input, std::vector <Data*> &biass);
+    bool CanRunMergeMOE(const Data &input, std::vector <Data*> &weights,
+                        std::vector <Data*> &biass);
     enum MoeGateType {
         MoeGateSwiglu = 0,
         MoeGateGeglu = 1
     };
-    void MergeMOE(const Data &input, const Data &index, const Data &score, std::vector <Data*> &weights, std::vector <Data*> &biass, 
+    void MergeMOE(const Data &input, const Data &index, const Data &score, std::vector <Data*> &weights, std::vector <Data*> &biass,
                 Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
                 float sharedScale, Data &output, int layer = 0, MoeGateType gateType = MoeGateSwiglu,
                 bool expertParallel = false, float swigluLimit = 0.0f,
-                bool deepSeekV4Mode = false);
+                bool deepSeekV4Mode = false,
+                const Data *allowedExpertMask = nullptr);
 
     void FusedMOE(const Data &input, const Data &index, const Data &score,
                 Data &gate, Data &up, Data &down, Data &w1,
@@ -909,7 +1091,9 @@ namespace fastllm {
     void MergeMLA(Data &qNope, Data &qPe, Data &kvCache, Data &peCache, const Data &mask, Data &output, float softmaxScale);
 
     // MLA with paged KV cache: kvCache (kpe) and peCache (ckv) are stored in paged form (isPagedKVCache, pageIndex, lastPageLen, pagedKVCacheData).
-    void MergeMLAPaged(Data &qNope, Data &qPe, Data &kvCachePaged, Data &peCachePaged, Data &output, float softmaxScale);
+    void MergeMLAPaged(Data &qNope, Data &qPe, Data &kvCachePaged,
+                       Data &peCachePaged, Data &output,
+                       float softmaxScale, int kvLen = -1);
 
     void Attention(const Data &q, const Data &k, const Data &v, const Data &mask, Data &output,
                    int group, float scale, int attentionType);
@@ -930,6 +1114,71 @@ namespace fastllm {
     void RMSNorm(const Data &input, const Data &weight, float eps, Data &output);
 
     void RMSNormPart(const Data &input, const Data &weight, float eps, int start, int end, Data &output);
+
+    // Kimi-K3 operators.  These are dispatched through the regular FastLLM
+    // executor; the CPU backend is the first implementation.
+    void KimiK3RMSNorm(const Data &input, const Data &weight, float eps,
+                       Data &output);
+
+    void KimiK3CausalConv1D(const Data &input, const Data &weight,
+                           int kernelSize, Data &output);
+
+    void KimiK3CausalConv1D(const Data &input, const Data &weight,
+                           int kernelSize, Data &cache, Data &output);
+
+    // Updates the packed Q/K/V short-convolution cache from a prefix of the
+    // projected inputs without evaluating convolution outputs.
+    void KimiK3UpdatePackedConvCache(
+            const Data &q, const Data &k, const Data &v,
+            int history, int tokens, Data &cache);
+
+    void KimiK3L2Norm(const Data &input, float eps, Data &output);
+
+    void KimiK3RecurrentKDA(
+            const Data &q, const Data &k, const Data &v,
+            const Data &rawGate, const Data &rawBeta,
+            const Data &aLog, const Data &dtBias, float lowerBound,
+            Data &state, Data &output, Data &decay, Data &beta);
+
+    // Inference only consumes the recurrent output and updated state.  Avoid
+    // materializing the full-sequence float32 decay/beta diagnostics on that
+    // path while retaining KimiK3RecurrentKDA for validation and tooling.
+    void KimiK3RecurrentKDAOutputOnly(
+            const Data &q, const Data &k, const Data &v,
+            const Data &rawGate, const Data &rawBeta,
+            const Data &aLog, const Data &dtBias, float lowerBound,
+            Data &state, Data &output);
+
+    // Replays only the recurrent-state transition for the first `tokens`
+    // rows of a captured verification batch.
+    void KimiK3RecurrentKDAUpdateState(
+            const Data &k, const Data &v,
+            const Data &rawGate, const Data &rawBeta,
+            const Data &aLog, const Data &dtBias, float lowerBound,
+            int tokens, Data &state);
+
+    void KimiK3RMSNormSigmoidGate(
+            const Data &input, const Data &gate, const Data &weight,
+            float eps, Data &output);
+
+    void KimiK3AttnRes(
+            const Data &prefixSum, const Data &blockResidual,
+            const Data &projection, const Data &norm, float eps,
+            Data &output);
+
+    void KimiK3SiTUAndMul(
+            const Data &gate, const Data &up, float beta,
+            float linearBeta, Data &output);
+
+    void KimiK3RoutedExperts(
+            const Data &input, const Data &index, const Data &score,
+            std::vector<Data*> &w1s, std::vector<Data*> &w2s,
+            std::vector<Data*> &w3s, float beta, float linearBeta,
+            Data &output);
+
+    void KimiK3CausalAttention(
+            const Data &q, const Data &k, const Data &v,
+            float scale, Data &output);
 
     void LayerNorm(Data &input, Data &gamma, Data &beta, int axis, Data &output);
 
@@ -1052,6 +1301,13 @@ namespace fastllm {
 
     void TransferAttn(Data &input);
 
+    void GatedDeltaRulePrepareAttn(const Data &at, const Data &decayMask,
+                                   Data &attn);
+    void GatedDeltaRuleBuildDecay(Data &g, Data &decayMask);
+
+    void GatedDeltaRuleApplyDecayMask(Data &attn, const Data &decayMask,
+                                      int causalBase);
+
     void RecurrentGatedDeltaRule(Data &q, Data &k, Data &v, Data &g, Data &b, 
                                 Data &last_recurrent_state, Data &core_attn_out, float qScale = 1.0f);
 
@@ -1088,6 +1344,11 @@ namespace fastllm {
     void Llama3RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta,
                             float factor, float originalMaxPosition,
                             float lowFreqFactor, float highFreqFactor);
+
+    // YaRN RoPE encoding computed directly from positions, without a sin/cos cache.
+    void YarnRopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta,
+                          float factor, float originalMaxPosition,
+                          float betaFast, float betaSlow, float attentionFactor);
 
     void Qwen35InterleavedRope(Data &input, const Data &positionIds, int rotaryDim,
                                int sectionT, int sectionH, int sectionW,

@@ -28,6 +28,7 @@
 #include "qwen3_moe.h"
 #include "hy_v3.h"
 #include "qwen3_next.h"
+#include "kimi_k3.h"
 #include "qwen3_5.h"
 #include "step3p5.h"
 #include "laguna.h"
@@ -215,6 +216,12 @@ namespace fastllm {
         this->specialWeightLayerIds[weightName] = layerId;
     }
 
+    std::string basellm::SelectSpecialWeightDevice(const std::string &weightName,
+                                                   int layerId) const {
+        (void)weightName;
+        return this->SelectMoeDeviceForLayer(layerId);
+    }
+
     bool basellm::UseLayeredMoeDevice(int layerId) const {
         if (this->moeDeviceLayers < 0 || this->layeredMoeDeviceMap.empty() ||
             this->block_cnt <= 0 || layerId < 0) {
@@ -311,12 +318,20 @@ namespace fastllm {
     }
 
     static int ParseRoutedExpertIndex(const std::string &weightName) {
-        const std::string marker = ".ffn.experts.";
-        size_t pos = weightName.find(marker);
-        if (pos == std::string::npos) {
+        const char *markers[] = {".ffn.experts.", ".moe.experts."};
+        size_t pos = std::string::npos;
+        size_t markerSize = 0;
+        for (const char *marker : markers) {
+            pos = weightName.find(marker);
+            if (pos != std::string::npos) {
+                markerSize = std::strlen(marker);
+                break;
+            }
+        }
+        if (pos == std::string::npos || markerSize == 0) {
             return -1;
         }
-        pos += marker.size();
+        pos += markerSize;
         size_t end = pos;
         while (end < weightName.size() && std::isdigit((unsigned char)weightName[end])) {
             end++;
@@ -364,6 +379,7 @@ namespace fastllm {
         if ((model->model_type != "qwen3_moe" &&
              model->model_type != "hy_v3" &&
              model->model_type != "step3p5" &&
+             model->model_type != "laguna" &&
              model->model_type != "minimax_m2" &&
              model->model_type != "deepseek_v4" &&
              model->model_struct != "qwen3_5") ||
@@ -381,7 +397,67 @@ namespace fastllm {
         Data emptyBias;
         bool explicitDeviceRatios = HasExplicitRatiosForAllDevices(devices, ratios);
         std::lock_guard<std::mutex> guard(multiCudaTpLoadSplitLock);
+        if (model->model_type == "deepseek_v4") {
+            const DeepSeekV4Model *deepseekV4 =
+                dynamic_cast<const DeepSeekV4Model*>(model);
+            if (deepseekV4 != nullptr) {
+                if (weightName.find(".attn.wq_b.weight") !=
+                    std::string::npos) {
+                    data.tpSplitUnit =
+                        deepseekV4->GetTensorParallelAttentionSplitUnit();
+                } else if (weightName.find(".attn.wo_a.weight") !=
+                               std::string::npos ||
+                           weightName.find(".attn.wo_b.weight") !=
+                               std::string::npos) {
+                    data.tpSplitUnit =
+                        deepseekV4->GetTensorParallelOutputGroupSplitUnit();
+                }
+            }
+        }
         int routedExpert = ParseRoutedExpertIndex(weightName);
+        if (model->model_type == "laguna" && routedExpert >= 0 &&
+            model->num_experts > 0) {
+            int totalRatio = 0;
+            for (int device : devices) {
+                auto ratioIt = ratios.find(device);
+                totalRatio += ratioIt == ratios.end()
+                    ? 1 : std::max(1, ratioIt->second);
+            }
+            int accumulatedRatio = 0;
+            int expertStart = 0;
+            for (int i = 0; i < (int)devices.size(); i++) {
+                auto ratioIt = ratios.find(devices[i]);
+                accumulatedRatio += ratioIt == ratios.end()
+                    ? 1 : std::max(1, ratioIt->second);
+                int expertEnd = i + 1 == (int)devices.size()
+                    ? model->num_experts
+                    : (int)((long long)model->num_experts *
+                            accumulatedRatio / totalRatio);
+                if (routedExpert >= expertStart && routedExpert < expertEnd) {
+                    // These source tensors are consumed layer-by-layer into a
+                    // local fused MoE tensor before the first ForwardGPU call.
+                    // On four Blackwell GPUs, keeping every 3 MiB down-proj in
+                    // an individual cudaMalloc rounds it to a 4 MiB allocation
+                    // and wastes about 3 GiB per rank across 47 x 64 experts.
+                    // Pack TP=4 sources into weight slabs; once a layer is
+                    // fused all of its source blocks retire together.  Keep the
+                    // established direct-allocation path for other TP sizes.
+                    data.directMemory = devices.size() != 4;
+                    return PlaceMultiCudaWeightOnDevice(
+                        data, devices, devices[i]);
+                }
+                expertStart = expertEnd;
+            }
+            return false;
+        }
+        // Qwen3.5 AWQ routed experts are repacked once into a consolidated
+        // grouped-Marlin layout. Keep their TP shards out of the mixed
+        // model-weight slab so that dropping the compact representation
+        // actually returns its memory instead of leaving slab holes.
+        bool directLocalMemory =
+            model->model_struct == "qwen3_5" &&
+            weightName.find(".mlp.experts.") != std::string::npos &&
+            data.dataType == DataType::INT4_GROUP;
         if (model->model_type == "deepseek_v4" && routedExpert >= 0) {
             constexpr int ownerOffset = 0;
             int ownerCount = (int)devices.size();
@@ -395,17 +471,23 @@ namespace fastllm {
             data.tpLinearType = TP_LINEAR_ROW;
             data.tpPackType = TP_PACK_GATEUP;
             DivisionScheme scheme = BuildMultiCudaRowSplitScheme(data, devices, ratios);
-            return SplitMultiCudaWeight(data, emptyBias, devices, scheme, 0, explicitDeviceRatios);
+            return SplitMultiCudaWeight(
+                data, emptyBias, devices, scheme, 0, explicitDeviceRatios,
+                directLocalMemory);
         }
         if (typeIt->second == "linearRow") {
             data.tpLinearType = TP_LINEAR_ROW;
             DivisionScheme scheme = BuildMultiCudaRowSplitScheme(data, devices, ratios);
-            return SplitMultiCudaWeight(data, emptyBias, devices, scheme, 0, explicitDeviceRatios);
+            return SplitMultiCudaWeight(
+                data, emptyBias, devices, scheme, 0, explicitDeviceRatios,
+                directLocalMemory);
         }
         if (typeIt->second == "linearColumn") {
             data.tpLinearType = TP_LINEAR_COLUMN;
             DivisionScheme scheme = BuildMultiCudaColumnSplitScheme(data, devices, ratios);
-            return SplitMultiCudaWeight(data, emptyBias, devices, scheme, 1, explicitDeviceRatios);
+            return SplitMultiCudaWeight(
+                data, emptyBias, devices, scheme, 1, explicitDeviceRatios,
+                directLocalMemory);
         }
         return false;
     }
@@ -423,7 +505,35 @@ namespace fastllm {
         if (layerIt == model->specialWeightLayerIds.end() || layerIt->second < 0) {
             return "";
         }
-        return model->SelectMoeDeviceForLayer(layerIt->second);
+        return model->SelectSpecialWeightDevice(weightName, layerIt->second);
+    }
+
+    static int GetMoeWeightLayerId(const std::string &weightName) {
+        // Auxiliary stacks such as mtp.layers use their own layer numbering.
+        // Only infer main-decoder paths when no explicit merge metadata exists.
+        size_t begin = std::string::npos;
+        const std::string modelMarker = "model.layers.";
+        size_t modelMarkerPos = weightName.find(modelMarker);
+        if (modelMarkerPos != std::string::npos &&
+            (modelMarkerPos == 0 || weightName[modelMarkerPos - 1] == '.')) {
+            begin = modelMarkerPos + modelMarker.size();
+        } else if (weightName.rfind("layers.", 0) == 0) {
+            begin = strlen("layers.");
+        }
+        if (begin == std::string::npos) {
+            return -1;
+        }
+
+        size_t end = begin;
+        while (end < weightName.size() &&
+               std::isdigit((unsigned char)weightName[end])) {
+            end++;
+        }
+        if (end == begin || end >= weightName.size() ||
+            weightName[end] != '.') {
+            return -1;
+        }
+        return std::atoi(weightName.substr(begin, end - begin).c_str());
     }
 
     static std::string GetMoeWeightSelectedDevice(const basellm *model, const std::string &weightName) {
@@ -446,6 +556,14 @@ namespace fastllm {
                 if (!selectedDevice.empty()) {
                     return selectedDevice;
                 }
+            }
+        }
+        if (!model->moeDeviceMap.empty() ||
+            (model->moeDeviceLayers >= 0 &&
+             !model->layeredMoeDeviceMap.empty())) {
+            int layerId = GetMoeWeightLayerId(weightName);
+            if (layerId >= 0) {
+                return model->SelectMoeDeviceForLayer(layerId);
             }
         }
         return "";
@@ -484,7 +602,9 @@ namespace fastllm {
             moeSpecialCount++;
             auto layerIt = this->specialWeightLayerIds.find(weightName);
             if (layerIt == this->specialWeightLayerIds.end() || layerIt->second < 0 ||
-                !DeviceNameMatchesType(this->SelectMoeDeviceForLayer(layerIt->second), "numa")) {
+                !DeviceNameMatchesType(
+                    this->SelectSpecialWeightDevice(weightName, layerIt->second),
+                    "numa")) {
                 continue;
             }
             numaSelectedCount++;
@@ -651,6 +771,8 @@ namespace fastllm {
             model = (basellm*)(new MinimaxM2Model());
         } else if (modelType == "qwen3_next") {
             model = (basellm*)(new Qwen3NextModel());
+        } else if (modelType == "kimi_k3") {
+            model = (basellm*)(new KimiK3Model());
         } else if (modelType == "glm_moe_dsa") {
             model = (basellm*)(new Glm5MoeDsaModel());
             model->model_type = "glm_moe_dsa";
@@ -858,10 +980,13 @@ namespace fastllm {
                     ErrorInFastLLM("CreateBufferWithScale error: packed FP4 cannot be loaded as FP8_E4M3.");
                 }
                 if (dstType == DataType::NVFP4 && !isPackedFp4) {
-                    ErrorInFastLLM("CreateBufferWithScale error: only packed FP4 I8 can be loaded as NVFP4.");
+                    ErrorInFastLLM("CreateBufferWithScale error: only packed FP4 I8/U8 can be loaded as NVFP4.");
                 }
-                if (dstType == DataType::NVFP4 && scale.dtype != "F8_E8M0") {
-                    ErrorInFastLLM("CreateBufferWithScale error: NVFP4 scale should be F8_E8M0.");
+                if (dstType == DataType::NVFP4 &&
+                    scale.dtype != "F8_E8M0" && scale.dtype != "U8") {
+                    ErrorInFastLLM(
+                        "CreateBufferWithScale error: NVFP4 scale should be "
+                        "F8_E8M0 or raw U8 E8M0.");
                 }
                 if ((dstType == DataType::NVFP4_BLOCK_16 || dstType == DataType::NVFP4_BLOCK_16_E8M0) && !isPackedFp4) {
                     ErrorInFastLLM("CreateBufferWithScale error: only packed FP4 I8/U8 can be loaded as NVFP4_BLOCK_16.");
@@ -1208,10 +1333,16 @@ namespace fastllm {
                 if (dstType != DataType::FLOAT32) {
                     ErrorInFastLLM("SafeTensorItem.CreateBuffer: unsupport src dtype " + this->dtype + "\n");
                 }
-            } else if (this->dtype == "F8_E8M0") {
+            } else if (this->dtype == "F8_E8M0" ||
+                       (this->dtype == "U8" &&
+                        StringEndWith(this->tensorName, ".weight_scale"))) {
                 if (dstType != DataType::FLOAT32) {
-                    ErrorInFastLLM("SafeTensorItem.CreateBuffer: F8_E8M0 tensor " + this->tensorName + " should be loaded as float32.\n");
+                    ErrorInFastLLM("SafeTensorItem.CreateBuffer: E8M0 tensor " + this->tensorName + " should be loaded as float32.\n");
                 }
+                // compressed-tensors serializes MXFP4 E8M0 scales as plain U8.
+                // Restrict the U8 interpretation to compressed-tensors'
+                // weight_scale convention; unrelated U8 tensors remain plain
+                // integer data.
                 ClearBuffer();
                 buffer = new uint8_t[(size_t)len * sizeof(float)];
                 std::vector<uint8_t> ori(len);
@@ -1347,6 +1478,19 @@ namespace fastllm {
             return false;
         }
         if (scaleIt->second.dtype == "F8_E8M0") {
+            dataType = DataType::NVFP4;
+            return true;
+        }
+        // compressed-tensors' mxfp4-pack-quantized format stores the E8M0
+        // exponent byte in a plain torch.uint8 safetensors tensor.  Keep the
+        // check shape-specific so unrelated U8 scale tensors are not inferred
+        // as compact NVFP4 weights.
+        if (scaleIt->second.dtype == "U8" &&
+            it->second.shape.size() == 2 &&
+            scaleIt->second.shape.size() == 2 &&
+            it->second.shape[0] == scaleIt->second.shape[0] &&
+            scaleIt->second.shape[1] > 0 &&
+            it->second.shape[1] * 2 == scaleIt->second.shape[1] * 32) {
             dataType = DataType::NVFP4;
             return true;
         }
@@ -1557,6 +1701,57 @@ namespace fastllm {
                DeviceNameMatchesType(GetMoeWeightSelectedDevice(model, weightName), "disk");
     }
 
+    static bool IsPureDiskDeviceMap(const std::map<std::string, int> &deviceMap) {
+        if (deviceMap.empty()) {
+            return false;
+        }
+        bool hasDisk = false;
+        for (const auto &it : deviceMap) {
+            if (it.second > 0) {
+                if (!DeviceNameMatchesType(it.first, "disk")) {
+                    return false;
+                }
+                hasDisk = true;
+            }
+        }
+        return hasDisk;
+    }
+
+    static uint64_t DiskEmbeddingMinBytes() {
+        static uint64_t bytes = []() {
+            const char *env = std::getenv("FASTLLM_DISK_EMBEDDING_MIN_MB");
+            unsigned long long mb = env == nullptr ? 64ULL : std::strtoull(env, nullptr, 10);
+            return mb * 1024ULL * 1024ULL;
+        }();
+        return bytes;
+    }
+
+    static WeightType GetDiskLazyWeightType(basellm *model,
+                                            const std::string &weightName,
+                                            uint64_t sourceBytes) {
+        if (model == nullptr) {
+            return WeightType::NONE;
+        }
+        if (IsDiskMoeWeight(model, weightName)) {
+            return WeightType::LINEAR;
+        }
+        if (!IsPureDiskDeviceMap(model->deviceMap)) {
+            return WeightType::NONE;
+        }
+        WeightType type = model->weight.GetWeightType(weightName);
+        if (type == WeightType::LINEAR) {
+            return type;
+        }
+        // Small positional embeddings are often consumed through direct CPU
+        // pointers by multimodal preprocessors. Keeping those resident costs
+        // little; token embeddings are large and benefit greatly from row-wise
+        // disk reads.
+        if (type == WeightType::EMBEDDING && sourceBytes >= DiskEmbeddingMinBytes()) {
+            return type;
+        }
+        return WeightType::NONE;
+    }
+
     static bool GetDiskSourceDataType(const std::string &dtype, DataType &dataType) {
         if (dtype == "F32") {
             dataType = DataType::FLOAT32;
@@ -1585,14 +1780,15 @@ namespace fastllm {
                dataType == DataType::NVFP4;
     }
 
-    static void ResetDiskWeightMeta(Data &weight, DataType dataType) {
+    static void ResetDiskWeightMeta(Data &weight, DataType dataType,
+                                    WeightType weightType = WeightType::LINEAR) {
         std::vector<int> dims = weight.dims;
         weight.dataType = dataType;
         weight.UpdateUnitSize();
         weight.Resize(dims);
         weight.isDiskWeight = true;
         weight.diskWeightParts.clear();
-        weight.weightType = WeightType::LINEAR;
+        weight.weightType = weightType;
         weight.expansionSize = 0;
         weight.expansionBytes = 0;
         weight.cpuData = nullptr;
@@ -1642,8 +1838,10 @@ namespace fastllm {
         return value;
     }
 
-    static void SetDiskWeightMeta(Data &weight, const SafeTensorItem &tensor, DataType targetDataType,
-                                  SafeTensorItem *scaleTensor = nullptr) {
+    static void SetDiskWeightMeta(Data &weight, const SafeTensorItem &tensor,
+                                  DataType targetDataType,
+                                  SafeTensorItem *scaleTensor = nullptr,
+                                  WeightType weightType = WeightType::LINEAR) {
         DataType sourceDataType;
         if (IsPackedFP4StorageDType(tensor.dtype) && targetDataType == DataType::NVFP4) {
             sourceDataType = DataType::NVFP4;
@@ -1658,7 +1856,7 @@ namespace fastllm {
               (sourceDataType == DataType::NVFP4 && targetDataType == DataType::NVFP4))) {
             ErrorInFastLLM("Disk MoE only supports scaled weights for FP8/NVFP4 expert tensors: " + weight.name + "\n");
         }
-        ResetDiskWeightMeta(weight, sourceDataType);
+        ResetDiskWeightMeta(weight, targetDataType, weightType);
 
         DiskWeightPart part;
         part.fileName = tensor.fileName;
@@ -1710,7 +1908,8 @@ namespace fastllm {
             }
             weight.blockK = blockK;
             weight.blockM = blockM;
-            if (targetDataType == DataType::NVFP4 && scaleTensor->dtype == "F8_E8M0") {
+            if (targetDataType == DataType::NVFP4 &&
+                (scaleTensor->dtype == "F8_E8M0" || scaleTensor->dtype == "U8")) {
                 if (isScalarScale) {
                     ErrorInFastLLM("Disk MoE compact NVFP4 does not support scalar scale: " + weight.name + "\n");
                 }
@@ -1738,7 +1937,8 @@ namespace fastllm {
         }
     }
 
-    static void SetDiskFastllmWeightMeta(Data &weight, const SafeTensorItem &tensor) {
+    static void SetDiskFastllmWeightMeta(Data &weight, const SafeTensorItem &tensor,
+                                         WeightType weightType = WeightType::LINEAR) {
         std::vector<uint8_t> header(sizeof(int) * 5);
         ReadDiskTensorRange(tensor.fileName, (long long)tensor.data_offsets[0],
                             header.data(), header.size());
@@ -1760,7 +1960,7 @@ namespace fastllm {
             fastllmGgmlType = ReadDiskMetaInt(header, offset);
             weight.ggmlType = fastllmGgmlType;
         }
-        ResetDiskWeightMeta(weight, dataType);
+        ResetDiskWeightMeta(weight, dataType, weightType);
         uint64_t payloadOffset = sizeof(int) * 2;
         bool compactFastllmNVFP4 = false;
 
@@ -2211,6 +2411,17 @@ namespace fastllm {
                 SplitString(lines[i], {' '}, line);
                 model->weight.AddTokenizerWord(Base64Decode(line[0]), atoi(line[1].c_str()), 1.0f);
             }
+            std::map<std::string, int> addedTokens;
+            for (const auto &it : tokenizerConfig["added_tokens_decoder"].object_items()) {
+                const std::string content = it.second["content"].string_value();
+                if (!content.empty()) {
+                    addedTokens[content] = std::atoi(it.first.c_str());
+                }
+            }
+            if (!addedTokens.empty()) {
+                model->weight.tokenizer.SetSpecialTokens(addedTokens);
+                model->weight.AddDict("tokenizer_has_special_tokens", "1");
+            }
             model->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;
             if (tokenizerClass == "QWenTokenizer") {
                 // Qwen用的分词
@@ -2387,13 +2598,111 @@ namespace fastllm {
             {"glm4_moe", "glm4_moe"}, // glm4_moe
             {"glm-dsa", "glm_moe_dsa"}, {"glm_moe_dsa", "glm_moe_dsa"}, // glm_moe_dsa
             {"minimax_m2", "minimax_m2"}, // minimax_m2
-            {"deepseek2", "deepseek_v2"}, {"deepseek_v2", "deepseek_v2"},  {"deepseek_v3", "deepseek_v2"} // deepseek_v2
+            {"deepseek2", "deepseek_v2"}, {"deepseek_v2", "deepseek_v2"}, {"deepseek_v3", "deepseek_v2"}, // deepseek_v2
+            {"deepseek4", "deepseek_v4"}, {"deepseek_v4", "deepseek_v4"} // deepseek_v4
         };
         if (ggufTypeToFastllmTypeDict.find(type) != ggufTypeToFastllmTypeDict.end()) {
             return ggufTypeToFastllmTypeDict[type];
         } else {
             printf("Warning: Can't convert type \"%s\", try use original type.\n", type.c_str());
             return type;
+        }
+    }
+
+    void ApplyDeepSeekV4GGUFMetadata(basellm *model, const json11::Json &params,
+                                     const std::string &arch) {
+        AssertInFastLLM(model != nullptr, "DeepSeek V4 GGUF metadata requires a model.\n");
+        AssertInFastLLM(arch == "deepseek4" || arch == "deepseek_v4",
+                        "Invalid DeepSeek V4 GGUF architecture: " + arch + ".\n");
+
+        auto addInt = [&](const std::string &dictKey, const std::string &ggufKey) {
+            const auto &value = params[arch + "." + ggufKey];
+            if (!value.is_null()) {
+                model->weight.AddDict(dictKey, std::to_string(value.int_value()));
+            }
+        };
+        auto addFloat = [&](const std::string &dictKey, const std::string &ggufKey) {
+            const auto &value = params[arch + "." + ggufKey];
+            if (!value.is_null()) {
+                model->weight.AddDict(dictKey, std::to_string(value.number_value()));
+            }
+        };
+        auto addString = [&](const std::string &dictKey, const std::string &ggufKey) {
+            const auto &value = params[arch + "." + ggufKey];
+            if (!value.is_null()) {
+                model->weight.AddDict(dictKey, value.string_value());
+            }
+        };
+
+        model->weight.AddDict("model_type", "deepseek_v4");
+        addInt("num_hidden_layers", "block_count");
+        addInt("hidden_size", "embedding_length");
+        addInt("num_attention_heads", "attention.head_count");
+        addInt("num_key_value_heads", "attention.head_count_kv");
+        addInt("head_dim", "attention.key_length");
+        addInt("qk_rope_head_dim", "rope.dimension_count");
+        addInt("q_lora_rank", "attention.q_lora_rank");
+        addInt("o_lora_rank", "attention.output_lora_rank");
+        addInt("o_groups", "attention.output_group_count");
+        addInt("sliding_window", "attention.sliding_window");
+        addInt("max_position_embeddings", "context_length");
+        addFloat("rms_norm_eps", "attention.layer_norm_rms_epsilon");
+
+        addInt("n_routed_experts", "expert_count");
+        addInt("num_experts_per_tok", "expert_used_count");
+        addInt("n_shared_experts", "expert_shared_count");
+        addInt("moe_intermediate_size", "expert_feed_forward_length");
+        addFloat("routed_scaling_factor", "expert_weights_scale");
+        const auto &normalizeExperts = params[arch + ".expert_weights_norm"];
+        if (!normalizeExperts.is_null()) {
+            model->weight.AddDict("norm_topk_prob",
+                                  normalizeExperts.bool_value() ? "true" : "false");
+        }
+        int gatingFunc = params[arch + ".expert_gating_func"].is_null()
+                             ? 4
+                             : params[arch + ".expert_gating_func"].int_value();
+        model->weight.AddDict("scoring_func",
+                              gatingFunc == 4 ? "sqrtsoftplus" :
+                              (gatingFunc == 2 ? "sigmoid" : "softmax"));
+        model->weight.AddDict("topk_method", "noaux_tc");
+
+        const auto &swigluClamp = params[arch + ".swiglu_clamp_exp"];
+        if (swigluClamp.is_array() && !swigluClamp.array_items().empty()) {
+            model->weight.AddDict("swiglu_limit",
+                                  std::to_string(swigluClamp.array_items()[0].number_value()));
+        } else if (swigluClamp.is_number()) {
+            model->weight.AddDict("swiglu_limit", std::to_string(swigluClamp.number_value()));
+        }
+
+        addInt("index_n_heads", "attention.indexer.head_count");
+        addInt("index_head_dim", "attention.indexer.key_length");
+        addInt("index_topk", "attention.indexer.top_k");
+        const auto &compressRatios = params[arch + ".attention.compress_ratios"];
+        if (compressRatios.is_array()) {
+            model->weight.AddDict("compress_ratios", compressRatios.dump());
+        }
+        addFloat("compress_rope_theta", "attention.compress_rope_freq_base");
+
+        addInt("hc_mult", "hyper_connection.count");
+        addInt("hc_sinkhorn_iters", "hyper_connection.sinkhorn_iterations");
+        addFloat("hc_eps", "hyper_connection.epsilon");
+        addInt("num_hash_layers", "hash_layer_count");
+
+        addFloat("rope_theta", "rope.freq_base");
+        addString("rope_scaling.type", "rope.scaling.type");
+        addFloat("rope_scaling.factor", "rope.scaling.factor");
+        addInt("rope_scaling.original_max_position_embeddings",
+               "rope.scaling.original_context_length");
+        addFloat("rope_scaling.beta_fast", "rope.scaling.yarn_beta_fast");
+        addFloat("rope_scaling.beta_slow", "rope.scaling.yarn_beta_slow");
+
+        // The selected GGUF contains the 43-layer target backbone only. DSpark
+        // is loaded separately from the official mtp.* safetensors shards.
+        model->weight.AddDict("num_nextn_predict_layers", "0");
+
+        const auto &blockCount = params[arch + ".block_count"];
+        if (!blockCount.is_null()) {
+            model->block_cnt = blockCount.int_value();
         }
     }
 
@@ -2453,7 +2762,97 @@ namespace fastllm {
                layerId >= mainLayerCount;
     }
 
-    std::unique_ptr<basellm> CreateLLMModelFromGGUFFile(const std::string &fileName, const std::string &originalPath) {
+    static void ApplyQwen35VisionProjectorMetadata(
+            basellm *model, const json11::Json &params) {
+        AssertInFastLLM(
+            params["general.architecture"].string_value() == "clip" &&
+            params["general.type"].string_value() == "mmproj",
+            "Qwen3.5 multimodal projector must be a clip mmproj GGUF.\n");
+        AssertInFastLLM(
+            params["clip.has_vision_encoder"].bool_value(),
+            "Qwen3.5 multimodal projector has no vision encoder.\n");
+        AssertInFastLLM(
+            params["clip.projector_type"].string_value() ==
+                "qwen3vl_merger",
+            "Qwen3.5 multimodal projector must use qwen3vl_merger.\n");
+
+        auto requiredInt = [&](const std::string &key) {
+            AssertInFastLLM(
+                params[key].is_number() && params[key].int_value() > 0,
+                "Qwen3.5 multimodal projector metadata `" + key +
+                    "` must be a positive integer.\n");
+            return params[key].int_value();
+        };
+        const int depth = requiredInt("clip.vision.block_count");
+        const int hiddenSize =
+            requiredInt("clip.vision.embedding_length");
+        const int numHeads =
+            requiredInt("clip.vision.attention.head_count");
+        const int intermediateSize =
+            requiredInt("clip.vision.feed_forward_length");
+        const int patchSize = requiredInt("clip.vision.patch_size");
+        const int mergeSize =
+            requiredInt("clip.vision.spatial_merge_size");
+        const int outputSize =
+            requiredInt("clip.vision.projection_dim");
+        const int imageSize = requiredInt("clip.vision.image_size");
+        AssertInFastLLM(
+            hiddenSize % numHeads == 0 &&
+            imageSize % patchSize == 0 &&
+            outputSize == model->embed_dim,
+            "Qwen3.5 multimodal projector dimensions do not match the text model.\n");
+
+        for (const auto &item :
+             params["clip.vision.is_deepstack_layers"].array_items()) {
+            AssertInFastLLM(
+                !item.bool_value(),
+                "Qwen3.5 deepstack vision projectors are not supported yet.\n");
+        }
+
+        model->weight.AddDict("vision_config.depth",
+                              std::to_string(depth));
+        model->weight.AddDict("vision_config.hidden_size",
+                              std::to_string(hiddenSize));
+        model->weight.AddDict("vision_config.num_heads",
+                              std::to_string(numHeads));
+        model->weight.AddDict("vision_config.intermediate_size",
+                              std::to_string(intermediateSize));
+        model->weight.AddDict("vision_config.patch_size",
+                              std::to_string(patchSize));
+        model->weight.AddDict("vision_config.temporal_patch_size", "2");
+        model->weight.AddDict("vision_config.spatial_merge_size",
+                              std::to_string(mergeSize));
+        model->weight.AddDict("vision_config.out_hidden_size",
+                              std::to_string(outputSize));
+        const int gridSize = imageSize / patchSize;
+        model->weight.AddDict(
+            "vision_config.num_position_embeddings",
+            std::to_string(gridSize * gridSize));
+
+        auto addTokenId = [&](const std::string &token,
+                              const std::string &dictKey,
+                              bool required) {
+            auto tokenIt =
+                model->weight.tokenizer.stringToTokenDict.find(token);
+            if (tokenIt == model->weight.tokenizer.stringToTokenDict.end()) {
+                AssertInFastLLM(
+                    !required,
+                    "Qwen3.5 tokenizer is missing required multimodal token `" +
+                        token + "`.\n");
+                return;
+            }
+            model->weight.AddDict(dictKey,
+                                  std::to_string(tokenIt->second));
+        };
+        addTokenId("<|image_pad|>", "image_token_id", true);
+        addTokenId("<|video_pad|>", "video_token_id", false);
+        addTokenId("<|vision_start|>", "vision_start_token_id", true);
+        addTokenId("<|vision_end|>", "vision_end_token_id", true);
+    }
+
+    std::unique_ptr<basellm> CreateLLMModelFromGGUFFile(
+            const std::string &fileName, const std::string &originalPath,
+            const std::string &multimodalProjectorPath) {
         std::vector <ReadGGUFTask> readGGUFTasks;
         std::map <std::string, ReadGGUFTask*> readGGUFTaskDict;
         std::vector <std::string> ggufFileNames = GenerateGGUFFileList(fileName);
@@ -2469,6 +2868,34 @@ namespace fastllm {
         const std::string sourceArch = params["general.architecture"].string_value();
         std::string arch = sourceArch;
         const bool sourceQwen35GGUF = sourceArch == "qwen35" || sourceArch == "qwen3_5";
+        const bool sourceDeepSeek4GGUF = sourceArch == "deepseek4" || sourceArch == "deepseek_v4";
+        std::vector <std::string> multimodalProjectorFiles;
+        json11::Json multimodalProjectorParams;
+        if (!multimodalProjectorPath.empty()) {
+            AssertInFastLLM(
+                sourceQwen35GGUF,
+                "A Qwen3.5 multimodal projector can only be attached to a Qwen3.5 GGUF model.\n");
+            multimodalProjectorFiles =
+                GenerateGGUFFileList(multimodalProjectorPath);
+            AssertInFastLLM(
+                !multimodalProjectorFiles.empty(),
+                "0 multimodal projector GGUF files found!\n");
+            json11::Json projectorConfig;
+            ReadGGUFMetaData(multimodalProjectorFiles.front(),
+                             projectorConfig);
+            multimodalProjectorParams = projectorConfig["params"];
+            AssertInFastLLM(
+                multimodalProjectorParams["general.architecture"].string_value() ==
+                        "clip" &&
+                    multimodalProjectorParams["general.type"].string_value() ==
+                        "mmproj",
+                "Multimodal projector must be a clip mmproj GGUF file.\n");
+            printf("Load multimodal projector from files:\n");
+            for (const auto &projectorFile :
+                 multimodalProjectorFiles) {
+                printf("%s\n", projectorFile.c_str());
+            }
+        }
         if (sourceArch == "qwen35moe" || sourceArch == "qwen3_5_moe") {
             throw std::runtime_error("Unsupported Qwen3.5 MoE GGUF architecture: " + sourceArch + ".");
         }
@@ -2676,6 +3103,9 @@ namespace fastllm {
                                           std::to_string(params[arch + ".rope.freq_base"].number_value()));
                 }
             }
+            if (sourceDeepSeek4GGUF) {
+                ApplyDeepSeekV4GGUFMetadata(model, params, sourceArch);
+            }
 
             if (!params[arch + ".attention.head_count"].is_null()) {
                 model->num_attention_heads = params[arch + ".attention.head_count"].int_value();
@@ -2728,6 +3158,28 @@ namespace fastllm {
                     ReportModelLoadProgress("tokenizer", idx, tokenTotal);
                 }
             }
+            const auto &tokenTypeItems =
+                params["tokenizer.ggml.token_type"].array_items();
+            if (tokenTypeItems.size() == tokenItems.size()) {
+                std::map<std::string, int> specialTokens;
+                for (int tokenIndex = 0; tokenIndex < tokenTotal;
+                     tokenIndex++) {
+                    const int tokenType =
+                        tokenTypeItems[tokenIndex].int_value();
+                    // GGML token types 3 and 4 are CONTROL and
+                    // USER_DEFINED. Both must remain atomic during BPE.
+                    if (tokenType == 3 || tokenType == 4) {
+                        specialTokens[
+                            tokenItems[tokenIndex].string_value()] =
+                                tokenIndex;
+                    }
+                }
+                if (!specialTokens.empty()) {
+                    model->weight.tokenizer.SetSpecialTokens(specialTokens);
+                    model->weight.AddDict(
+                        "tokenizer_has_special_tokens", "1");
+                }
+            }
             if (tokenTotal == 0) {
                 ReportModelLoadProgress("tokenizer", 1, 1);
             }
@@ -2752,6 +3204,10 @@ namespace fastllm {
                 }
             }
         }
+        if (!multimodalProjectorFiles.empty()) {
+            ApplyQwen35VisionProjectorMetadata(
+                model, multimodalProjectorParams);
+        }
 
         arch = ConvertGGUFTypeToFastllmType(sourceArch);
         int ggufMainLayerCount = GetGLMDSAGGUFMainLayerCount(params, arch, model);
@@ -2767,6 +3223,10 @@ namespace fastllm {
         ReportModelLoadProgress("weights_prepare", 0, 1);
         for (auto &s : ggufFileNames) {
             AppendGGUFTasks(arch, s, readGGUFTasks);
+        }
+        for (const auto &projectorFile : multimodalProjectorFiles) {
+            AppendGGUFTasks("qwen3_5_mmproj", projectorFile,
+                            readGGUFTasks);
         }
         // Qwen3.5 GGUF: the nextn-specific tensors (eh_proj/enorm/hnorm/...)
         // are renamed to mtp.* by the GGUF rules. The MTP block's attention/FFN
@@ -3134,10 +3594,16 @@ namespace fastllm {
         return std::unique_ptr<fastllm::basellm> (model);
     }
 
-    std::unique_ptr<fastllm::basellm> CreateLLMModelFromFile(const std::string &fileName) {
+    std::unique_ptr<fastllm::basellm> CreateLLMModelFromFile(
+            const std::string &fileName,
+            const std::string &multimodalProjectorPath) {
         if (IsGGUFFile(fileName)) {
-            return CreateLLMModelFromGGUFFile(fileName, "");
+            return CreateLLMModelFromGGUFFile(
+                fileName, "", multimodalProjectorPath);
         }
+        AssertInFastLLM(
+            multimodalProjectorPath.empty(),
+            "A GGUF multimodal projector requires a GGUF text model.\n");
         std::string modelType = GetModelTypeFromFile(fileName);
         basellm *model = CreateModelWithType(modelType);
         if(modelType == "bert"){
@@ -3190,6 +3656,15 @@ namespace fastllm {
             path += "/";
         }
 
+        std::string dsparkPath;
+        const char *dsparkPathEnv = std::getenv("FASTLLM_DSPARK_MODEL_PATH");
+        if (dsparkPathEnv != nullptr && dsparkPathEnv[0] != '\0') {
+            dsparkPath = dsparkPathEnv;
+            if (dsparkPath.back() != '/' && dsparkPath.back() != '\\') {
+                dsparkPath += "/";
+            }
+        }
+
         // 1. 检查是否有 model.safetensors.index.json,如果有就读取
         std::set <std::string> stFiles;
         std::string stIndexFile = path + "model.safetensors.index.json";
@@ -3200,6 +3675,27 @@ namespace fastllm {
             auto stIndex = json11::Json::parse(ReadAllFile(stIndexFile), error)["weight_map"];
             for (auto it : stIndex.object_items()) {
                 stFiles.insert(path + it.second.string_value());
+            }
+        }
+        if (!dsparkPath.empty()) {
+            std::string dsparkIndexFile =
+                dsparkPath + "model.safetensors.index.json";
+            if (!FileExists(dsparkIndexFile)) {
+                AssertInFastLLM(
+                    FileExists(dsparkPath + "model.safetensors"),
+                    "DSpark checkpoint has no model.safetensors: " +
+                    dsparkPath);
+                stFiles.insert(dsparkPath + "model.safetensors");
+            } else {
+                std::string dsparkIndexError;
+                auto dsparkIndex = json11::Json::parse(
+                    ReadAllFile(dsparkIndexFile),
+                    dsparkIndexError)["weight_map"];
+                AssertInFastLLM(dsparkIndexError.empty(),
+                                "Failed to parse DSpark safetensors index.");
+                for (auto it : dsparkIndex.object_items()) {
+                    stFiles.insert(dsparkPath + it.second.string_value());
+                }
             }
         }
         SafeTensors safeTensors(stFiles);
@@ -3249,6 +3745,27 @@ namespace fastllm {
             ((GraphLLMModel*)model)->graphLLMModelConfig->Init(modelConfig);
         }
         AddDictRecursion(model, "", config);
+        if (!dsparkPath.empty()) {
+            AssertInFastLLM(
+                model->model_type == "kimi_k3" || modelType == "kimi_k3",
+                "The current DSpark integration requires a Kimi-K3 target model.");
+            std::string dsparkConfigError;
+            auto dsparkConfig = json11::Json::parse(
+                ReadAllFile(dsparkPath + "config.json"),
+                dsparkConfigError);
+            AssertInFastLLM(dsparkConfigError.empty(),
+                            "Failed to parse DSpark config.json.");
+            bool dsparkArchitecture = false;
+            for (const auto &architecture :
+                 dsparkConfig["architectures"].array_items()) {
+                dsparkArchitecture |=
+                    architecture.string_value() == "DSparkDraftModel";
+            }
+            AssertInFastLLM(dsparkArchitecture,
+                            "The draft checkpoint is not DSparkDraftModel.");
+            AddDictRecursion(model, "dspark.", dsparkConfig);
+            model->weight.AddDict("dspark.model_path", dsparkPath);
+        }
         // 设置eos_token_id
         if (config["eos_token_id"].is_null()) {
             auto tokenizer = json11::Json::parse(ReadAllFile(path + "tokenizer.json"), error);
@@ -3304,6 +3821,13 @@ namespace fastllm {
         // tensorMap[name]代表本名为name的tensor，创建后的名字以及类型
         // 有些tensor被共享，可能需要创建多次
         auto tensorMap = model->GetTensorMap(tensors);
+        tensors.erase(
+            std::remove_if(tensors.begin(), tensors.end(),
+                [&](const std::string &name) {
+                    auto it = tensorMap.find(name);
+                    return it == tensorMap.end() || it->second.empty();
+                }),
+            tensors.end());
 
         // 如果有需要，为moe设置特定的量化参数。AWQ 的专家权重使用
         // .qweight 保存，即使名称模式未把它识别成普通 LINEAR，也必须走
@@ -3670,13 +4194,16 @@ namespace fastllm {
                                 }
                             }
 
-                            bool diskLazyWeight = IsDiskMoeWeight(model, weightName);
+                            WeightType diskLazyWeightType = GetDiskLazyWeightType(
+                                model, weightName, tensor.bytes);
+                            bool diskLazyWeight = diskLazyWeightType != WeightType::NONE;
                             if (diskLazyWeight) {
                                 if (isAwqModel || loraDicts.find(weightName) != loraDicts.end()) {
-                                    ErrorInFastLLM("Disk MoE does not support AWQ/lora expert weight yet: " + weightName + "\n");
+                                    ErrorInFastLLM("Disk device does not support AWQ/lora lazy weight yet: " + weightName + "\n");
                                 }
                                 if (tensor.dtype == "fastllm") {
-                                    SetDiskFastllmWeightMeta(model->weight[weightName], tensor);
+                                    SetDiskFastllmWeightMeta(model->weight[weightName], tensor,
+                                                            diskLazyWeightType);
                                 } else {
                                     SafeTensorItem *scaleTensor = nullptr;
                                     DataType diskDataType = dataType;
@@ -3690,14 +4217,17 @@ namespace fastllm {
                                         }
                                         scaleTensor = &safeTensors.itmeDict[scaleTensorName];
                                         AssertInFastLLM(scaleTensor->dtype == "F32" || scaleTensor->dtype == "BF16" ||
-                                                        scaleTensor->dtype == "F8_E8M0" || scaleTensor->dtype == "F8_E4M3",
-                                                        "Tensor scale error: scale's dtype should be F32, BF16, F8_E8M0 or F8_E4M3.");
-                                        if (!((diskDataType == DataType::NVFP4 && scaleTensor->dtype == "F8_E8M0") ||
+                                                        scaleTensor->dtype == "F8_E8M0" || scaleTensor->dtype == "F8_E4M3" ||
+                                                        scaleTensor->dtype == "U8",
+                                                        "Tensor scale error: scale's dtype should be F32, BF16, F8_E8M0, F8_E4M3 or U8.");
+                                        if (!((diskDataType == DataType::NVFP4 &&
+                                               (scaleTensor->dtype == "F8_E8M0" || scaleTensor->dtype == "U8")) ||
                                               (diskDataType == DataType::NVFP4_BLOCK_16 && scaleTensor->dtype == "F8_E4M3"))) {
                                             scaleTensor->CreateBuffer(DataType::FLOAT32);
                                         }
                                     }
-                                    SetDiskWeightMeta(model->weight[weightName], tensor, diskDataType, scaleTensor);
+                                    SetDiskWeightMeta(model->weight[weightName], tensor, diskDataType,
+                                                      scaleTensor, diskLazyWeightType);
                                     if (scaleTensor != nullptr) {
                                         scaleTensor->ClearBuffer();
                                     }
@@ -3708,9 +4238,11 @@ namespace fastllm {
                                 } else if(!isAwqModel) {
                                     auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
                                     AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16" ||
-                                                    scaleTensor.dtype == "F8_E8M0" || scaleTensor.dtype == "F8_E4M3"
-                                        , "Tensor scale error: scale's dtype should be F32, BF16, F8_E8M0 or F8_E4M3.");
-                                    bool keepScalePacked = (oriDataType == DataType::NVFP4 && scaleTensor.dtype == "F8_E8M0") ||
+                                                    scaleTensor.dtype == "F8_E8M0" || scaleTensor.dtype == "F8_E4M3" ||
+                                                    scaleTensor.dtype == "U8"
+                                        , "Tensor scale error: scale's dtype should be F32, BF16, F8_E8M0, F8_E4M3 or U8.");
+                                    bool keepScalePacked = (oriDataType == DataType::NVFP4 &&
+                                                            (scaleTensor.dtype == "F8_E8M0" || scaleTensor.dtype == "U8")) ||
                                                            (oriDataType == DataType::NVFP4_BLOCK_16 && scaleTensor.dtype == "F8_E4M3") ||
                                                            packedInt4DataType == DataType::INT4_GROUP32;
                                     if (!keepScalePacked) {
@@ -4143,7 +4675,8 @@ namespace fastllm {
         std::map <std::string, std::string> outputFileDict;
         std::string stIndexFile = path + "model.safetensors.index.json";
         std::string error;
-        if (!FileExists(stIndexFile)) {
+        bool hasSafeTensorIndex = FileExists(stIndexFile);
+        if (!hasSafeTensorIndex) {
             stFiles.insert(path + "model.safetensors");
             outputFileDict[path + "model.safetensors"] = outputPath + "model.safetensors";
         } else {
@@ -4175,6 +4708,13 @@ namespace fastllm {
         // 4.1 读取权重
         auto tensors = safeTensors.GetSortedItemNames();
         auto tensorMap = model->GetTensorMap(tensors);
+        tensors.erase(
+            std::remove_if(tensors.begin(), tensors.end(),
+                [&](const std::string &name) {
+                    auto it = tensorMap.find(name);
+                    return it == tensorMap.end() || it->second.empty();
+                }),
+            tensors.end());
 
         // 如果有需要，为moe设置特定的量化参数
         if (useMoeDataType && model->moeLinears.size() > 0) {
@@ -4214,7 +4754,10 @@ namespace fastllm {
             printf("Export weight model: %s\n", outputFileName.c_str());
             std::vector <SafeTensorItem*> items;
             for (auto &it : safeTensors.itmeDict) {
-                if (it.second.fileName == file) {
+                auto tensorMapIt = tensorMap.find(it.first);
+                if (it.second.fileName == file &&
+                    tensorMapIt != tensorMap.end() &&
+                    !tensorMapIt->second.empty()) {
                     items.push_back(&it.second);
                 }
             }
@@ -4356,11 +4899,13 @@ namespace fastllm {
                                 tensor.CreateBuffer(oriDataType);
                             } else {
                                 auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
-                                AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16" || scaleTensor.dtype == "F8_E8M0"
-                                    , "Tensor scale error: scale's dtype should be F32, BF16 or F8_E8M0.");
+                                AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16" ||
+                                                scaleTensor.dtype == "F8_E8M0" || scaleTensor.dtype == "U8"
+                                    , "Tensor scale error: scale's dtype should be F32, BF16, F8_E8M0 or U8.");
                                 if (packedInt4DataType == DataType::INT4_GROUP32) {
                                     scaleTensor.CreateBuffer(DataType::BFLOAT16);
-                                } else if (!(oriDataType == DataType::NVFP4 && scaleTensor.dtype == "F8_E8M0")) {
+                                } else if (!(oriDataType == DataType::NVFP4 &&
+                                             (scaleTensor.dtype == "F8_E8M0" || scaleTensor.dtype == "U8"))) {
                                     scaleTensor.CreateBuffer(DataType::FLOAT32);
                                 }
                                 if (isPackedInt4Group) {
@@ -4492,6 +5037,44 @@ namespace fastllm {
             fwrite(configString.data(), 1, configString.size(), outputFile);
             fwrite(bytes.data(), 1, bytes.size(), outputFile);
             fclose(outputFile);
+        }
+        if (hasSafeTensorIndex) {
+            json11::Json::object exportedWeightMap;
+            for (const auto &mapping : tensorMap) {
+                if (mapping.second.empty()) {
+                    continue;
+                }
+                auto tensor = safeTensors.itmeDict.find(mapping.first);
+                if (tensor == safeTensors.itmeDict.end()) {
+                    continue;
+                }
+                auto output = outputFileDict.find(tensor->second.fileName);
+                if (output == outputFileDict.end()) {
+                    continue;
+                }
+                exportedWeightMap[mapping.first] =
+                    fs::path(output->second).filename().string();
+            }
+            uint64_t totalSize = 0;
+            for (const auto &output : outputFileDict) {
+                if (fs::exists(output.second) && fs::is_regular_file(output.second)) {
+                    totalSize += fs::file_size(output.second);
+                }
+            }
+            json11::Json::object metadata = {
+                {"total_size", (double)totalSize},
+            };
+            json11::Json::object index = {
+                {"metadata", metadata},
+                {"weight_map", exportedWeightMap},
+            };
+            std::ofstream outputIndex(
+                outputPath + "model.safetensors.index.json",
+                std::ios::binary | std::ios::trunc);
+            AssertInFastLLM(
+                outputIndex.good(),
+                "Unable to write exported safetensors index.");
+            outputIndex << json11::Json(index).dump();
         }
         delete loraTensors;        
         return;

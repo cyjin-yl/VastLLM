@@ -6,6 +6,7 @@
 #define FASTLLM_CUDADEVICE_H
 
 #include "device.h"
+#include "devices/cpu/kimi_k3_ops.h"
 
 namespace fastllm {
     void DoCudaAttentionReshape(Data &q, Data &v, Data &output);
@@ -28,7 +29,8 @@ namespace fastllm {
         Data **weights, Data **biass, float sharedScale, MoeGateType gateType = MoeGateSwiglu, int weightsBatch = -1);
     void DoCudaFusedMOE(Data &input, Data &output, Data &index, Data &score,
         Data &gate, Data &up, Data &down, Data &w1,
-        MoeGateType gateType = MoeGateSwiglu, float swigluLimit = 0.0f);
+        MoeGateType gateType = MoeGateSwiglu, float swigluLimit = 0.0f,
+        bool allowTriton = true);
     void FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
     bool FastllmCudaMergeMOEUsedGraphUnsafeFallback();
     void DoCudaAttentionPaged(Data &q, Data &k, Data &v, Data &output, int group, float scale, bool inited = false);
@@ -109,6 +111,85 @@ namespace fastllm {
     class CudaRMSNormPartOp : BaseOperator {
         bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    // Kimi-K3 keeps these numerics as first-class FastLLM operators.  CUDA
+    // subclasses reuse the CPU shape contract and only replace CanRun/Run;
+    // unsupported dtype/layout combinations therefore continue to fall back
+    // through the normal executor instead of entering model-specific code.
+    class CudaKimiK3RMSNormOp : public CpuKimiK3RMSNormOp {
+    public:
+        bool CanRun(const std::string &opType, const DataDict &datas,
+                    const FloatDict &floatParams, const IntDict &intParams) override;
+        void Run(const std::string &opType, const DataDict &datas,
+                 const FloatDict &floatParams, const IntDict &intParams) override;
+    };
+
+    class CudaKimiK3CausalConv1DOp : public CpuKimiK3CausalConv1DOp {
+    public:
+        bool CanRun(const std::string &opType, const DataDict &datas,
+                    const FloatDict &floatParams, const IntDict &intParams) override;
+        void Run(const std::string &opType, const DataDict &datas,
+                 const FloatDict &floatParams, const IntDict &intParams) override;
+    };
+
+    class CudaKimiK3UpdatePackedConvCacheOp
+            : public CpuKimiK3UpdatePackedConvCacheOp {
+    public:
+        bool CanRun(const std::string &opType, const DataDict &datas,
+                    const FloatDict &floatParams, const IntDict &intParams) override;
+        void Run(const std::string &opType, const DataDict &datas,
+                 const FloatDict &floatParams, const IntDict &intParams) override;
+    };
+
+    class CudaKimiK3L2NormOp : public CpuKimiK3L2NormOp {
+    public:
+        bool CanRun(const std::string &opType, const DataDict &datas,
+                    const FloatDict &floatParams, const IntDict &intParams) override;
+        void Run(const std::string &opType, const DataDict &datas,
+                 const FloatDict &floatParams, const IntDict &intParams) override;
+    };
+
+    class CudaKimiK3RecurrentKDAOp : public CpuKimiK3RecurrentKDAOp {
+    public:
+        bool CanRun(const std::string &opType, const DataDict &datas,
+                    const FloatDict &floatParams, const IntDict &intParams) override;
+        void Run(const std::string &opType, const DataDict &datas,
+                 const FloatDict &floatParams, const IntDict &intParams) override;
+    };
+
+    class CudaKimiK3RMSNormSigmoidGateOp
+            : public CpuKimiK3RMSNormSigmoidGateOp {
+    public:
+        bool CanRun(const std::string &opType, const DataDict &datas,
+                    const FloatDict &floatParams, const IntDict &intParams) override;
+        void Run(const std::string &opType, const DataDict &datas,
+                 const FloatDict &floatParams, const IntDict &intParams) override;
+    };
+
+    class CudaKimiK3AttnResOp : public CpuKimiK3AttnResOp {
+    public:
+        bool CanRun(const std::string &opType, const DataDict &datas,
+                    const FloatDict &floatParams, const IntDict &intParams) override;
+        void Run(const std::string &opType, const DataDict &datas,
+                 const FloatDict &floatParams, const IntDict &intParams) override;
+    };
+
+    class CudaKimiK3SiTUAndMulOp : public CpuKimiK3SiTUAndMulOp {
+    public:
+        bool CanRun(const std::string &opType, const DataDict &datas,
+                    const FloatDict &floatParams, const IntDict &intParams) override;
+        void Run(const std::string &opType, const DataDict &datas,
+                 const FloatDict &floatParams, const IntDict &intParams) override;
+    };
+
+    class CudaKimiK3CausalAttentionOp
+            : public CpuKimiK3CausalAttentionOp {
+    public:
+        bool CanRun(const std::string &opType, const DataDict &datas,
+                    const FloatDict &floatParams, const IntDict &intParams) override;
+        void Run(const std::string &opType, const DataDict &datas,
+                 const FloatDict &floatParams, const IntDict &intParams) override;
     };
 
     class CudaConv1DPerChannel : CpuConv1DPerChannel {
@@ -302,6 +383,25 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
+    class CudaGatedDeltaRulePrepareAttnOp : BaseOperator {
+        void Reshape(const std::string &opType, const DataDict &datas,
+                     const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas,
+                 const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaGatedDeltaRuleBuildDecayOp : BaseOperator {
+        void Reshape(const std::string &opType, const DataDict &datas,
+                     const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas,
+                 const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaGatedDeltaRuleApplyDecayMaskOp : BaseOperator {
+        void Run(const std::string &opType, const DataDict &datas,
+                 const FloatDict &floatParams, const IntDict &intParams);
+    };
+
     class CudaCumSumLastDimOp : BaseOperator {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
@@ -334,7 +434,7 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
-    class CudaFusedSoftmaxSelectExpertOp : BaseOperator {
+    class CudaFusedSelectExpertOp : BaseOperator {
         void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
@@ -361,6 +461,10 @@ namespace fastllm {
     };
 
     class CudaLlama3RopeEncodingOp : BaseOperator {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaYarnRopeEncodingOp : BaseOperator {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 

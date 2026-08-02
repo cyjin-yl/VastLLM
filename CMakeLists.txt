@@ -15,6 +15,7 @@ option(USE_TFACC "use tfacc" OFF)
 option(PY_API "python api" OFF)
 
 option(USE_MMAP "use mmap" OFF)
+option(USE_ZSTD "Enable optional zstd compression for cold CPU request snapshots" ON)
 
 option(USE_SENTENCEPIECE "use sentencepiece" OFF)
 
@@ -209,7 +210,7 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/executo
         src/devices/disk/diskdevice.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp
         src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp
-        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp
+        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp src/models/kimi_k3.cpp
         src/models/minimax.cpp src/models/hunyuan.cpp
         src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/glm5_moe_dsa.cpp src/models/gpt_oss.cpp
         src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/qwen3_5.cpp src/models/gemma4.cpp src/models/step3p5.cpp src/models/laguna.cpp
@@ -449,6 +450,19 @@ if(USE_ROCM)
     endif()
 endif()
 
+if (USE_ZSTD)
+    find_path(FASTLLM_ZSTD_INCLUDE_DIR zstd.h)
+    find_library(FASTLLM_ZSTD_LIBRARY NAMES zstd)
+    if (FASTLLM_ZSTD_INCLUDE_DIR AND FASTLLM_ZSTD_LIBRARY)
+        include_directories(${FASTLLM_ZSTD_INCLUDE_DIR})
+        list(APPEND FASTLLM_LINKED_LIBS ${FASTLLM_ZSTD_LIBRARY})
+        add_compile_definitions(FASTLLM_USE_ZSTD)
+        message(STATUS "Cold CPU request snapshot zstd support enabled")
+    else()
+        message(WARNING "libzstd was not found; cold CPU snapshots remain raw")
+    endif()
+endif()
+
 if (USE_IVCOREX)
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cudart)
     set(CMAKE_CUDA_ARCHITECTURES ${IVCOREX_ARCH})
@@ -486,6 +500,29 @@ if (USE_TOPS) # For suiyuan
     link_directories(/opt/tops/lib)
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} topsaten /opt/tops/lib/libtopsrt.so)
     #target_link_libraries(main rtcu)
+endif()
+
+find_package(PNG QUIET)
+find_package(JPEG QUIET)
+find_package(OpenSSL QUIET)
+set(FASTLLM_APISERVER_IMAGE_LIBS)
+set(FASTLLM_APISERVER_IMAGE_DEFINITIONS)
+if (PNG_FOUND AND JPEG_FOUND)
+    list(APPEND FASTLLM_APISERVER_IMAGE_LIBS PNG::PNG JPEG::JPEG)
+    list(APPEND FASTLLM_APISERVER_IMAGE_DEFINITIONS
+         FASTLLM_APISERVER_IMAGE_DECODERS)
+    message(STATUS "API server PNG/JPEG image decoding enabled")
+else()
+    message(WARNING "libpng or libjpeg was not found; API image decoding is disabled")
+endif()
+if (OpenSSL_FOUND)
+    list(APPEND FASTLLM_APISERVER_IMAGE_LIBS
+         OpenSSL::SSL OpenSSL::Crypto)
+    list(APPEND FASTLLM_APISERVER_IMAGE_DEFINITIONS
+         FASTLLM_APISERVER_OPENSSL)
+    message(STATUS "API server HTTPS image loading enabled")
+else()
+    message(WARNING "OpenSSL was not found; API image loading supports data: and HTTP URLs only")
 endif()
 
 if (PY_API)
@@ -537,8 +574,17 @@ if (UNIT_TEST)
 
     add_executable(testApiServerSocket
         test/apiserver/socketWriteTest.cpp
+        example/apiserver/image_loader.cpp
         third_party/json11/json11.cpp)
-endif()
+    target_compile_definitions(testApiServerSocket PRIVATE ${FASTLLM_APISERVER_IMAGE_DEFINITIONS})
+    target_link_libraries(testApiServerSocket PRIVATE ${FASTLLM_APISERVER_IMAGE_LIBS})
+
+    if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(cudaGraphPoolMissRegression test/ops/cudaGraphPoolMissRegression.cpp)
+        target_include_directories(cudaGraphPoolMissRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_link_libraries(cudaGraphPoolMissRegression PRIVATE fastllm)
+    endif()
+    endif()
 
 add_executable(webui example/webui/webui.cpp)
 target_link_libraries(webui fastllm)
@@ -552,8 +598,12 @@ add_custom_command(
 add_executable(benchmark example/benchmark/benchmark.cpp)
 target_link_libraries(benchmark fastllm)
 
-add_executable(apiserver example/apiserver/apiserver.cpp)
-target_link_libraries(apiserver fastllm)
+add_executable(apiserver
+    example/apiserver/apiserver.cpp
+    example/apiserver/image_loader.cpp)
+target_compile_definitions(apiserver PRIVATE
+    ${FASTLLM_APISERVER_IMAGE_DEFINITIONS})
+target_link_libraries(apiserver fastllm ${FASTLLM_APISERVER_IMAGE_LIBS})
 
 if (BUILD_CLI)
     add_executable(FastllmStudio_cli example/FastllmStudio/cli/cli.cpp example/FastllmStudio/cli/ui.cpp)
