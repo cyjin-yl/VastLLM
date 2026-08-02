@@ -4196,11 +4196,19 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
 
         int unitSize = weight.unitSize;
-        if (GetLowMemMode()) {
+        AssertInFastLLM(vocabSize > 0 && embSize > 0,
+                        "EmbeddingDirect error: invalid weight dims ["
+                        + std::to_string(vocabSize) + ", " + std::to_string(embSize) + "].\n");
+        if (GetLowMemMode() && !weight.fileName.empty()) {
             FILE *fi = fopen(weight.fileName.c_str(), "rb");
+            AssertInFastLLM(fi != nullptr,
+                            "EmbeddingDirect error: can't open weight file " + weight.fileName + ".\n");
             uint8_t *outputData = (uint8_t *) output.cpuData;
             for (int i = 0; i < inputLen; i++) {
                 int token = (int) (inputData[i] + 1e-9);
+                AssertInFastLLM(token >= 0 && token < vocabSize,
+                                "EmbeddingDirect error: token " + std::to_string(token)
+                                + " out of range [0, " + std::to_string(vocabSize) + ").\n");
 #if defined(_WIN32) or defined(_WIN64)
                 _fseeki64(fi, (long long)token * embSize * unitSize + weight.filePos, 0);
 #else
@@ -4210,10 +4218,18 @@ ops += (long long)lines * inputDim * interDim * 2;
             }
             fclose(fi);
         } else {
+            AssertInFastLLM(weight.cpuData != nullptr,
+                            "EmbeddingDirect error: in-memory weight has null cpuData"
+                            " (dims = [" + std::to_string(vocabSize) + ", "
+                            + std::to_string(embSize) + "], fileName = \""
+                            + weight.fileName + "\").\n");
             uint8_t *outputData = (uint8_t *) output.cpuData;
             uint8_t *weightData = (uint8_t *) weight.cpuData;
             for (int i = 0; i < inputLen; i++) {
                 int token = (int) (inputData[i] + 1e-9);
+                AssertInFastLLM(token >= 0 && token < vocabSize,
+                                "EmbeddingDirect error: token " + std::to_string(token)
+                                + " out of range [0, " + std::to_string(vocabSize) + ").\n");
                 memcpy(outputData + (uint64_t)i * embSize * unitSize, weightData + (uint64_t)token * embSize * unitSize, (uint64_t)embSize * unitSize);
             }
         }
@@ -5331,7 +5347,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             __m256 vClampedHigh = _mm256_min_ps(vClampedLow, vMax);
             
             // Convert to int32 (truncate)
-            __m256i vInt32 = _mm256_cvtps_epi32(vClampedHigh);
+            __m256i vInt32 = _mm256_cvttps_epi32(vClampedHigh);
             
             // Pack into 16-bit integers
             __m128i vInt16 = _mm_packus_epi32(

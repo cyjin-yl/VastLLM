@@ -1258,16 +1258,16 @@ namespace {
                                                : __half2float(input1.out[pair]);
                         const float a1 = i < 4 ? __half2float(input0.out[pair + 1])
                                                : __half2float(input1.out[pair + 1]);
-                        const uint8_t g0 = gatePacked.out[i];
-                        const uint8_t u0 = upPacked.out[i];
+                        const uint8_t gateByte = gatePacked.out[i];
+                        const uint8_t upByte = upPacked.out[i];
                         gateSum += a0 * FastllmCudaDequantInt4GroupHalfValue(
-                            (float)(g0 >> 4), gateScale, gateMin, useZeroPoint);
+                            (float)(gateByte >> 4), gateScale, gateMin, useZeroPoint);
                         gateSum += a1 * FastllmCudaDequantInt4GroupHalfValue(
-                            (float)(g0 & 15), gateScale, gateMin, useZeroPoint);
+                            (float)(gateByte & 15), gateScale, gateMin, useZeroPoint);
                         upSum += a0 * FastllmCudaDequantInt4GroupHalfValue(
-                            (float)(u0 >> 4), upScale, upMin, useZeroPoint);
+                            (float)(upByte >> 4), upScale, upMin, useZeroPoint);
                         upSum += a1 * FastllmCudaDequantInt4GroupHalfValue(
-                            (float)(u0 & 15), upScale, upMin, useZeroPoint);
+                            (float)(upByte & 15), upScale, upMin, useZeroPoint);
                     }
                     // Keep the same reduction grouping as the standalone
                     // small-row INT4_GROUP GEMV used by the generic MoE path.

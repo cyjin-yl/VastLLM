@@ -98,9 +98,8 @@ struct Sm70_s884 {
                                          Operand_C<float, order_C>,
                                          MODE_C,
                                          SplitK>;
-
         using Kernel = GemmUniversal<Sm70, Mainloop, Epilogue, Scheduler>;
-    };
+};
 };
 
 template<Order raster_order>
