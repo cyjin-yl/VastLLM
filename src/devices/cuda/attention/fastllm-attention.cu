@@ -2045,6 +2045,12 @@ bool FastllmCudaPagedCacheCopyMultiPage(
         return false;
     }
 
+    if (fastllm::IsPackedKVCacheDataType(dstType)) {
+        return FastllmCudaPackedKVCacheCopyMultiPage(
+            pagedData, pageIdxHost, pageCount, firstPageOffset, pageLen,
+            numHeads, headDim, dstType, inputData, srcType, seqLen);
+    }
+
     FastllmPagedCacheCopyPageList pageList = {};
     for (int i = 0; i < pageCount; i++) {
         pageList.pageIdx[i] = pageIdxHost[i];

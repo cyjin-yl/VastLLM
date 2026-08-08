@@ -134,12 +134,41 @@ __device__ __forceinline__ void InverseWht128(float *x, int lane) {
     __syncthreads();
 }
 
+constexpr int kMaxMultiPageCount = 256;
+// 跨页追加的紧凑页表(按值传入 kernel, 避免额外 H2D 元数据拷贝)
+struct PackedKVMultiPageList {
+    int32_t pageIdx[kMaxMultiPageCount];
+};
+
+// 由 token 序号推导 (page, pageOffset): 第一页从 firstPageOffset 写起, 后续整页填充
+__device__ __forceinline__ void MultiPageLocate(
+        const PackedKVMultiPageList &pageList, int pageCount,
+        int firstPageOffset, int pageLen, int token, int &page, int &pageOffset) {
+    int firstPageCapacity = pageLen - firstPageOffset;
+    int pageSlot;
+    if (token < firstPageCapacity) {
+        pageSlot = 0;
+        pageOffset = firstPageOffset + token;
+    } else {
+        int tailToken = token - firstPageCapacity;
+        pageSlot = 1 + tailToken / pageLen;
+        pageOffset = tailToken % pageLen;
+    }
+    if (pageSlot >= pageCount) {
+        page = -1;
+        pageOffset = pageLen; // 触发越界检查
+        return;
+    }
+    page = pageList.pageIdx[pageSlot];
+}
+
 template <typename SrcT>
 __global__ void QuantizeQ8RowsKernel(
         const SrcT *src, uint8_t *dst, const int32_t *pageIds,
         const int32_t *pageOffsets, int rows, int sourceSeqLen,
         int pageLen, int numHeads, int headDim, bool batchLayout,
-        int sourceTokenOffset) {
+        int sourceTokenOffset, PackedKVMultiPageList multiPages,
+        int multiPageCount, int firstPageOffset) {
     int row = blockIdx.x;
     int block = blockIdx.y;
     int lane = threadIdx.x;
@@ -147,9 +176,15 @@ __global__ void QuantizeQ8RowsKernel(
     int copiedTokens = rows / numHeads;
     int token = batchLayout ? row / numHeads : row % copiedTokens;
     int head = batchLayout ? row % numHeads : row / copiedTokens;
-    int page = pageIds[batchLayout ? token : 0];
-    int pageOffset = pageOffsets[batchLayout ? token : 0] +
+    int page, pageOffset;
+    if (multiPageCount > 0) {
+        MultiPageLocate(multiPages, multiPageCount, firstPageOffset,
+                        pageLen, token, page, pageOffset);
+    } else {
+        page = pageIds[batchLayout ? token : 0];
+        pageOffset = pageOffsets[batchLayout ? token : 0] +
                      (batchLayout ? 0 : token);
+    }
     if (pageOffset < 0 || pageOffset >= pageLen) return;
     size_t sourceRow = batchLayout
         ? (size_t)token * numHeads + head
@@ -174,7 +209,8 @@ __global__ void QuantizeTurbo3RowsKernel(
         const SrcT *src, uint8_t *dst, const int32_t *pageIds,
         const int32_t *pageOffsets, int rows, int sourceSeqLen,
         int pageLen, int numHeads, int headDim, bool batchLayout,
-        int sourceTokenOffset) {
+        int sourceTokenOffset, PackedKVMultiPageList multiPages,
+        int multiPageCount, int firstPageOffset) {
     int row = blockIdx.x;
     int group = blockIdx.y;
     int lane = threadIdx.x;
@@ -182,9 +218,15 @@ __global__ void QuantizeTurbo3RowsKernel(
     int copiedTokens = rows / numHeads;
     int token = batchLayout ? row / numHeads : row % copiedTokens;
     int head = batchLayout ? row % numHeads : row / copiedTokens;
-    int page = pageIds[batchLayout ? token : 0];
-    int pageOffset = pageOffsets[batchLayout ? token : 0] +
+    int page, pageOffset;
+    if (multiPageCount > 0) {
+        MultiPageLocate(multiPages, multiPageCount, firstPageOffset,
+                        pageLen, token, page, pageOffset);
+    } else {
+        page = pageIds[batchLayout ? token : 0];
+        pageOffset = pageOffsets[batchLayout ? token : 0] +
                      (batchLayout ? 0 : token);
+    }
     if (pageOffset < 0 || pageOffset >= pageLen) return;
     size_t sourceRow = batchLayout
         ? (size_t)token * numHeads + head
@@ -285,16 +327,17 @@ bool LaunchCopy(uint8_t *pagedData, int pageIdx, int pageLen, int numHeads,
                                         cudaStreamPerThread);
     if (error != cudaSuccess) { FastllmCudaFree(meta); cudaGetLastError(); return false; }
     int rows = numHeads * copyLen;
+    PackedKVMultiPageList noMultiPages = {};
     if (dstType == fastllm::DataType::Q8_0_KV) {
         dim3 grid(rows, headDim / 32, 1);
         QuantizeQ8RowsKernel<SrcT><<<grid, 32, 0, cudaStreamPerThread>>>(
             inputData, pagedData, meta, meta + 1, rows, seqLen, pageLen,
-            numHeads, headDim, false, inputOffset);
+            numHeads, headDim, false, inputOffset, noMultiPages, 0, 0);
     } else if (dstType == fastllm::DataType::TURBO3_KV) {
         dim3 grid(rows, headDim / 128, 1);
         QuantizeTurbo3RowsKernel<SrcT><<<grid, 128, 0, cudaStreamPerThread>>>(
             inputData, pagedData, meta, meta + 1, rows, seqLen, pageLen,
-            numHeads, headDim, false, inputOffset);
+            numHeads, headDim, false, inputOffset, noMultiPages, 0, 0);
     } else {
         FastllmCudaFree(meta); return false;
     }
@@ -311,22 +354,53 @@ bool LaunchCopyBatch(uint8_t *pagedData, int32_t *pageIds,
                      const SrcT *inputData, bool sync) {
     if (headDim != kHeadDim || batch <= 0 || pageIds == nullptr || pageOffsets == nullptr) return false;
     int rows = batch * numHeads;
+    PackedKVMultiPageList noMultiPages = {};
     if (dstType == fastllm::DataType::Q8_0_KV) {
         dim3 grid(rows, headDim / 32, 1);
         QuantizeQ8RowsKernel<SrcT><<<grid, 32, 0, cudaStreamPerThread>>>(
             inputData, pagedData, pageIds, pageOffsets, rows, 1,
-            pageLen, numHeads, headDim, true, 0);
+            pageLen, numHeads, headDim, true, 0, noMultiPages, 0, 0);
     } else if (dstType == fastllm::DataType::TURBO3_KV) {
         dim3 grid(rows, headDim / 128, 1);
         QuantizeTurbo3RowsKernel<SrcT><<<grid, 128, 0, cudaStreamPerThread>>>(
             inputData, pagedData, pageIds, pageOffsets, rows, 1,
-            pageLen, numHeads, headDim, true, 0);
+            pageLen, numHeads, headDim, true, 0, noMultiPages, 0, 0);
     } else {
         return false;
     }
     cudaError_t error = cudaGetLastError();
     if (sync && error == cudaSuccess) error = cudaStreamSynchronize(cudaStreamPerThread);
     return error == cudaSuccess;
+}
+
+template <typename SrcT>
+bool LaunchCopyMultiPage(uint8_t *pagedData, const int *pageIdxHost,
+                         int pageCount, int firstPageOffset, int pageLen,
+                         int numHeads, int headDim, fastllm::DataType dstType,
+                         const SrcT *inputData, int seqLen) {
+    if (headDim != kHeadDim || seqLen <= 0 || pageIdxHost == nullptr ||
+        pageCount <= 0 || pageCount > kMaxMultiPageCount ||
+        firstPageOffset < 0 || firstPageOffset >= pageLen) return false;
+    PackedKVMultiPageList multiPages = {};
+    for (int i = 0; i < pageCount; i++)
+        multiPages.pageIdx[i] = pageIdxHost[i];
+    int rows = numHeads * seqLen;
+    if (dstType == fastllm::DataType::Q8_0_KV) {
+        dim3 grid(rows, headDim / 32, 1);
+        QuantizeQ8RowsKernel<SrcT><<<grid, 32, 0, cudaStreamPerThread>>>(
+            inputData, pagedData, nullptr, nullptr, rows, seqLen, pageLen,
+            numHeads, headDim, false, 0, multiPages, pageCount, firstPageOffset);
+    } else if (dstType == fastllm::DataType::TURBO3_KV) {
+        dim3 grid(rows, headDim / 128, 1);
+        QuantizeTurbo3RowsKernel<SrcT><<<grid, 128, 0, cudaStreamPerThread>>>(
+            inputData, pagedData, nullptr, nullptr, rows, seqLen, pageLen,
+            numHeads, headDim, false, 0, multiPages, pageCount, firstPageOffset);
+    } else {
+        return false;
+    }
+    cudaError_t error = cudaGetLastError();
+    cudaError_t syncError = cudaStreamSynchronize(cudaStreamPerThread);
+    return error == cudaSuccess && syncError == cudaSuccess;
 }
 
 } // namespace
@@ -350,6 +424,28 @@ bool FastllmCudaPackedKVCacheCopy(
         return LaunchCopy(pagedData, pageIdx, pageLen, numHeads, headDim, dstType,
                           reinterpret_cast<const float *>(inputData), seqLen,
                           inputOffset, copyLen, pageOffset);
+    return false;
+}
+
+bool FastllmCudaPackedKVCacheCopyMultiPage(
+        uint8_t *pagedData, const int *pageIdxHost, int pageCount,
+        int firstPageOffset, int pageLen, int numHeads, int headDim,
+        fastllm::DataType dstType, uint8_t *inputData,
+        fastllm::DataType srcType, int seqLen) {
+    if (!fastllm::IsPackedKVCacheDataType(dstType) || pagedData == nullptr || inputData == nullptr)
+        return false;
+    if (srcType == fastllm::DataType::FLOAT16)
+        return LaunchCopyMultiPage(pagedData, pageIdxHost, pageCount, firstPageOffset,
+                          pageLen, numHeads, headDim, dstType,
+                          reinterpret_cast<const half *>(inputData), seqLen);
+    if (srcType == fastllm::DataType::BFLOAT16)
+        return LaunchCopyMultiPage(pagedData, pageIdxHost, pageCount, firstPageOffset,
+                          pageLen, numHeads, headDim, dstType,
+                          reinterpret_cast<const __nv_bfloat16 *>(inputData), seqLen);
+    if (srcType == fastllm::DataType::FLOAT32)
+        return LaunchCopyMultiPage(pagedData, pageIdxHost, pageCount, firstPageOffset,
+                          pageLen, numHeads, headDim, dstType,
+                          reinterpret_cast<const float *>(inputData), seqLen);
     return false;
 }
 

@@ -210,24 +210,6 @@ namespace {
             return "";
         }
     };
-    class Qwen35ConfigTestModel final : public fastllm::Qwen3_5Model {
-    public:
-        const fastllm::Data &InvScaleData() const {
-            return inv_scale_data;
-        }
-
-        int NumKeyValueHeads() const {
-            return num_key_value_heads;
-        }
-
-        void ConfigureTurbo3Fixture() {
-            head_dim = 256;
-            block_cnt = 2;
-            weight.AddEmptyWeight(
-                language_prefix + "layers.0.self_attn.o_proj.weight",
-                {1, 1}, fastllm::DataType::FLOAT32);
-        }
-    };
 
 
     class CpuRequestSwapTestModel final : public fastllm::basellm {
@@ -4099,6 +4081,44 @@ namespace {
                                       "packed KV cross-page head " + std::to_string(head));
                 FastllmCudaFree(gatherFloat);
                 FastllmCudaFree(gatherHalf);
+            }
+            // Multi-page copy must reproduce the single-page reference exactly.
+            {
+                size_t rowBytesMp = fastllm::GetKVCacheRowBytes(type, headDim);
+                size_t packedBytesMp = (size_t)maxPages * pageLen * numHeads * rowBytesMp;
+                uint8_t *packedMp = (uint8_t*)FastllmCudaMalloc(packedBytesMp);
+                Expect(packedMp != nullptr, "multi-page packed KV allocation failed.");
+                Expect(cudaMemset(packedMp, 0, packedBytesMp) == cudaSuccess,
+                       "multi-page packed KV memset failed.");
+                Expect(FastllmCudaPackedKVCacheCopyMultiPage(
+                           packedMp, hostPages, 2, 0, pageLen, numHeads,
+                           headDim, type, (uint8_t*)source.cudaData,
+                           source.dataType, seqLen),
+                       "packed KV multi-page copy failed.");
+                for (int head = 0; head < numHeads; head++) {
+                    void *gHalfMp = FastllmCudaMalloc((size_t)seqLen * headDim * sizeof(uint16_t));
+                    void *gFloatMp = FastllmCudaMalloc((size_t)seqLen * headDim * sizeof(float));
+                    Expect(FastllmCudaPackedKVCacheGatherHeadRangeToHalf(
+                               packedMp, type, cudaPages, 0, seqLen,
+                               pageLen, numHeads, headDim, head, gHalfMp),
+                           "packed KV multi-page gather failed.");
+                    Expect(FastllmHalfToFloat(gHalfMp, gFloatMp, seqLen * headDim),
+                           "packed KV multi-page gathered half conversion failed.");
+                    std::vector<float> actualMp((size_t)seqLen * headDim);
+                    FastllmCudaCopyFromDeviceToHost(
+                        actualMp.data(), gFloatMp, actualMp.size() * sizeof(float));
+                    std::vector<float> expectedMp(actualMp.size());
+                    for (int token = 0; token < seqLen; token++) {
+                        std::copy_n(sourceValues.begin() +
+                                        ((size_t)head * seqLen + token) * headDim,
+                                    headDim, expectedMp.begin() + (size_t)token * headDim);
+                    }
+                    ExpectPackedKvQuality(expectedMp, actualMp, type,
+                                          "packed KV multi-page head " + std::to_string(head));
+                    FastllmCudaFree(gFloatMp);
+                    FastllmCudaFree(gHalfMp);
+                }
+                FastllmCudaFree(packedMp);
             }
 
             constexpr int decodeBatch = 2;

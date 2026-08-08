@@ -312,6 +312,10 @@ bool FastllmCudaPackedKVCacheCopy(uint8_t *pagedData, int pageIdx, int pageLen,
                                   int numHeads, int headDim, fastllm::DataType dstType,
                                   uint8_t *inputData, fastllm::DataType srcType,
                                   int seqLen, int inputOffset, int copyLen, int pageOffset);
+bool FastllmCudaPackedKVCacheCopyMultiPage(uint8_t *pagedData, const int *pageIdxHost,
+                                  int pageCount, int firstPageOffset, int pageLen,
+                                  int numHeads, int headDim, fastllm::DataType dstType,
+                                  uint8_t *inputData, fastllm::DataType srcType, int seqLen);
 bool FastllmCudaPackedKVCacheCopyBatch(uint8_t *pagedData, int32_t *pageIdxArray,
                                        int32_t *pageOffsetArray, int pageLen, int batch,
                                        int numHeads, int headDim, fastllm::DataType dstType,
