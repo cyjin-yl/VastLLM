@@ -126,6 +126,7 @@ namespace fastllm {
         bool expertParallel = false,
         float swigluLimit = 0.0f,
         bool deepSeekV4Mode = false,
+        Data *pairedReduceInput = nullptr,
         const Data *allowedExpertMask = nullptr
     );
 

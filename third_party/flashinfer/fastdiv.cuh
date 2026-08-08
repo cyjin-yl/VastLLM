@@ -1,9 +1,5 @@
 /*
- * Copyright 2014 Maxim Milakov
- *
- * The code is based on the Chapter 10 of Hacker's Delight book by Henry S. Warren, Jr.
- * The struct is adapted from https://github.com/milakov/int_fastdiv/blob/master/int_fastdiv.h
- * by Maxim Milakov, the difference is that here we use uint32_t instead of int32_t.
+ * Copyright (c) 2024 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,9 +16,34 @@
 #ifndef FLASHINFER_FASTDIV_CUH_
 #define FLASHINFER_FASTDIV_CUH_
 #include <cstdint>
+#include <cuda/std/__cccl/version.h>
+#if CCCL_VERSION >= 3002000
+#include <cuda/cmath>
+#endif
 
 namespace flashinfer {
 
+#if CCCL_VERSION >= 3002000
+// API-compatible wrapper around cuda::fast_mod_div<uint32_t>.
+struct uint_fastdiv {
+  __host__ __device__ uint_fastdiv() : impl_(1), d_(0) {}
+
+  __host__ uint_fastdiv(uint32_t d) : impl_(d ? d : 1), d_(d) {}
+
+  __host__ __device__ __forceinline__ operator unsigned int() const { return d_; }
+
+  __host__ __device__ __forceinline__ void divmod(uint32_t n, uint32_t& q, uint32_t& r) const {
+    q = n / impl_;
+    r = n - q * d_;
+  }
+
+ private:
+  cuda::fast_mod_div<uint32_t> impl_;
+  uint32_t d_;
+};
+#else
+// CUDA 12.x ships CCCL 2.x without cuda::fast_mod_div. Keep the portable
+// Hacker's Delight divider used by FlashInfer before the CCCL 3.2 migration.
 struct uint_fastdiv {
   uint32_t d;
   uint32_t m;
@@ -81,29 +102,20 @@ struct uint_fastdiv {
     r = n - q * d;
   }
 };
+#endif
 
 __host__ __device__ __forceinline__ uint32_t operator/(const uint32_t n,
                                                        const uint_fastdiv& divisor) {
-  uint32_t q;
-  if (divisor.d == 1) {
-    q = n;
-  } else {
-#ifdef __CUDA_ARCH__
-    q = __umulhi(divisor.m, n);
-#else
-    q = (((unsigned long long)((long long)divisor.m * (long long)n)) >> 32);
-#endif
-    q += divisor.a * n;
-    q >>= divisor.s;
-  }
+  uint32_t q, r;
+  divisor.divmod(n, q, r);
   return q;
 }
 
 __host__ __device__ __forceinline__ uint32_t operator%(const uint32_t n,
                                                        const uint_fastdiv& divisor) {
-  uint32_t quotient = n / divisor;
-  uint32_t remainder = n - quotient * divisor;
-  return remainder;
+  uint32_t q, r;
+  divisor.divmod(n, q, r);
+  return r;
 }
 
 }  // namespace flashinfer
