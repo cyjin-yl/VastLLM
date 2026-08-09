@@ -6,6 +6,7 @@
 #include "devices/cpu/computeutils.h"
 #include "models/qwen3_5.h"
 #include "gguf.h"
+#include "prefixcache_persistence.h"
 
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
@@ -532,6 +533,142 @@ namespace {
         std::string oldValue;
         bool hadValue = false;
     };
+
+    void RunPersistentPrefixArchiveRegression() {
+        using fastllm::PersistentPayloadKind;
+        using fastllm::PersistentPayloadRecord;
+        using fastllm::PersistentPayloadRef;
+        using fastllm::PersistedPrefixCacheGeneration;
+
+        auto makeGeneration = [](uint64_t generation, uint8_t marker) {
+            PersistedPrefixCacheGeneration value;
+            value.generation = generation;
+            value.cacheKey = "qwen36-q8-turbo3-page128";
+            PersistentPayloadRecord payload;
+            payload.kind = PersistentPayloadKind::PAGED_CACHE_PAGE;
+            payload.name = "manager-3/page-7";
+            payload.dataType = (uint32_t)fastllm::DataType::FLOAT16;
+            payload.dimensions = {2, 4};
+            payload.bytes = {marker, 2, 3, 4, 5, 6, 7, 8};
+            value.payloads.push_back(std::move(payload));
+            return value;
+        };
+
+        {
+            ScopedTempDirectory root("fastllm-prefix-persist-roundtrip-");
+            PersistedPrefixCacheGeneration source = makeGeneration(1, 1);
+            std::vector<PersistentPayloadRef> writtenRefs;
+            std::string error;
+            Expect(fastllm::CommitPersistentPrefixCacheGeneration(
+                       root.Path(), source, writtenRefs, &error), error);
+            Expect(writtenRefs.size() == 1,
+                   "persistent archive omitted its payload reference.");
+
+            PersistedPrefixCacheGeneration loaded;
+            std::vector<PersistentPayloadRef> loadedRefs;
+            Expect(fastllm::LoadPersistentPrefixCacheGeneration(
+                       root.Path(), loaded, loadedRefs, &error), error);
+            Expect(loaded.generation == 1 &&
+                       loaded.cacheKey == source.cacheKey &&
+                       loadedRefs.size() == 1,
+                   "persistent archive metadata did not round trip.");
+            std::vector<uint8_t> bytes;
+            Expect(fastllm::ReadPersistentPrefixCachePayload(
+                       root.Path(), loaded.generation, loadedRefs[0],
+                       bytes, &error), error);
+            Expect(bytes == source.payloads[0].bytes,
+                   "persistent archive payload did not round trip.");
+
+            const std::filesystem::path manifest =
+                root.Path() / "gen-1" / "manifest.bin";
+            {
+                std::ofstream out(manifest, std::ios::binary | std::ios::app);
+                out.put('\0');
+            }
+            Expect(!fastllm::LoadPersistentPrefixCacheGeneration(
+                       root.Path(), loaded, loadedRefs, &error),
+                   "persistent archive accepted trailing manifest bytes.");
+        }
+
+        {
+            ScopedTempDirectory root("fastllm-prefix-persist-cap-");
+            PersistedPrefixCacheGeneration source = makeGeneration(1, 9);
+            std::vector<PersistentPayloadRef> refs;
+            std::string error;
+            Expect(fastllm::CommitPersistentPrefixCacheGeneration(
+                       root.Path(), source, refs, &error), error);
+            const std::filesystem::path manifest =
+                root.Path() / "gen-1" / "manifest.bin";
+            {
+                std::ifstream input(manifest, std::ios::binary);
+                std::vector<uint8_t> manifestBytes {
+                    std::istreambuf_iterator<char>(input),
+                    std::istreambuf_iterator<char>()
+                };
+                Expect(manifestBytes.size() > 28,
+                       "persistent archive fixture manifest is truncated.");
+                std::fill(manifestBytes.begin() + 20,
+                          manifestBytes.begin() + 24, UINT8_MAX);
+                uint64_t checksum = UINT64_C(1469598103934665603);
+                for (size_t i = 0; i + 8 < manifestBytes.size(); i++) {
+                    checksum ^= manifestBytes[i];
+                    checksum *= UINT64_C(1099511628211);
+                }
+                for (int i = 0; i < 8; i++) {
+                    manifestBytes[manifestBytes.size() - 8 + i] =
+                        (uint8_t)(checksum >> (8 * i));
+                }
+                std::ofstream output(
+                    manifest, std::ios::binary | std::ios::trunc);
+                output.write(
+                    reinterpret_cast<const char *>(manifestBytes.data()),
+                    (std::streamsize)manifestBytes.size());
+            }
+            PersistedPrefixCacheGeneration loaded;
+            Expect(!fastllm::LoadPersistentPrefixCacheGeneration(
+                       root.Path(), loaded, refs, &error),
+                   "persistent archive accepted an unbounded string length.");
+        }
+
+        {
+            ScopedTempDirectory root("fastllm-prefix-persist-atomic-");
+            std::string error;
+            std::vector<PersistentPayloadRef> refs;
+            PersistedPrefixCacheGeneration first = makeGeneration(1, 17);
+            Expect(fastllm::CommitPersistentPrefixCacheGeneration(
+                       root.Path(), first, refs, &error), error);
+            std::filesystem::create_directory(root.Path() / ".staging-crashed");
+
+            fastllm::SetPersistentPrefixCacheCommitFailpointForTest(
+                fastllm::PersistentPrefixCommitFailpoint::BEFORE_CURRENT_RENAME);
+            PersistedPrefixCacheGeneration second = makeGeneration(2, 33);
+            Expect(!fastllm::CommitPersistentPrefixCacheGeneration(
+                       root.Path(), second, refs, &error),
+                   "injected persistent archive commit unexpectedly succeeded.");
+            fastllm::SetPersistentPrefixCacheCommitFailpointForTest(
+                fastllm::PersistentPrefixCommitFailpoint::NONE);
+
+            PersistedPrefixCacheGeneration loaded;
+            Expect(fastllm::LoadPersistentPrefixCacheGeneration(
+                       root.Path(), loaded, refs, &error), error);
+            Expect(loaded.generation == 1,
+                   "failed atomic commit replaced the last valid generation.");
+            Expect(!std::filesystem::exists(root.Path() / ".staging-crashed"),
+                   "persistent archive did not clean a stale staging directory.");
+
+            std::filesystem::resize_file(
+                root.Path() / "gen-1" / "pages.bin", 1);
+            std::vector<uint8_t> bytes;
+            Expect(!fastllm::ReadPersistentPrefixCachePayload(
+                       root.Path(), loaded.generation, refs[0], bytes, &error),
+                   "persistent archive accepted a truncated payload file.");
+        }
+
+        Expect(fastllm::PersistentPrefixCacheKeyDirectoryName("../../bad") !=
+                   "../../bad",
+               "persistent cache key remained path-traversable.");
+        std::cout << "persistent prefix archive regression: PASS\n";
+    }
 
     void RunBFloat16Q8KConversionRegression() {
         constexpr size_t rows = 41;
@@ -16794,6 +16931,11 @@ int main(int argc, char **argv) {
         if (only != nullptr &&
             std::string(only) == "cpu_swap_policy") {
             RunCpuRequestSwapPolicyRegression();
+            return 0;
+        }
+        if (only != nullptr &&
+            std::string(only) == "persistent_prefix_cache") {
+            RunPersistentPrefixArchiveRegression();
             return 0;
         }
         if (only != nullptr &&
