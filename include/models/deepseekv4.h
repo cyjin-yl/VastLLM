@@ -336,6 +336,10 @@ namespace fastllm {
             const std::vector<int> &indices,
             const DeepSeekV4ExpertAllowList *policy);
 
+    int DeepSeekV4DecodeReservationTokens(
+            int usedTokens, int requestedTokens, int tokenLimit,
+            bool allowPartial);
+
     // Test-only seam over the file-local MoE routing builder in
     // deepseekv4.cpp. Lets unit tests drive learned/hash CPU and CUDA expert
     // routing with tiny in-memory weights instead of a checkpoint. Not used by

@@ -1,6 +1,7 @@
 #include "devices/cpu/cpudevice.h"
 #include "devices/cpu/computeutils.h"
 #include "utils.h"
+#include "gguf.h"
 
 #include <algorithm>
 #include <chrono>
@@ -238,19 +239,81 @@ namespace fastllm {
             }
         } else {
             ErrorInFastLLM(
-                "DeepSeek-V4 CPU op received an unsupported float dtype.\n");
+                "DeepSeek-V4 CPU op received unsupported float dtype " +
+                std::to_string((int)dataType) + ".\n");
         }
+    }
+
+    static uint64_t DeepSeekV4LogicalElementCount(const Data &input) {
+        if (input.dataType < DataType::DATA_GGUF_FORMAT ||
+            input.dataType >= DataType::DATA_GGUF_FORMAT_END) {
+            return input.Count(0);
+        }
+        uint64_t count = 1;
+        for (int dim : input.dims) {
+            AssertInFastLLM(
+                dim >= 0,
+                "DeepSeek-V4 CPU op received a GGUF tensor with a negative dimension.\n");
+            count *= (uint64_t)dim;
+        }
+        return count;
     }
 
     static void DeepSeekV4HcPreReadFloatDataInto(
             Data &input, std::vector<float> &ret) {
-        uint64_t count = input.Count(0);
+        uint64_t count = DeepSeekV4LogicalElementCount(input);
         ret.resize(count);
         if (count == 0) {
             return;
         }
         AssertInFastLLM(input.dataDevice == DataDevice::CPU && input.cpuData != nullptr,
                         "DeepSeek-V4 CPU op received a tensor without CPU storage.\n");
+        if (input.dataType >= DataType::DATA_GGUF_FORMAT &&
+            input.dataType < DataType::DATA_GGUF_FORMAT_END) {
+            ggml_type weightType = input.ggmlTensor != nullptr ?
+                ((ggml_tensor*)input.ggmlTensor)->type :
+                (input.dataType == DataType::DATA_GGUF_FORMAT ?
+                    (ggml_type)input.ggmlType :
+                    (ggml_type)((int)input.dataType -
+                                (int)DataType::DATA_GGUF_FORMAT));
+            auto toFloat = ggml_type_to_float(weightType);
+            AssertInFastLLM(
+                toFloat != nullptr,
+                "DeepSeek-V4 CPU op cannot dequantize GGUF weight type " +
+                    std::string(ggml_type_name(weightType)) + ".\n");
+            toFloat(input.cpuData, ret.data(), count);
+            return;
+        }
+        if (input.dataType == DataType::FP8_E4M3) {
+            AssertInFastLLM(
+                input.dims.size() >= 2 && input.blockK > 0 &&
+                    input.blockM > 0,
+                "DeepSeek-V4 CPU FP8 tensor has invalid block metadata.\n");
+            const uint64_t columns = (uint64_t)input.dims.back();
+            AssertInFastLLM(
+                columns > 0 && count % columns == 0,
+                "DeepSeek-V4 CPU FP8 tensor has invalid dimensions.\n");
+            const uint64_t rows = count / columns;
+            const uint64_t scaleColumns =
+                (columns + input.blockM - 1) / input.blockM;
+            const uint64_t scaleRows =
+                (rows + input.blockK - 1) / input.blockK;
+            AssertInFastLLM(
+                input.scales.size() == scaleRows * scaleColumns,
+                "DeepSeek-V4 CPU FP8 tensor scale shape mismatch.\n");
+            static const FP8E4M3ToFP32Manager fp8;
+            for (uint64_t row = 0; row < rows; row++) {
+                const uint64_t scaleRow =
+                    (row / input.blockK) * scaleColumns;
+                for (uint64_t column = 0; column < columns; column++) {
+                    ret[row * columns + column] =
+                        fp8.dict[input.cpuData[row * columns + column]] *
+                        input.scales[
+                            scaleRow + column / input.blockM];
+                }
+            }
+            return;
+        }
         DeepSeekV4ConvertRawFloatData(
             input.cpuData, input.dataType, ret.data(), count);
     }
@@ -2662,8 +2725,20 @@ namespace fastllm {
         AssertInFastLLM(heads % groups == 0, "DeepSeekV4WoA error: heads should be divisible by groups.\n");
         int headsPerGroup = heads / groups;
         int groupDim = headsPerGroup * headDim;
-        AssertInFastLLM(weight.Count(0) == (uint64_t)groups * oRank * groupDim,
-                        "DeepSeekV4WoA error: weight shape mismatch.\n");
+        const uint64_t expectedWeightCount =
+            (uint64_t)groups * oRank * groupDim;
+        const uint64_t actualWeightCount =
+            DeepSeekV4LogicalElementCount(weight);
+        AssertInFastLLM(
+            actualWeightCount == expectedWeightCount,
+            "DeepSeekV4WoA error: weight shape mismatch (got " +
+                std::to_string(actualWeightCount) +
+                " logical elements, expected " +
+                std::to_string(expectedWeightCount) + "; heads=" +
+                std::to_string(heads) + ", headDim=" +
+                std::to_string(headDim) + ", groups=" +
+                std::to_string(groups) + ", oRank=" +
+                std::to_string(oRank) + ").\n");
 
         const bool profileWoALinear = GetFastllmEnv().printProfile;
         const int tokens = bsz * seqlen;
@@ -2672,6 +2747,82 @@ namespace fastllm {
         bool useFastFloat16Path = weight.dataType == DataType::FLOAT16 &&
                                   !DeepSeekV4HcPreEnvFlagEnabled(
                                       "FASTLLM_DSV4_DISABLE_CPU_WOA_FAST");
+        const bool useFastFp8Path =
+            input.dataType == DataType::BFLOAT16 &&
+            weight.dataType == DataType::FP8_E4M3 &&
+            weight.blockK > 0 && weight.blockM > 0 &&
+            oRank % weight.blockK == 0 &&
+            !DeepSeekV4HcPreEnvFlagEnabled(
+                "FASTLLM_DSV4_DISABLE_CPU_WOA_FAST");
+
+        if (useFastFp8Path) {
+            AssertInFastLLM(
+                input.dataDevice == DataDevice::CPU &&
+                    input.cpuData != nullptr &&
+                    weight.dataDevice == DataDevice::CPU &&
+                    weight.cpuData != nullptr,
+                "DeepSeekV4WoA CPU FP8 fast path requires CPU tensors.\n");
+            const int scaleColumns =
+                (groupDim + weight.blockM - 1) / weight.blockM;
+            const int scaleRowsPerGroup = oRank / weight.blockK;
+            AssertInFastLLM(
+                weight.scales.size() ==
+                    (uint64_t)groups * scaleRowsPerGroup * scaleColumns,
+                "DeepSeekV4WoA CPU FP8 scale shape mismatch.\n");
+
+            std::unique_ptr<uint16_t[]> groupInput(
+                new uint16_t[(uint64_t)groups * tokens * groupDim]);
+            std::unique_ptr<float[]> groupOutput(
+                new float[(uint64_t)groups * tokens * oRank]);
+            const uint16_t *source = (const uint16_t*)input.cpuData;
+            for (int group = 0; group < groups; group++) {
+                for (int token = 0; token < tokens; token++) {
+                    memcpy(
+                        groupInput.get() +
+                            ((uint64_t)group * tokens + token) * groupDim,
+                        source + (uint64_t)token * heads * headDim +
+                            (uint64_t)group * groupDim,
+                        (uint64_t)groupDim * sizeof(uint16_t));
+                }
+            }
+
+            const int outputRowsPerTask = 64;
+            std::vector<MultiThreadBaseOp*> ops;
+            ops.reserve(
+                (uint64_t)groups *
+                ((oRank + outputRowsPerTask - 1) / outputRowsPerTask));
+            for (int group = 0; group < groups; group++) {
+                uint16_t *currentInput =
+                    groupInput.get() + (uint64_t)group * tokens * groupDim;
+                uint8_t *currentWeight =
+                    weight.cpuData + (uint64_t)group * oRank * groupDim;
+                float *currentOutput =
+                    groupOutput.get() + (uint64_t)group * tokens * oRank;
+                float *currentScales =
+                    weight.scales.data() +
+                    (uint64_t)group * scaleRowsPerGroup * scaleColumns;
+                for (int start = 0; start < oRank;
+                     start += outputRowsPerTask) {
+                    const int end =
+                        std::min(start + outputRowsPerTask, oRank);
+                    ops.push_back(
+                        new MultiThreadLinearBFloat16FP8E4M3Op(
+                            currentInput, currentWeight, nullptr,
+                            currentOutput, tokens, groupDim, oRank,
+                            start, end, currentScales,
+                            weight.blockK, weight.blockM));
+                }
+            }
+            DynamicScheduleTasks(ops);
+
+            output.dataType = DataType::BFLOAT16;
+            output.Resize({bsz, seqlen, groups * oRank});
+            output.Allocate();
+            DeepSeekV4WoAWriteOutput(
+                groupOutput.get(), (uint16_t*)output.cpuData,
+                tokens, groups, oRank, pool);
+            return;
+        }
 
         if (useFastFloat16Path && tokens > 1) {
             AssertInFastLLM(

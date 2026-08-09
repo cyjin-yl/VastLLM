@@ -8061,3 +8061,89 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * r
 }
 
 #endif // #ifdef __aarch64__ else ...
+
+void ggml_vec_dot_mxfp4_q8_K(int n, float * GGML_RESTRICT s, size_t bs,
+                             const void * GGML_RESTRICT vx, size_t bx,
+                             const void * GGML_RESTRICT vy, size_t by,
+                             int nrc) {
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+    (void)bs;
+    (void)bx;
+    (void)by;
+
+    static const int8_t values[32] = {
+         0,  1,  2,  3,  4,  6,  8,  12,
+         0, -1, -2, -3, -4, -6, -8, -12,
+         0,  1,  2,  3,  4,  6,  8,  12,
+         0, -1, -2, -3, -4, -6, -8, -12,
+    };
+    const block_mxfp4 * GGML_RESTRICT x =
+        static_cast<const block_mxfp4 *>(vx);
+    const block_q8_K * GGML_RESTRICT y =
+        static_cast<const block_q8_K *>(vy);
+    float sum = 0.0f;
+
+#if defined(__AVX2__) && !defined(__aarch64__)
+    const __m256i valueTable =
+        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(values));
+    const __m256i nibbleMask = _mm256_set1_epi8(0x0f);
+    const __m256i ones = _mm256_set1_epi16(1);
+#endif
+
+    for (int block = 0; block < n / QK_K; ++block) {
+        const block_mxfp4 *weightBlock =
+            x + block * (QK_K / QK_MXFP4);
+        const block_q8_K &inputBlock = y[block];
+        for (int subBlock = 0; subBlock < QK_K / QK_MXFP4;
+             ++subBlock) {
+            const block_mxfp4 &weight = weightBlock[subBlock];
+            uint32_t scaleBits = weight.e < 2
+                ? 0x00200000u << weight.e
+                : (uint32_t)(weight.e - 1) << 23;
+            float scale;
+            memcpy(&scale, &scaleBits, sizeof(scale));
+            int integerDot = 0;
+
+#if defined(__AVX2__) && !defined(__aarch64__)
+            const __m128i packed = _mm_loadu_si128(
+                reinterpret_cast<const __m128i *>(weight.qs));
+            const __m128i lowIndices =
+                _mm_and_si128(packed, _mm_set1_epi8(0x0f));
+            const __m128i highIndices =
+                _mm_and_si128(_mm_srli_epi16(packed, 4),
+                              _mm_set1_epi8(0x0f));
+            const __m256i indices =
+                _mm256_set_m128i(highIndices, lowIndices);
+            const __m256i weightValues =
+                _mm256_shuffle_epi8(valueTable, indices);
+            const __m256i inputValues = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(
+                    inputBlock.qs + subBlock * QK_MXFP4));
+            const __m256i absoluteWeights =
+                _mm256_and_si256(_mm256_abs_epi8(weightValues), nibbleMask);
+            const __m256i signedInputs =
+                _mm256_sign_epi8(inputValues, weightValues);
+            const __m256i pairSums =
+                _mm256_maddubs_epi16(absoluteWeights, signedInputs);
+            const __m256i laneSums = _mm256_madd_epi16(pairSums, ones);
+            alignas(32) int32_t lanes[8];
+            _mm256_store_si256(reinterpret_cast<__m256i *>(lanes), laneSums);
+            for (int lane : lanes) {
+                integerDot += lane;
+            }
+#else
+            for (int i = 0; i < QK_MXFP4 / 2; ++i) {
+                const uint8_t packed = weight.qs[i];
+                integerDot += values[packed & 0x0f] *
+                              inputBlock.qs[subBlock * QK_MXFP4 + i];
+                integerDot += values[packed >> 4] *
+                              inputBlock.qs[subBlock * QK_MXFP4 + i +
+                                            QK_MXFP4 / 2];
+            }
+#endif
+            sum += integerDot * (inputBlock.d * scale);
+        }
+    }
+    *s = sum;
+}

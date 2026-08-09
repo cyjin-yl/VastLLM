@@ -91,7 +91,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
         }},
         {GGML_TYPE_MXFP4, ggml_type_traits{/* type_name */"mxfp4", /* blck_size */QK_MXFP4,
             /* type_size */ sizeof(block_mxfp4),/* is_quantized */  true,
-            /* vec_dot */ nullptr,
+            /* vec_dot */ ggml_vec_dot_mxfp4_q8_K,
             /* vec_dot_type */ GGML_TYPE_Q8_K,
             /* to_float */ (ggml_to_float_t) dequantize_row_mxfp4,
         }},
@@ -346,6 +346,8 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = QK_MXFP4,
             .type_size                = sizeof(block_mxfp4),
             .is_quantized             = true,
+            .vec_dot                  = ggml_vec_dot_mxfp4_q8_K,
+            .vec_dot_type             = GGML_TYPE_Q8_K,
             .to_float                 = (ggml_to_float_t) dequantize_row_mxfp4,
         }},
         {GGML_TYPE_Q2_K, ggml_type_traits{

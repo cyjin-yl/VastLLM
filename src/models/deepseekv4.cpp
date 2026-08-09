@@ -210,7 +210,7 @@ namespace fastllm {
         static bool DeepSeekV4PreferCuda() {
 #ifdef USE_CUDA
             auto *executor = (Executor*)GetExecutor();
-            return executor != nullptr &&
+            return executor != nullptr && FastllmCudaGetDeviceCount() > 0 &&
                    (executor->firstDevice == "cuda" ||
                     executor->firstDevice.rfind("cuda:", 0) == 0 ||
                     executor->firstDevice == "multicuda" ||
@@ -2947,7 +2947,8 @@ namespace fastllm {
                 }
                 return;
             }
-            if (compressedTopK == nullptr && q.dims[1] == 1) {
+            if (DeepSeekV4PreferCuda() && compressedTopK == nullptr &&
+                q.dims[1] == 1) {
                 Data qCuda, windowCuda, compressedCuda;
                 const Data *qForCuda = &q;
                 if (q.dataDevice != DataDevice::CUDA) {
@@ -3359,12 +3360,17 @@ namespace fastllm {
                             decodeCache->indexerCompressedKV, bsz,
                             targetBlocks, indexHeadDim);
                 }
-                TrimCompressorRawCache(
-                    bsz, totalLen, compressRatio, wideDim,
-                    decodeCache->indexerCompressedBlocks,
-                    decodeCache->indexerCompressorKVRaw,
-                    decodeCache->indexerCompressorScoreRaw,
-                    decodeCache->indexerCompressorRawTokenBase);
+                // Verification may append several tentative rows and then
+                // roll back to the first accepted token. Preserve the
+                // committed raw tail until acceptance has been decided.
+                if (!DeepSeekV4DsparkVerificationActive()) {
+                    TrimCompressorRawCache(
+                        bsz, totalLen, compressRatio, wideDim,
+                        decodeCache->indexerCompressedBlocks,
+                        decodeCache->indexerCompressorKVRaw,
+                        decodeCache->indexerCompressorScoreRaw,
+                        decodeCache->indexerCompressorRawTokenBase);
+                }
                 compressed = &decodeCache->indexerCompressedKV;
             }
 
@@ -3815,6 +3821,24 @@ namespace fastllm {
             return true;
         }
     }
+
+    int DeepSeekV4DecodeReservationTokens(
+            int usedTokens, int requestedTokens, int tokenLimit,
+            bool allowPartial) {
+        if (requestedTokens <= 0) {
+            return 0;
+        }
+        if (tokenLimit <= 0) {
+            return requestedTokens;
+        }
+        const int availableTokens = tokenLimit - usedTokens;
+        if (availableTokens <= 0) {
+            return 0;
+        }
+        return availableTokens >= requestedTokens ? requestedTokens :
+            (allowPartial ? availableTokens : 0);
+    }
+
 
 #ifdef USE_CUDA
     bool DeepSeekV4CopyCudaTensorToCpuForTest(
@@ -6222,10 +6246,14 @@ namespace fastllm {
                         if (sur > 0) {
                             predictLen = std::min(predictLen, ((sur - 1) / 128 + 1) * 128);
                         }
-                        if (maxTotalLens > 0 && lenSum + predictLen > maxTotalLens) {
+                        const int reservedTokens =
+                            DeepSeekV4DecodeReservationTokens(
+                                lenSum, predictLen, maxTotalLens,
+                                seqLens.empty());
+                        if (reservedTokens <= 0) {
                             continue;
                         }
-                        lenSum += predictLen;
+                        lenSum += reservedTokens;
                     } else {
                         // Restored pages are not part of currentTokens, but
                         // they still consume the shared cache token budget.
