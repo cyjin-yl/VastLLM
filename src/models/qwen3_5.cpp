@@ -8388,6 +8388,96 @@ namespace fastllm {
         return basellm::GetKVCacheDataTypes(layerIndex);
     }
 
+    bool Qwen3_5Model::PreparePersistentPrefixCacheManagers(
+            std::string *error) {
+        if (error != nullptr) {
+            error->clear();
+        }
+#ifdef USE_CUDA
+        if (GetKVCacheInCPU()) {
+            return true;
+        }
+        std::vector<int> restoreDevices;
+        std::map<int, int> restoreRatios;
+        if (!GetQwen35GPUForwardDevices(
+                this->deviceMap,
+                restoreDevices,
+                restoreRatios) ||
+            restoreDevices.size() != 1) {
+            if (error != nullptr) {
+                *error =
+                    "Qwen3.5 persistent prefix cache restore requires "
+                    "exactly one CUDA forward device";
+            }
+            return false;
+        }
+        try {
+            if (this->threadTpPagedCacheBase < 0) {
+                this->threadTpPagedCacheBase =
+                    qwen35ThreadTpNextPagedCacheBase.fetch_add(
+                        std::max(1, this->block_cnt * 2));
+            }
+            const int device = restoreDevices[0];
+            size_t preparedManagers = 0;
+            auto makeDescriptor = [&](DataType dataType) {
+                Data descriptor(dataType);
+                descriptor.dims = {
+                    this->num_key_value_heads,
+                    1,
+                    this->head_dim,
+                };
+                descriptor.dataDevice = DataDevice::CUDA;
+                descriptor.dataDeviceIds = {device};
+                descriptor.UpdateUnitSize();
+                return descriptor;
+            };
+            for (int layer = 0; layer < this->block_cnt; layer++) {
+                if (Qwen35LayerIsLinearAttention(this, layer)) {
+                    continue;
+                }
+                const auto cacheTypes =
+                    this->GetKVCacheDataTypes(layer);
+                Data keyDescriptor =
+                    makeDescriptor(cacheTypes.first);
+                Data valueDescriptor =
+                    makeDescriptor(cacheTypes.second);
+                const int cacheLayer =
+                    this->threadTpPagedCacheBase + layer;
+                AllocatePagedCacheManager(
+                    cacheLayer * 2,
+                    PagedCacheManager::
+                        PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+                    keyDescriptor);
+                AllocatePagedCacheManager(
+                    cacheLayer * 2 + 1,
+                    PagedCacheManager::
+                        PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+                    valueDescriptor);
+                preparedManagers += 2;
+            }
+            const PersistentPrefixCacheStatus persistentStatus =
+                GetPersistentPrefixCacheStatus();
+            printf(
+                "[Prefix-persist] prepared %zu Qwen paged managers "
+                "for generation %llu.\n",
+                preparedManagers,
+                (unsigned long long)
+                    persistentStatus.loadedGeneration);
+            fflush(stdout);
+        } catch (const std::exception &exception) {
+            if (error != nullptr) {
+                *error =
+                    std::string(
+                        "failed to prepare Qwen persistent paged "
+                        "cache managers: ") +
+                    exception.what();
+            }
+            return false;
+        }
+#endif
+        return true;
+    }
+
     PagedCacheManager* Qwen3_5Model::GetPagedKVCacheManager(int layerIndex, bool isKey) const {
         if (layerIndex >= 0 && Qwen35LayerIsLinearAttention(this, layerIndex)) {
             return nullptr;
@@ -18339,71 +18429,6 @@ namespace fastllm {
         NewMainLoop();
 #else
         Qwen3_5Model *model = this;
-        const PersistentPrefixCacheStatus persistentStatus =
-            GetPersistentPrefixCacheStatus();
-        if (persistentStatus.loadedGeneration > 0 &&
-            !GetKVCacheInCPU()) {
-            std::vector<int> restoreDevices;
-            std::map<int, int> restoreRatios;
-            if (GetQwen35GPUForwardDevices(
-                    model->deviceMap,
-                    restoreDevices,
-                    restoreRatios) &&
-                restoreDevices.size() == 1) {
-                if (model->threadTpPagedCacheBase < 0) {
-                    model->threadTpPagedCacheBase =
-                        qwen35ThreadTpNextPagedCacheBase.fetch_add(
-                            std::max(1, model->block_cnt * 2));
-                }
-                const int device = restoreDevices[0];
-                size_t preparedManagers = 0;
-                auto makeDescriptor =
-                    [&](DataType dataType) {
-                        Data descriptor(dataType);
-                        descriptor.dims = {
-                            model->num_key_value_heads,
-                            1,
-                            model->head_dim,
-                        };
-                        descriptor.dataDevice = DataDevice::CUDA;
-                        descriptor.dataDeviceIds = {device};
-                        descriptor.UpdateUnitSize();
-                        return descriptor;
-                    };
-                for (int layer = 0;
-                     layer < model->block_cnt; layer++) {
-                    if (Qwen35LayerIsLinearAttention(model, layer)) {
-                        continue;
-                    }
-                    const auto cacheTypes =
-                        model->GetKVCacheDataTypes(layer);
-                    Data keyDescriptor =
-                        makeDescriptor(cacheTypes.first);
-                    Data valueDescriptor =
-                        makeDescriptor(cacheTypes.second);
-                    const int cacheLayer =
-                        model->threadTpPagedCacheBase + layer;
-                    AllocatePagedCacheManager(
-                        cacheLayer * 2,
-                        PagedCacheManager::
-                            PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
-                        keyDescriptor);
-                    AllocatePagedCacheManager(
-                        cacheLayer * 2 + 1,
-                        PagedCacheManager::
-                            PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
-                        valueDescriptor);
-                    preparedManagers += 2;
-                }
-                printf(
-                    "[Prefix-persist] prepared %zu Qwen paged managers "
-                    "for generation %llu.\n",
-                    preparedManagers,
-                    (unsigned long long)
-                        persistentStatus.loadedGeneration);
-                fflush(stdout);
-            }
-        }
         int maxTotalLens = 0;
         int totalPages = 0;
         const bool residentPlainBatchEnabled =

@@ -185,6 +185,15 @@ owned child spawn 时注入随机 control token。`stop()` 的 drain 结束后�
    - 两次 unload/reload 无 OOM、死锁、残留 child 或损坏 generation。
 6. 删除/截断最新 generation 后重启：服务从空 cache 正常生成，输出仍一致，并报告可诊断的 restore error。
 
+### V100 实测（2026-08-10）
+
+- 环境：Tesla V100-PCIE-32GB，driver `580.173.02`，SM70；ThinkingCap Qwen3.6 27B Q4_K_M（SHA-256 `b0651e28555bde7d2459ce99f091319b1a547143463e8d49f2aa7f572675fe67`），Turbo3 KV，page length 128，owned backend。
+- 同一份确定性长前缀请求（10,830 prompt tokens，128 completion tokens）跨两个 backend epoch 输出 SHA-256 均为 `1700e90fd6fa6d5759f0e1add8d277798b853501f6c2933aad9193e7323049d5`。
+- Epoch 1 cold TTFT 114.011 s；drain 后 checkpoint generation 1：2,048 pages、275,693,105 uncompressed bytes、3,306.188 ms；显存从 24,037 MiB 回落到 327 MiB。
+- Epoch 2 加载 generation 1 并产生 2,048 个 immutable-generation restore hits；TTFT 89.755 s，较 cold run 减少 24.256 s（1.270×）；第二次 checkpoint/unload 同样成功。
+- 将最新 `pages.bin` 从 224,761,966 bytes 截断到 1 byte 后，新进程报告 `persistent prefix cache pages size mismatch`、`loaded_generation=0`、`restore_hits=0`；请求仍返回 HTTP 200 且输出 hash 不变，随后成功提交新的完整 generation。
+- Focused gates：`persistent_prefix_cache` 五项、`paged_prefix_cache_policy`、`qwen35_long_prefill_state`、API socket test、Thinking Proxy 35 项 lifecycle/protocol tests 与 `bash -n scripts/start_proxy.sh` 全部通过。机器可读证据：`v100-perfs/benchmarks/fastllm/results/fastllm_persistent_prefix_cache_v100_smoke.json`。
+
 ## 8. Rollout
 
 - 所有新行为默认关闭。

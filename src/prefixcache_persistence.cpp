@@ -1233,15 +1233,20 @@ bool PreparePersistentPrefixCache(
     PersistedPrefixCacheGeneration loaded;
     std::vector<PersistentPayloadRef> refs;
     if (!LoadPersistentPrefixCacheGeneration(
-            root, loaded, refs, error) ||
-        loaded.cacheKey != options.cacheKey) {
-        if (loaded.cacheKey != options.cacheKey) {
-            SetError(error, "persistent prefix cache key mismatch");
-        }
+            root, loaded, refs, error)) {
         std::lock_guard<std::mutex> guard(runtime.locker);
         runtime.root = root;
         runtime.status.lastError =
             error == nullptr ? "failed to load cache generation" : *error;
+        status = runtime.status;
+        return false;
+    }
+    if (loaded.cacheKey != options.cacheKey) {
+        SetError(error, "persistent prefix cache key mismatch");
+        std::lock_guard<std::mutex> guard(runtime.locker);
+        runtime.root = root;
+        runtime.status.lastError =
+            error == nullptr ? "persistent prefix cache key mismatch" : *error;
         status = runtime.status;
         return false;
     }
@@ -1301,6 +1306,20 @@ bool PreparePersistentPrefixCache(
         runtime.refs = std::move(refs);
         runtime.status.loadedGeneration = loaded.generation;
         runtime.status.payloadBytes = payloadBytes;
+    }
+    if (model != nullptr &&
+        !model->PreparePersistentPrefixCacheManagers(error)) {
+        std::lock_guard<std::mutex> guard(runtime.locker);
+        runtime.generation = 0;
+        runtime.refs.clear();
+        runtime.status.loadedGeneration = 0;
+        runtime.status.payloadBytes = 0;
+        runtime.status.lastError =
+            error == nullptr ?
+                "model failed to prepare persistent paged cache managers" :
+                *error;
+        status = runtime.status;
+        return false;
     }
     AttachPreparedPersistentPrefixCacheManagers();
     status = GetPersistentPrefixCacheStatus();

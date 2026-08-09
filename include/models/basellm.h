@@ -505,6 +505,11 @@ namespace fastllm {
         virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context);
         virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const;
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const;
+        virtual bool PreparePersistentPrefixCacheManagers(
+            std::string *error) {
+            (void)error;
+            return true;
+        }
         virtual bool ExportPersistentPrefixCacheExtras(
             std::vector<PersistentPayloadRecord> &records,
             std::string *error) const {

@@ -746,6 +746,16 @@ namespace {
                 }
                 return false;
             }
+            bool PreparePersistentPrefixCacheManagers(
+                    std::string *error) override {
+                (void)error;
+                prepareManagersCalled = true;
+                if (prepareManagers) {
+                    prepareManagers();
+                }
+                return true;
+            }
+
 
             std::string MakeInput(
                     const std::string &history,
@@ -766,6 +776,8 @@ namespace {
 
             std::vector<uint8_t> exported;
             std::vector<uint8_t> imported;
+            std::function<void()> prepareManagers;
+            bool prepareManagersCalled = false;
         };
         PersistentExtraProbeModel firstModel;
         firstModel.exported = {0x41, 0x42, 0x43};
@@ -866,14 +878,18 @@ namespace {
         fastllm::ClearAllPagedCacheManagers();
         fastllm::ResetPersistentPrefixCacheForTest();
         PersistentExtraProbeModel thirdModel;
+        thirdModel.prepareManagers = [&]() {
+            key = makeManager(72020, pageLen);
+            extra = makeManager(72022, pageLen);
+        };
         Expect(fastllm::PreparePersistentPrefixCache(
                    options, &thirdModel, status, &error), error);
+        Expect(thirdModel.prepareManagersCalled,
+               "model did not prepare lazy paged managers before restore.");
         Expect(status.loadedGeneration == stats.generation,
                "second persistent generation was not restored.");
         Expect(thirdModel.imported == secondModel.exported,
                "second-generation model extra did not survive restart.");
-        key = makeManager(72020, pageLen);
-        extra = makeManager(72022, pageLen);
         expectRestored(key, expectedKey,
                        "second-generation persistent K cache");
         expectRestored(extra, expectedExtra,
@@ -1034,9 +1050,10 @@ namespace {
             return 6;
         }
         if (expectMiss) {
-            if (prepared || error.empty()) {
+            if (prepared ||
+                error.find("manifest") == std::string::npos) {
                 std::cerr
-                    << "corrupt generation did not fail open: "
+                    << "corrupt generation did not preserve its diagnostic: "
                     << error << "\n";
                 return 7;
             }
