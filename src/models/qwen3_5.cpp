@@ -19757,6 +19757,7 @@ namespace fastllm {
                     if (!oldTokensReady) {
                         oldTokens = gpuTokenHandoff.WaitHostTokens(
                             oldHostSlot, (int)oldHandles.size());
+
                     }
                     AssertInFastLLM(oldTokens.size() == oldHandles.size(),
                                     "Qwen3.5 GPU token handoff lost batch outputs.\n");

@@ -3967,6 +3967,9 @@ namespace fastllm {
         if (allowedExpertMask != nullptr) {
             datas["allowedExpertMask"] = (Data*)allowedExpertMask;
         }
+        if (pairedReduceInput != nullptr) {
+            datas["pairedReduceInput"] = pairedReduceInput;
+        }
         curExecutor->Run("MergeMOE", datas,
                          {{"sharedScale", sharedScale}, {"swigluLimit", swigluLimit}},
                          {{"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()},

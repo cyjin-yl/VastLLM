@@ -169,6 +169,8 @@ namespace {
         assert(ggml_blck_size(GGML_TYPE_MXFP4) == QK_MXFP4);
         assert(ggml_type_size(GGML_TYPE_MXFP4) == sizeof(block_mxfp4));
         assert(ggml_type_to_float(GGML_TYPE_MXFP4) != nullptr);
+        assert(ggml_type_vec_dot_type(GGML_TYPE_MXFP4) == GGML_TYPE_Q8_K);
+        assert(ggml_type_vec_dot(GGML_TYPE_MXFP4) != nullptr);
         assert(ggml_type_to_float(GGML_TYPE_IQ2_XS) != nullptr);
         assert(ggml_type_to_float(GGML_TYPE_IQ3_XXS) != nullptr);
         assert(ggml_row_size(GGML_TYPE_MXFP4, QK_MXFP4) == 17);
@@ -200,6 +202,27 @@ namespace {
         for (int i = 0; i < 16; ++i) {
             assert(mxfp4Output[i] == 0.5f * mxfp4Values[i]);
         }
+
+        block_mxfp4 dotWeights[QK_K / QK_MXFP4]{};
+        for (int block = 0; block < QK_K / QK_MXFP4; ++block) {
+            dotWeights[block].e = (uint8_t)(127 + block);
+            std::memset(dotWeights[block].qs, 0x11,
+                        sizeof(dotWeights[block].qs));
+        }
+        std::vector<float> dotInput(QK_K, 1.0f);
+        block_q8_K quantizedInput{};
+        iqk_quantize_row_q8_K(dotInput.data(), &quantizedInput, QK_K,
+                              GGML_TYPE_Q8_K, GGML_TYPE_MXFP4);
+        float actualDot = 0.0f;
+        ggml_type_vec_dot(GGML_TYPE_MXFP4)(
+            QK_K, &actualDot, 0, dotWeights, 0, &quantizedInput, 0, 1);
+        std::vector<float> dotWeightValues(QK_K);
+        dequantize_row_mxfp4(dotWeights, dotWeightValues.data(), QK_K);
+        float expectedDot = 0.0f;
+        for (float value : dotWeightValues) {
+            expectedDot += value;
+        }
+        assert(std::fabs(actualDot - expectedDot) < 1e-4f);
 
         block_iq2_xs iq2{};
         iq2.d = 0x3c00;

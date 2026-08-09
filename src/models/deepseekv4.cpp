@@ -210,7 +210,7 @@ namespace fastllm {
         static bool DeepSeekV4PreferCuda() {
 #ifdef USE_CUDA
             auto *executor = (Executor*)GetExecutor();
-            return executor != nullptr &&
+            return executor != nullptr && FastllmCudaGetDeviceCount() > 0 &&
                    (executor->firstDevice == "cuda" ||
                     executor->firstDevice.rfind("cuda:", 0) == 0 ||
                     executor->firstDevice == "multicuda" ||
@@ -2947,7 +2947,8 @@ namespace fastllm {
                 }
                 return;
             }
-            if (compressedTopK == nullptr && q.dims[1] == 1) {
+            if (DeepSeekV4PreferCuda() && compressedTopK == nullptr &&
+                q.dims[1] == 1) {
                 Data qCuda, windowCuda, compressedCuda;
                 const Data *qForCuda = &q;
                 if (q.dataDevice != DataDevice::CUDA) {
@@ -3359,12 +3360,17 @@ namespace fastllm {
                             decodeCache->indexerCompressedKV, bsz,
                             targetBlocks, indexHeadDim);
                 }
-                TrimCompressorRawCache(
-                    bsz, totalLen, compressRatio, wideDim,
-                    decodeCache->indexerCompressedBlocks,
-                    decodeCache->indexerCompressorKVRaw,
-                    decodeCache->indexerCompressorScoreRaw,
-                    decodeCache->indexerCompressorRawTokenBase);
+                // Verification may append several tentative rows and then
+                // roll back to the first accepted token. Preserve the
+                // committed raw tail until acceptance has been decided.
+                if (!DeepSeekV4DsparkVerificationActive()) {
+                    TrimCompressorRawCache(
+                        bsz, totalLen, compressRatio, wideDim,
+                        decodeCache->indexerCompressedBlocks,
+                        decodeCache->indexerCompressorKVRaw,
+                        decodeCache->indexerCompressorScoreRaw,
+                        decodeCache->indexerCompressorRawTokenBase);
+                }
                 compressed = &decodeCache->indexerCompressedKV;
             }
 
@@ -3815,6 +3821,24 @@ namespace fastllm {
             return true;
         }
     }
+
+    int DeepSeekV4DecodeReservationTokens(
+            int usedTokens, int requestedTokens, int tokenLimit,
+            bool allowPartial) {
+        if (requestedTokens <= 0) {
+            return 0;
+        }
+        if (tokenLimit <= 0) {
+            return requestedTokens;
+        }
+        const int availableTokens = tokenLimit - usedTokens;
+        if (availableTokens <= 0) {
+            return 0;
+        }
+        return availableTokens >= requestedTokens ? requestedTokens :
+            (allowPartial ? availableTokens : 0);
+    }
+
 
 #ifdef USE_CUDA
     bool DeepSeekV4CopyCudaTensorToCpuForTest(
@@ -6222,10 +6246,14 @@ namespace fastllm {
                         if (sur > 0) {
                             predictLen = std::min(predictLen, ((sur - 1) / 128 + 1) * 128);
                         }
-                        if (maxTotalLens > 0 && lenSum + predictLen > maxTotalLens) {
+                        const int reservedTokens =
+                            DeepSeekV4DecodeReservationTokens(
+                                lenSum, predictLen, maxTotalLens,
+                                seqLens.empty());
+                        if (reservedTokens <= 0) {
                             continue;
                         }
-                        lenSum += predictLen;
+                        lenSum += reservedTokens;
                     } else {
                         // Restored pages are not part of currentTokens, but
                         // they still consume the shared cache token budget.
@@ -6902,6 +6930,10 @@ namespace fastllm {
         this->model_type = "deepseek_v4";
         this->model_struct = "deepseek_v4";
         this->defaultChunkedPrefillSize = 4096;
+        // basellm 中这两个成员无类内初始化器；给出文档化的 V4-Flash 默认值，
+        // 保证 InitParams 之前（如 hybrid loader 的命名校验）读取是确定的。
+        this->num_experts = 256;
+        this->num_experts_per_tok = 6;
 
         // V4 推荐 thinking 模式，需配合外部 chat_template；这里给一份最小默认值
         this->pre_prompt = "";
@@ -6945,7 +6977,6 @@ namespace fastllm {
             "mtp.*.ffn.shared_experts.w1.weight",
             "mtp.*.ffn.shared_experts.w2.weight",
             "mtp.*.ffn.shared_experts.w3.weight",
-            "mtp.*.e_proj.weight", "mtp.*.h_proj.weight",
             // DeepSeek-V4 Flash 内置 DSpark 的 stage-0 主特征投影，
             // 以及 stage-2 Markov / confidence heads。
             "mtp.*.main_proj.weight",
@@ -7008,6 +7039,84 @@ namespace fastllm {
         }
 #endif
         return mapped;
+    }
+
+    // 官方 0731 safetensors 的 mtp namespace 是封闭集合；hybrid loader 在
+    // 导入前用本函数拒绝任何越界/拼写错误的名称。backbone 与其他命名不
+    // 在本函数管辖范围内，一律放行给既有加载路径。
+    bool DeepSeekV4Model::IsRecognizedWeightName(
+            const std::string &weightName) const {
+        if (weightName.rfind("mtp.", 0) != 0) {
+            return true;
+        }
+        size_t pos = 4; // strlen("mtp.")
+        size_t stageEnd = weightName.find('.', pos);
+        if (stageEnd == std::string::npos || stageEnd == pos) {
+            return false;
+        }
+        int stage = 0;
+        for (size_t i = pos; i < stageEnd; i++) {
+            if (weightName[i] < '0' || weightName[i] > '9' || stage > 100) {
+                return false;
+            }
+            stage = stage * 10 + (weightName[i] - '0');
+        }
+        const int stageCount = dsparkLayers > 0 ? dsparkLayers : 3;
+        if (stage >= stageCount) {
+            return false;
+        }
+        const std::string suffix = weightName.substr(stageEnd + 1);
+        static const std::set<std::string> commonSuffixes = {
+            "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
+            "attn_norm.weight",
+            "attn.wq_a.weight", "attn.q_norm.weight", "attn.wq_b.weight",
+            "attn.wkv.weight", "attn.kv_norm.weight", "attn.attn_sink",
+            "attn.wo_a.weight", "attn.wo_b.weight",
+            "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base",
+            "ffn_norm.weight",
+            "ffn.gate.weight",
+            // 官方 0731 的 MoE router 带 bias（backbone MoE 层同样有）。
+            "ffn.gate.bias",
+            "ffn.shared_experts.w1.weight",
+            "ffn.shared_experts.w2.weight",
+            "ffn.shared_experts.w3.weight",
+        };
+        if (commonSuffixes.count(suffix)) {
+            return true;
+        }
+        if (suffix.rfind("ffn.experts.", 0) == 0) {
+            size_t expertEnd = suffix.find('.', 12);
+            if (expertEnd == std::string::npos || expertEnd == 12) {
+                return false;
+            }
+            int expertId = 0;
+            for (size_t i = 12; i < expertEnd; i++) {
+                if (suffix[i] < '0' || suffix[i] > '9' || expertId > 100000) {
+                    return false;
+                }
+                expertId = expertId * 10 + (suffix[i] - '0');
+            }
+            if (num_experts > 0 && expertId >= num_experts) {
+                return false;
+            }
+            const std::string part = suffix.substr(expertEnd);
+            return part == ".w1.weight" || part == ".w2.weight" ||
+                part == ".w3.weight";
+        }
+        if (stage == 0) {
+            return suffix == "main_proj.weight" ||
+                suffix == "main_norm.weight";
+        }
+        if (stage == stageCount - 1) {
+            return suffix == "norm.weight" ||
+                suffix == "hc_head_fn" ||
+                suffix == "hc_head_scale" ||
+                suffix == "hc_head_base" ||
+                suffix == "markov_head.markov_w1.weight" ||
+                suffix == "markov_head.markov_w2.weight" ||
+                suffix == "confidence_head.proj.weight";
+        }
+        return false;
     }
 
     std::string DeepSeekV4Model::SelectSpecialWeightDevice(
@@ -7265,6 +7374,7 @@ namespace fastllm {
         remappedHashRouteTables.clear();
         hashRemapCoverage.clear();
         UpdateExpertAllowListMetadata();
+
         dsparkTokens = std::max(0, EnvInt("FASTLLM_DSPARK_TOKENS", 0));
         dsparkEnabled = dsparkTokens > 0;
         if (dsparkEnabled) {

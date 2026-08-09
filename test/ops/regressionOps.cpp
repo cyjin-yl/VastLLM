@@ -4336,6 +4336,15 @@ namespace {
                "DeepSeek-V4 in-place BF16 RMSNorm changed output bits.");
     }
 
+    void RunDeepSeekV4SchedulerReservationRegression() {
+        Expect(
+            fastllm::DeepSeekV4DecodeReservationTokens(
+                6, 128, 64, true) == 58,
+            "DeepSeek-V4 scheduler rejected the only runnable decode when "
+            "the token budget was smaller than its admission reserve.");
+    }
+
+
     void RunCpuDeepSeekV4WoARegression() {
         constexpr int tokens = 37;
         constexpr int groups = 8;
@@ -4346,7 +4355,7 @@ namespace {
         constexpr int inputStride = heads * headDim;
         constexpr int outputStride = groups * oRank;
 
-        fastllm::SetThreads(40);
+        fastllm::SetThreads(2);
         fastllm::Data input(
             fastllm::DataType::BFLOAT16,
             {1, tokens, heads, headDim});
@@ -4430,6 +4439,55 @@ namespace {
                       referenceBits.size() * sizeof(uint16_t)) == 0,
                "DeepSeek-V4 CPU WoA global Linear queue changed BF16 output bits.");
 
+        {
+            constexpr int fp8Tokens = 1;
+            constexpr int fp8Groups = 2;
+            constexpr int fp8Heads = 4;
+            constexpr int fp8HeadDim = 32;
+            constexpr int fp8GroupDim =
+                fp8Heads / fp8Groups * fp8HeadDim;
+            constexpr int fp8ORank = 3;
+            fastllm::Data fp8Input(
+                fastllm::DataType::BFLOAT16,
+                {1, fp8Tokens, fp8Heads, fp8HeadDim});
+            fp8Input.Allocate();
+            std::fill_n(
+                (uint16_t*)fp8Input.cpuData, fp8Input.Count(0),
+                fastllm::Float32ToBFloat16RNEBits(1.0f));
+
+            fastllm::Data fp8Weight(
+                fastllm::DataType::FP8_E4M3,
+                {fp8Groups * fp8ORank, fp8GroupDim});
+            fp8Weight.Allocate();
+            memset(fp8Weight.cpuData, 0x38, fp8Weight.Count(0));
+            fp8Weight.blockK = 2;
+            fp8Weight.blockM = 32;
+            fp8Weight.scales = {
+                1.0f, 2.0f,
+                0.5f, 4.0f,
+                2.0f, 0.25f};
+
+            fastllm::Data fp8Output;
+            {
+                ScopedFirstDevice device("cpu");
+                fastllm::DeepSeekV4WoA(
+                    fp8Input, fp8Weight, fp8Groups, fp8ORank,
+                    fp8Output);
+            }
+            const float expectedRows[6] = {
+                96.0f, 96.0f, 144.0f, 144.0f, 72.0f, 72.0f};
+            const uint16_t *fp8OutputBits =
+                (const uint16_t*)fp8Output.cpuData;
+            for (int row = 0; row < fp8Groups * fp8ORank; row++) {
+                Expect(
+                    fp8OutputBits[row] ==
+                        fastllm::Float32ToBFloat16RNEBits(
+                            expectedRows[row]),
+                    "DeepSeek-V4 CPU WoA FP8 block-scale decode mismatch.");
+            }
+        }
+
+
 #ifdef USE_NUMAS
         if (fastllm::HasDeviceType("numa")) {
             fastllm::Data numaOutput;
@@ -4481,6 +4539,69 @@ namespace {
                    "DeepSeek-V4 NUMA WoA decode changed BF16 output bits.");
         }
 #endif
+    }
+
+    void RunCpuDeepSeekV4GgufWoARegression() {
+        constexpr int tokens = 3;
+        constexpr int groups = 2;
+        constexpr int heads = 4;
+        constexpr int headDim = 32;
+        constexpr int groupDim = heads / groups * headDim;
+        constexpr int oRank = 33;
+
+        fastllm::SetThreads(2);
+        std::vector<float> inputValues(
+            (size_t)tokens * heads * headDim);
+        for (size_t i = 0; i < inputValues.size(); i++) {
+            inputValues[i] =
+                (float)((int)(i * 17 % 127) - 63) / 64.0f;
+        }
+        fastllm::Data input(
+            fastllm::DataType::BFLOAT16,
+            {1, tokens, heads, headDim}, inputValues);
+
+        std::vector<float> sourceWeightValues(
+            (size_t)groups * oRank * groupDim);
+        for (size_t i = 0; i < sourceWeightValues.size(); i++) {
+            sourceWeightValues[i] =
+                (float)((int)(i * 29 % 251) - 125) / 256.0f;
+        }
+        fastllm::Data quantizedWeight(
+            fastllm::DataType::DATA_GGUF_FORMAT,
+            (int)GGML_TYPE_Q8_0, {groups, oRank, groupDim});
+        quantizedWeight.CreateFromOriData(
+            fastllm::WeightType::LINEAR, fastllm::DataType::FLOAT32,
+            (uint8_t*)sourceWeightValues.data(), nullptr, nullptr);
+
+        std::vector<float> dequantizedWeightValues(
+            sourceWeightValues.size());
+        auto q8ToFloat = ggml_type_to_float(GGML_TYPE_Q8_0);
+        Expect(q8ToFloat != nullptr,
+               "GGUF Q8_0 dequantizer is unavailable.");
+        q8ToFloat(
+            quantizedWeight.cpuData, dequantizedWeightValues.data(),
+            (int64_t)dequantizedWeightValues.size());
+        fastllm::Data dequantizedWeight(
+            fastllm::DataType::FLOAT32,
+            {groups, oRank, groupDim}, dequantizedWeightValues);
+
+        fastllm::Data quantizedOutput, dequantizedOutput;
+        {
+            ScopedFirstDevice device("cpu");
+            fastllm::DeepSeekV4WoA(
+                input, quantizedWeight, groups, oRank, quantizedOutput);
+            fastllm::DeepSeekV4WoA(
+                input, dequantizedWeight, groups, oRank, dequantizedOutput);
+        }
+        Expect(
+            quantizedOutput.dataType == fastllm::DataType::BFLOAT16 &&
+                quantizedOutput.dims ==
+                    std::vector<int>({1, tokens, groups * oRank}),
+            "DeepSeek-V4 CPU WoA GGUF Q8_0 output metadata mismatch.");
+        ExpectFloatNear(
+            ToFloatVector(dequantizedOutput), ToFloatVector(quantizedOutput),
+            0.0f, 0.0f,
+            "DeepSeek-V4 CPU WoA GGUF Q8_0 logical shape");
     }
 
     void RunCpuDeepSeekV4SparseAttentionRegression() {
@@ -17174,6 +17295,12 @@ int main(int argc, char **argv) {
         }
 #endif
         if (argc == 2 &&
+            std::string(argv[1]) == "--cpu-dsv4-scheduler") {
+            RunDeepSeekV4SchedulerReservationRegression();
+            std::cout << "DeepSeek-V4 scheduler reservation regression: PASS\n";
+            return 0;
+        }
+        if (argc == 2 &&
             std::string(argv[1]) == "--cpu-dsv4-preprocess") {
             RunCpuDeepSeekV4PreprocessRegression();
             std::cout << "DeepSeek-V4 CPU preprocessing bitwise regressions: PASS\n";
@@ -17183,6 +17310,12 @@ int main(int argc, char **argv) {
             std::string(argv[1]) == "--cpu-dsv4-scale-qratory") {
             RunCpuDeepSeekV4ScaleQRatoryRegression();
             std::cout << "DeepSeek-V4 CPU ScaleQRatory bitwise regression: PASS\n";
+            return 0;
+        }
+        if (argc == 2 &&
+            std::string(argv[1]) == "--cpu-dsv4-woa-gguf") {
+            RunCpuDeepSeekV4GgufWoARegression();
+            std::cout << "DeepSeek-V4 CPU GGUF WoA regression: PASS\n";
             return 0;
         }
         if (argc == 2 &&
