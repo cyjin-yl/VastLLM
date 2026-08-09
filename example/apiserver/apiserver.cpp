@@ -128,6 +128,7 @@ using socket_t = int;
 #include "stop_parser.h"
 #include "image_loader.h"
 #include "openai_multimodal_request.h"
+#include "checkpoint_control.h"
 #include "utils/stop_string_matcher.h"
 
 class MultimodalInputGuard {
@@ -203,6 +204,43 @@ struct APIConfig {
     std::map <std::string, int> devices;
 };
 APIConfig config;
+
+bool PrepareServerPersistentPrefixCache(
+        fastllm::basellm *model) {
+    fastllm::PersistentPrefixCacheStatus status;
+    std::string error;
+    const bool prepared =
+        fastllm::PreparePersistentPrefixCacheFromEnv(
+            model, status, &error);
+    if (!prepared) {
+        std::fprintf(
+            stderr,
+            "[Prefix-persist] restore skipped; cold start: %s\n",
+            error.empty() ? "unknown error" : error.c_str());
+        return false;
+    }
+    if (status.enabled) {
+        std::fprintf(
+            stderr,
+            "[Prefix-persist] enabled, loaded generation %llu\n",
+            (unsigned long long)status.loadedGeneration);
+    }
+    return true;
+}
+
+#ifndef _WIN32
+volatile sig_atomic_t shutdownSignal = 0;
+volatile sig_atomic_t serverSocketForSignal = -1;
+
+void HandleShutdownSignal(int signalNumber) {
+    shutdownSignal = signalNumber;
+    const int socketFd = (int)serverSocketForSignal;
+    serverSocketForSignal = -1;
+    if (socketFd >= 0) {
+        close(socketFd);
+    }
+}
+#endif
 
 void ToNext(char * &cur, const std::string &target, std::string &v) {
     v = "";
@@ -287,6 +325,37 @@ struct HttpRequest {
     }
 } httpChecker;
 
+std::string TrimHttpHeaderValue(const std::string &value) {
+    size_t begin = 0;
+    while (begin < value.size() &&
+           std::isspace((unsigned char)value[begin])) {
+        begin++;
+    }
+    size_t end = value.size();
+    while (end > begin &&
+           std::isspace((unsigned char)value[end - 1])) {
+        end--;
+    }
+    return value.substr(begin, end - begin);
+}
+
+bool HttpHeaderNameEquals(const std::string &left,
+                          const char *right) {
+    const size_t rightSize = std::strlen(right);
+    if (left.size() != rightSize) {
+        return false;
+    }
+    for (size_t i = 0; i < rightSize; i++) {
+        if (std::tolower((unsigned char)left[i]) !=
+            std::tolower((unsigned char)right[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+
+
 struct WorkNode {
     int client;
     HttpRequest request;
@@ -308,7 +377,11 @@ struct WorkQueue {
     std::mutex locker;
     std::condition_variable cv;
     std::queue <WorkNode*> q;
-    std::thread *loop;
+    std::thread *loop = nullptr;
+    bool checkpointInProgress = false;
+    bool stopping = false;
+    std::atomic<uint64_t> cacheMutationEpoch {0};
+    std::atomic<uint64_t> checkpointedMutationEpoch {0};
 
     void Push(char *buffer, int client) {
         locker.lock();
@@ -319,33 +392,85 @@ struct WorkQueue {
         cv.notify_all();
     }
 
+    bool BeginExclusiveCheckpoint(std::string &reason) {
+        std::lock_guard<std::mutex> lock(locker);
+        if (checkpointInProgress) {
+            reason = "a prefix-cache checkpoint is already running";
+            return false;
+        }
+        if (activateQueryNumber != 1 || !q.empty()) {
+            reason =
+                "prefix-cache checkpoint requires no active or queued requests";
+            return false;
+        }
+        checkpointInProgress = true;
+        return true;
+    }
+
+    void EndExclusiveCheckpoint() {
+        {
+            std::lock_guard<std::mutex> lock(locker);
+            checkpointInProgress = false;
+        }
+        cv.notify_all();
+    }
+
     void Start() {
+        {
+            std::lock_guard<std::mutex> lock(locker);
+            stopping = false;
+        }
         loop = new std::thread ([] (WorkQueue *ts) {
             while (true) {
-                std::unique_lock <std::mutex> lock(ts->locker);
-                if (ts->activateQueryNumber >= ts->maxActivateQueryNumber) {
-                    fastllm::MySleep(0);
-                    continue;
+                std::unique_lock<std::mutex> lock(ts->locker);
+                ts->cv.wait(lock, [ts]() {
+                    const bool canDispatch =
+                        !ts->checkpointInProgress &&
+                        ts->activateQueryNumber <
+                            ts->maxActivateQueryNumber &&
+                        !ts->q.empty();
+                    const bool drained =
+                        ts->stopping &&
+                        !ts->checkpointInProgress &&
+                        ts->activateQueryNumber == 0 &&
+                        ts->q.empty();
+                    return canDispatch || drained;
+                });
+                if (ts->stopping &&
+                    ts->activateQueryNumber == 0 &&
+                    ts->q.empty()) {
+                    return;
                 }
-                if (ts->q.empty()) {
-                    ts->cv.wait(lock);
-                }
-
-                while (ts->activateQueryNumber < ts->maxActivateQueryNumber && !ts->q.empty()) {
+                while (!ts->checkpointInProgress &&
+                       ts->activateQueryNumber <
+                           ts->maxActivateQueryNumber &&
+                       !ts->q.empty()) {
                     WorkNode *now = ts->q.front();
                     ts->q.pop();
                     ts->activateQueryNumber++;
-
                     ts->totalQueryNumber++;
-                    printf("totalQueryNumber = %d\n", ts->totalQueryNumber);
-//printf("activate = %d, q.size() = %d\n", ts->activateQueryNumber, (int) ts->q.size());
-
+                    printf("totalQueryNumber = %d\n",
+                           ts->totalQueryNumber);
                     std::thread([ts](WorkNode *now) {
+                        std::string route = now->request.route;
+                        if (route.size() > 1 && route.back() == '/') {
+                            route.pop_back();
+                        }
+                        const bool mayMutatePrefixCache =
+                            now->request.method == "POST" &&
+                            (route == "/generate" ||
+                             route == "/v1/chat/completions");
                         ts->Deal(now);
-                        printf("Response client %d finish\n", now->client);
+                        if (mayMutatePrefixCache) {
+                            ts->cacheMutationEpoch.fetch_add(
+                                1, std::memory_order_relaxed);
+                        }
+                        printf("Response client %d finish\n",
+                               now->client);
                         delete now;
                         {
-                            std::lock_guard<std::mutex> lock(ts->locker);
+                            std::lock_guard<std::mutex> lock(
+                                ts->locker);
                             ts->activateQueryNumber--;
                         }
                         ts->cv.notify_all();
@@ -353,6 +478,19 @@ struct WorkQueue {
                 }
             }
         }, this);
+    }
+
+    void StopAndDrain() {
+        {
+            std::lock_guard<std::mutex> lock(locker);
+            stopping = true;
+        }
+        cv.notify_all();
+        if (loop != nullptr && loop->joinable()) {
+            loop->join();
+        }
+        delete loop;
+        loop = nullptr;
     }
 
     void Deal(WorkNode *node) {
@@ -373,6 +511,135 @@ struct WorkQueue {
                                 "invalid_request_error", "method_not_allowed"),
                 {{"Allow", allowed}});
         };
+
+        if (route == "/admin/prefix-cache/checkpoint") {
+            std::string authorization;
+            for (const auto &header : req->headers) {
+                if (HttpHeaderNameEquals(
+                        header.first, "Authorization")) {
+                    authorization =
+                        TrimHttpHeaderValue(header.second);
+                    break;
+                }
+            }
+            const char *configured = std::getenv(
+                "FASTLLM_PREFIX_CACHE_CONTROL_TOKEN");
+            const std::string expectedToken =
+                configured == nullptr ? std::string() :
+                    std::string(configured);
+            const fastllm::PersistentPrefixCacheStatus before =
+                fastllm::GetPersistentPrefixCacheStatus();
+            int activeGenerationRequests = 0;
+            int queuedGenerationRequests = 0;
+            {
+                std::lock_guard<std::mutex> lock(locker);
+                activeGenerationRequests =
+                    std::max(0, activateQueryNumber - 1);
+                queuedGenerationRequests =
+                    static_cast<int>(q.size());
+            }
+            const fastllm::apiserver::CheckpointControlDecision
+                decision =
+                    fastllm::apiserver::EvaluateCheckpointControl(
+                        req->method,
+                        authorization,
+                        expectedToken,
+                        before.enabled,
+                        activeGenerationRequests,
+                        queuedGenerationRequests);
+            if (decision ==
+                fastllm::apiserver::CheckpointControlDecision::
+                    METHOD_NOT_ALLOWED) {
+                writeMethodNotAllowed("POST");
+                return;
+            }
+            if (decision ==
+                fastllm::apiserver::CheckpointControlDecision::
+                    FORBIDDEN) {
+                writeJsonAndClose(
+                    403,
+                    OpenAIHttpError(
+                        fastllm::apiserver::
+                            CheckpointControlDecisionMessage(decision),
+                        "authentication_error",
+                        "invalid_checkpoint_token"));
+                return;
+            }
+            if (decision ==
+                fastllm::apiserver::CheckpointControlDecision::
+                    DISABLED) {
+                writeJsonAndClose(
+                    503,
+                    OpenAIHttpError(
+                        fastllm::apiserver::
+                            CheckpointControlDecisionMessage(decision),
+                        "server_error",
+                        "prefix_cache_disabled"));
+                return;
+            }
+            if (decision ==
+                fastllm::apiserver::CheckpointControlDecision::
+                    BUSY) {
+                writeJsonAndClose(
+                    409,
+                    OpenAIHttpError(
+                        fastllm::apiserver::
+                            CheckpointControlDecisionMessage(decision),
+                        "conflict_error",
+                        "checkpoint_requires_idle_server"));
+                return;
+            }
+            std::string busyReason;
+            if (!BeginExclusiveCheckpoint(busyReason)) {
+                writeJsonAndClose(
+                    409,
+                    OpenAIHttpError(
+                        busyReason,
+                        "conflict_error",
+                        "checkpoint_requires_idle_server"));
+                return;
+            }
+            struct CheckpointGuard {
+                WorkQueue *queue;
+                ~CheckpointGuard() {
+                    queue->EndExclusiveCheckpoint();
+                }
+            } checkpointGuard {this};
+            fastllm::PersistentPrefixCheckpointStats stats;
+            std::string checkpointError;
+            const bool checkpointed =
+                fastllm::CheckpointPersistentPrefixCache(
+                    model.get(), stats, &checkpointError);
+            (void)checkpointGuard;
+            if (!checkpointed) {
+                writeJsonAndClose(
+                    500,
+                    OpenAIHttpError(
+                        checkpointError.empty() ?
+                            "persistent prefix checkpoint failed" :
+                            checkpointError,
+                        "server_error",
+                        "prefix_cache_checkpoint_failed"));
+                return;
+            }
+            checkpointedMutationEpoch.store(
+                cacheMutationEpoch.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            const fastllm::PersistentPrefixCacheStatus after =
+                fastllm::GetPersistentPrefixCacheStatus();
+            writeJsonAndClose(200, json11::Json::object {
+                {"status", "ok"},
+                {"generation", (double)stats.generation},
+                {"pages", (double)stats.pages},
+                {"bytes", (double)stats.bytes},
+                {"duration_ms", stats.durationMs},
+                {"checkpoint_count",
+                    (double)after.checkpointCount},
+                {"restore_hit_count",
+                    (double)after.restoreHitCount}
+            });
+            return;
+        }
 
         if (route == "/health" || route == "/version" || route == "/props") {
             if (req->method != "GET") {
@@ -411,6 +678,8 @@ struct WorkQueue {
                     : fastllm::GetDataTypeName(::config.kvCacheDtype);
             const auto zstdMetrics =
                 fastllm::GetPagedCacheCpuSnapshotZstdMetrics();
+            const auto persistentStatus =
+                fastllm::GetPersistentPrefixCacheStatus();
             writeJsonAndClose(200, json11::Json::object {
                 {"model", ::config.modelName},
                 {"max_batch", ::config.batch},
@@ -513,6 +782,20 @@ struct WorkQueue {
                 {"prefix_cache_zstd_decompress_seconds",
                     fastllm::
                         GetPagedPrefixCacheZstdDecompressSeconds()},
+                {"prefix_cache_persistence_enabled",
+                    persistentStatus.enabled},
+                {"prefix_cache_persistence_loaded_generation",
+                    (double)persistentStatus.loadedGeneration},
+                {"prefix_cache_persistence_checkpoint_count",
+                    (double)persistentStatus.checkpointCount},
+                {"prefix_cache_persistence_restore_hits",
+                    (double)persistentStatus.restoreHitCount},
+                {"prefix_cache_persistence_payload_bytes",
+                    (double)persistentStatus.payloadBytes},
+                {"prefix_cache_persistence_last_duration_ms",
+                    persistentStatus.lastDurationMs},
+                {"prefix_cache_persistence_last_error",
+                    persistentStatus.lastError},
                 {"backend", "fastllm"}
             });
             return;
@@ -1172,6 +1455,7 @@ int main(int argc, char** argv) {
     }
     workQueue.maxActivateQueryNumber = std::max(1, std::min(256, config.batch));
     workQueue.model->maxBatch = workQueue.maxActivateQueryNumber;
+    PrepareServerPersistentPrefixCache(workQueue.model.get());
     workQueue.Start();
 
     int local_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1180,6 +1464,11 @@ int main(int argc, char** argv) {
         exit(-1);
     }
     std::cout << "socket ready!" << std::endl;
+#ifndef _WIN32
+    serverSocketForSignal = local_fd;
+    std::signal(SIGINT, HandleShutdownSignal);
+    std::signal(SIGTERM, HandleShutdownSignal);
+#endif
 
     struct sockaddr_in local_addr;
     local_addr.sin_family = AF_INET;
@@ -1203,7 +1492,14 @@ int main(int argc, char** argv) {
         //6.accept()函数：阻塞运行，直到收到某一客户机的连接请求，并返回客户机的描述符
         int client = accept(local_fd, (struct sockaddr *) &client_addr, &len);
         if (client == -1) {
-            exit(-1);
+#ifndef _WIN32
+            if (shutdownSignal != 0) {
+                break;
+            }
+#endif
+            std::perror("accept");
+            workQueue.StopAndDrain();
+            return -1;
         }
 
 #ifdef _WIN32
@@ -1240,5 +1536,38 @@ int main(int argc, char** argv) {
         workQueue.Push(buff, client);
     }
 
-    return 0;
+#ifndef _WIN32
+    serverSocketForSignal = -1;
+#endif
+    workQueue.StopAndDrain();
+    int shutdownStatus = 0;
+#ifndef _WIN32
+    if (shutdownSignal != 0 &&
+        fastllm::GetPersistentPrefixCacheStatus().enabled &&
+        workQueue.cacheMutationEpoch.load(std::memory_order_relaxed) !=
+            workQueue.checkpointedMutationEpoch.load(
+                std::memory_order_relaxed)) {
+        fastllm::PersistentPrefixCheckpointStats stats;
+        std::string checkpointError;
+        if (!fastllm::CheckpointPersistentPrefixCache(
+                workQueue.model.get(), stats, &checkpointError)) {
+            std::fprintf(
+                stderr,
+                "[Prefix-persist] shutdown checkpoint failed: %s\n",
+                checkpointError.empty() ?
+                    "unknown error" : checkpointError.c_str());
+            shutdownStatus = 1;
+        } else {
+            std::fprintf(
+                stderr,
+                "[Prefix-persist] shutdown checkpoint generation %llu, "
+                "%llu pages, %llu bytes, %.3f ms\n",
+                (unsigned long long)stats.generation,
+                (unsigned long long)stats.pages,
+                (unsigned long long)stats.bytes,
+                stats.durationMs);
+        }
+    }
+#endif
+    return shutdownStatus;
 }

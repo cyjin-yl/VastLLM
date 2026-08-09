@@ -4177,6 +4177,350 @@ namespace fastllm {
             Data mtpValue;
         };
 
+        constexpr uint64_t QWEN35_PERSISTENT_SNAPSHOT_MAGIC =
+            UINT64_C(0x3153504e57333551);
+        constexpr uint32_t QWEN35_PERSISTENT_SNAPSHOT_VERSION = 2;
+
+        class Qwen35SnapshotWriter {
+        public:
+            template <class T>
+            void Write(const T &value) {
+                const uint8_t *begin =
+                    reinterpret_cast<const uint8_t*>(&value);
+                bytes.insert(bytes.end(), begin, begin + sizeof(T));
+            }
+
+            void WriteIntVector(const std::vector<int> &values) {
+                Write((uint32_t)values.size());
+                for (int value : values) {
+                    Write((int32_t)value);
+                }
+            }
+
+            void WriteRanges(const DivisionScheme &ranges) {
+                Write((uint32_t)ranges.size());
+                for (const auto &device : ranges) {
+                    Write((int32_t)device.first);
+                    Write((uint32_t)device.second.size());
+                    for (const auto &range : device.second) {
+                        Write((int32_t)range.first);
+                        Write((int32_t)range.second);
+                    }
+                }
+            }
+
+            bool WriteTensor(const Data &tensor) {
+                Write((uint32_t)tensor.dataType);
+                WriteIntVector(tensor.dims);
+                Write((uint8_t)(tensor.isLinearAttentionTransposed ? 1 : 0));
+                const uint64_t tensorBytes = tensor.GetBytes();
+                Write(tensorBytes);
+                if (tensorBytes == 0) {
+                    return true;
+                }
+                if (tensor.dataDevice != DataDevice::CPU ||
+                    tensor.cpuData == nullptr) {
+                    return false;
+                }
+                bytes.insert(
+                    bytes.end(),
+                    tensor.cpuData,
+                    tensor.cpuData + tensorBytes);
+                return true;
+            }
+
+            bool WriteCache(
+                    const Qwen35LinearPrefixSnapshotCache &cache) {
+                Write((uint8_t)(cache.valid ? 1 : 0));
+                if (!cache.valid) {
+                    return true;
+                }
+                Write((uint8_t)(cache.multiDevice ? 1 : 0));
+                WriteIntVector(cache.dataDeviceIds);
+                Write((int32_t)cache.tpLayout);
+                Write((int32_t)cache.tpAxis);
+                WriteRanges(cache.tpRanges);
+                WriteIntVector(cache.tpGlobalDims);
+                WriteIntVector(cache.dims);
+                Write((uint32_t)cache.dataType);
+                Write((uint8_t)(cache.transposed ? 1 : 0));
+                if (!cache.multiDevice) {
+                    return WriteTensor(cache.single);
+                }
+                Write((uint32_t)cache.locals.size());
+                for (const auto &local : cache.locals) {
+                    Write((int32_t)local.first);
+                    if (!WriteTensor(local.second)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            bool WriteSnapshot(
+                    const Qwen35LinearPrefixSnapshot &snapshot) {
+                Write(QWEN35_PERSISTENT_SNAPSHOT_MAGIC);
+                Write(QWEN35_PERSISTENT_SNAPSHOT_VERSION);
+                Write((int32_t)snapshot.cachedLen);
+                Write((int32_t)snapshot.requestId);
+                Write((int64_t)snapshot.timestamp);
+                WriteIntVector(snapshot.tokens);
+                Write((uint32_t)snapshot.layers.size());
+                for (const auto &layer : snapshot.layers) {
+                    Write((uint8_t)(layer.linear ? 1 : 0));
+                    if (layer.linear &&
+                        (!WriteCache(layer.first) ||
+                         !WriteCache(layer.second))) {
+                        return false;
+                    }
+                }
+                Write((uint8_t)(snapshot.mtpValid ? 1 : 0));
+                Write((int32_t)snapshot.mtpTokens);
+                if (snapshot.mtpValid &&
+                    (!WriteTensor(snapshot.mtpKey) ||
+                     !WriteTensor(snapshot.mtpValue))) {
+                    return false;
+                }
+                const uint64_t checksum = PrefixCacheChecksum(bytes);
+                Write(checksum);
+                return true;
+            }
+
+            std::vector<uint8_t> bytes;
+        };
+
+        class Qwen35SnapshotReader {
+        public:
+            explicit Qwen35SnapshotReader(
+                    const std::vector<uint8_t> &bytes)
+                : bytes(bytes) {
+                if (bytes.size() < sizeof(uint64_t)) {
+                    return;
+                }
+                payloadSize = bytes.size() - sizeof(uint64_t);
+                uint64_t expected = 0;
+                std::memcpy(
+                    &expected,
+                    bytes.data() + payloadSize,
+                    sizeof(expected));
+                checksumValid =
+                    expected ==
+                    PrefixCacheChecksum(bytes.data(), payloadSize);
+            }
+
+            template <class T>
+            bool Read(T &value) {
+                if (offset > payloadSize ||
+                    sizeof(T) > payloadSize - offset) {
+                    return false;
+                }
+                std::memcpy(&value, bytes.data() + offset, sizeof(T));
+                offset += sizeof(T);
+                return true;
+            }
+
+            bool ReadIntVector(
+                    std::vector<int> &values,
+                    uint32_t maxCount = UINT32_C(1048576)) {
+                uint32_t count = 0;
+                if (!Read(count) || count > maxCount ||
+                    count > (payloadSize - offset) / sizeof(int32_t)) {
+                    return false;
+                }
+                values.resize(count);
+                for (uint32_t i = 0; i < count; i++) {
+                    int32_t value = 0;
+                    if (!Read(value)) {
+                        return false;
+                    }
+                    values[i] = value;
+                }
+                return true;
+            }
+
+            bool ReadRanges(DivisionScheme &ranges) {
+                uint32_t devices = 0;
+                if (!Read(devices) || devices > 64) {
+                    return false;
+                }
+                ranges.clear();
+                for (uint32_t i = 0; i < devices; i++) {
+                    int32_t device = 0;
+                    uint32_t count = 0;
+                    if (!Read(device) || !Read(count) ||
+                        count > 1048576) {
+                        return false;
+                    }
+                    auto &items = ranges[device];
+                    items.reserve(count);
+                    for (uint32_t j = 0; j < count; j++) {
+                        int32_t begin = 0;
+                        int32_t end = 0;
+                        if (!Read(begin) || !Read(end)) {
+                            return false;
+                        }
+                        items.push_back({begin, end});
+                    }
+                }
+                return true;
+            }
+
+            bool ReadTensor(Data &tensor) {
+                uint32_t rawType = 0;
+                std::vector<int> dims;
+                uint8_t transposed = 0;
+                uint64_t tensorBytes = 0;
+                if (!Read(rawType) ||
+                    rawType > (uint32_t)DataType::DATA_AUTO_NONE ||
+                    !ReadIntVector(dims, 16) ||
+                    dims.empty() ||
+                    !Read(transposed) ||
+                    !Read(tensorBytes) ||
+                    tensorBytes > payloadSize - offset) {
+                    return false;
+                }
+                for (int dim : dims) {
+                    if (dim <= 0) {
+                        return false;
+                    }
+                }
+                Data restored((DataType)rawType, dims);
+                if (restored.GetBytes() != tensorBytes) {
+                    return false;
+                }
+                restored.Allocate(false);
+                if (tensorBytes > 0 && restored.cpuData == nullptr) {
+                    return false;
+                }
+                if (tensorBytes > 0) {
+                    std::memcpy(
+                        restored.cpuData,
+                        bytes.data() + offset,
+                        (size_t)tensorBytes);
+                }
+                offset += (size_t)tensorBytes;
+                restored.isKVCache = true;
+                restored.isLinearAttention = true;
+                restored.isLinearAttentionTransposed =
+                    transposed != 0;
+                tensor.CopyFrom(restored);
+                tensor.isKVCache = true;
+                tensor.isLinearAttention = true;
+                tensor.isLinearAttentionTransposed =
+                    transposed != 0;
+                return true;
+            }
+
+            bool ReadCache(Qwen35LinearPrefixSnapshotCache &cache) {
+                uint8_t valid = 0;
+                if (!Read(valid) || valid > 1) {
+                    return false;
+                }
+                cache.valid = valid != 0;
+                if (!cache.valid) {
+                    return true;
+                }
+                uint8_t multiDevice = 0;
+                int32_t tpLayout = 0;
+                int32_t tpAxis = -1;
+                uint32_t rawType = 0;
+                uint8_t transposed = 0;
+                if (!Read(multiDevice) || multiDevice > 1 ||
+                    !ReadIntVector(cache.dataDeviceIds, 64) ||
+                    !Read(tpLayout) ||
+                    !Read(tpAxis) ||
+                    !ReadRanges(cache.tpRanges) ||
+                    !ReadIntVector(cache.tpGlobalDims, 16) ||
+                    !ReadIntVector(cache.dims, 16) ||
+                    !Read(rawType) ||
+                    rawType > (uint32_t)DataType::DATA_AUTO_NONE ||
+                    !Read(transposed) || transposed > 1) {
+                    return false;
+                }
+                cache.multiDevice = multiDevice != 0;
+                cache.tpLayout =
+                    (TensorParallelLayoutType)tpLayout;
+                cache.tpAxis = tpAxis;
+                cache.dataType = (DataType)rawType;
+                cache.transposed = transposed != 0;
+                if (!cache.multiDevice) {
+                    return ReadTensor(cache.single);
+                }
+                uint32_t locals = 0;
+                if (!Read(locals) || locals == 0 || locals > 64) {
+                    return false;
+                }
+                for (uint32_t i = 0; i < locals; i++) {
+                    int32_t device = 0;
+                    if (!Read(device) ||
+                        !ReadTensor(cache.locals[device])) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            bool ReadSnapshot(
+                    Qwen35LinearPrefixSnapshot &snapshot) {
+                uint64_t magic = 0;
+                uint32_t version = 0;
+                int32_t cachedLen = 0;
+                int32_t requestId = 0;
+                int64_t timestamp = 0;
+                uint32_t layers = 0;
+                if (!Read(magic) ||
+                    magic != QWEN35_PERSISTENT_SNAPSHOT_MAGIC ||
+                    !Read(version) ||
+                    version != QWEN35_PERSISTENT_SNAPSHOT_VERSION ||
+                    !Read(cachedLen) || cachedLen <= 0 ||
+                    !Read(requestId) || requestId <= 0 ||
+                    !Read(timestamp) || timestamp < 0 ||
+                    !ReadIntVector(snapshot.tokens) ||
+                    (int)snapshot.tokens.size() != cachedLen ||
+                    !Read(layers) || layers == 0 ||
+                    layers > 4096) {
+                    return false;
+                }
+                snapshot.cachedLen = cachedLen;
+                snapshot.requestId = requestId;
+                snapshot.timestamp = timestamp;
+                snapshot.layers.resize(layers);
+                for (uint32_t i = 0; i < layers; i++) {
+                    uint8_t linear = 0;
+                    if (!Read(linear) || linear > 1) {
+                        return false;
+                    }
+                    snapshot.layers[i].linear = linear != 0;
+                    if (snapshot.layers[i].linear &&
+                        (!ReadCache(snapshot.layers[i].first) ||
+                         !ReadCache(snapshot.layers[i].second))) {
+                        return false;
+                    }
+                }
+                uint8_t mtpValid = 0;
+                int32_t mtpTokens = 0;
+                if (!Read(mtpValid) || mtpValid > 1 ||
+                    !Read(mtpTokens) || mtpTokens < 0) {
+                    return false;
+                }
+                snapshot.mtpValid = mtpValid != 0;
+                snapshot.mtpTokens = mtpTokens;
+                if (snapshot.mtpValid &&
+                    (snapshot.mtpTokens != snapshot.cachedLen ||
+                     !ReadTensor(snapshot.mtpKey) ||
+                     !ReadTensor(snapshot.mtpValue))) {
+                    return false;
+                }
+                return checksumValid && offset == payloadSize;
+            }
+
+        private:
+            const std::vector<uint8_t> &bytes;
+            size_t payloadSize = 0;
+            size_t offset = 0;
+            bool checksumValid = false;
+        };
+
         static std::mutex &Qwen35LinearPrefixSnapshotsMutex() {
             static auto *mutex = new std::mutex();
             return *mutex;
@@ -4198,6 +4542,133 @@ namespace fastllm {
             static auto *counter = new std::atomic<int>(0);
             return *counter;
         }
+
+#ifdef USE_CUDA
+        bool ConfigureQwen35PersistentPrefixFixtureImpl(
+                Qwen3_5Model &model,
+                bool installSnapshot,
+                std::string *error) {
+            auto fillTensor = [](
+                    Data &tensor,
+                    const std::vector<int> &dims,
+                    uint8_t marker,
+                    bool transposed) {
+                Data source(DataType::FLOAT32, dims);
+                source.Allocate(false);
+                if (source.cpuData == nullptr) {
+                    return false;
+                }
+                for (size_t i = 0; i < source.GetBytes(); i++) {
+                    source.cpuData[i] =
+                        static_cast<uint8_t>(marker + i);
+                }
+                source.isKVCache = true;
+                source.isLinearAttention = true;
+                source.isLinearAttentionTransposed = transposed;
+                tensor.CopyFrom(source);
+                tensor.isKVCache = true;
+                tensor.isLinearAttention = true;
+                tensor.isLinearAttentionTransposed = transposed;
+                return true;
+            };
+            auto fillSingle = [&fillTensor](
+                    Qwen35LinearPrefixSnapshotCache &cache,
+                    uint8_t marker,
+                    bool transposed) {
+                cache.valid = true;
+                cache.multiDevice = false;
+                cache.dataDeviceIds = {0};
+                cache.dims = {1, 4, 2};
+                cache.dataType = DataType::FLOAT32;
+                cache.transposed = transposed;
+                return fillTensor(
+                    cache.single,
+                    cache.dims,
+                    marker,
+                    transposed);
+            };
+            auto fillSharded = [&fillTensor](
+                    Qwen35LinearPrefixSnapshotCache &cache,
+                    uint8_t marker,
+                    bool transposed) {
+                cache.valid = true;
+                cache.multiDevice = true;
+                cache.dataDeviceIds = {0, 1};
+                cache.tpLayout = TP_LAYOUT_SHARDED;
+                cache.tpAxis = 2;
+                cache.tpRanges = {
+                    {0, {{0, 2}}},
+                    {1, {{2, 4}}},
+                };
+                cache.tpGlobalDims = {1, 4, 4};
+                cache.dims = cache.tpGlobalDims;
+                cache.dataType = DataType::FLOAT32;
+                cache.transposed = transposed;
+                return fillTensor(
+                           cache.locals[0],
+                           {1, 4, 2},
+                           marker,
+                           transposed) &&
+                    fillTensor(
+                           cache.locals[1],
+                           {1, 4, 2},
+                           static_cast<uint8_t>(marker + 0x20),
+                           transposed);
+            };
+
+            model.block_cnt = 2;
+            model.weight.weight.emplace(
+                Qwen3_5Model::language_prefix +
+                    "layers.1.self_attn.o_proj.weight",
+                Data(DataType::FLOAT32));
+            {
+                std::lock_guard<std::mutex> guard(
+                    Qwen35LinearPrefixSnapshotsMutex());
+                Qwen35LinearPrefixSnapshots().erase(&model);
+            }
+            if (!installSnapshot) {
+                if (error != nullptr) {
+                    error->clear();
+                }
+                return true;
+            }
+
+            std::unique_ptr<Qwen35LinearPrefixSnapshot> snapshot(
+                new Qwen35LinearPrefixSnapshot());
+            snapshot->cachedLen = 4;
+            snapshot->requestId = 1;
+            snapshot->timestamp = 1;
+            snapshot->tokens = {101, 102, 103, 104};
+            snapshot->layers.resize(2);
+            snapshot->layers[0].linear = true;
+            if (!fillSingle(
+                    snapshot->layers[0].first, 0x11, false) ||
+                !fillSharded(
+                    snapshot->layers[0].second, 0x51, true) ||
+                !fillTensor(
+                    snapshot->mtpKey, {1, 4, 2}, 0x91, false) ||
+                !fillTensor(
+                    snapshot->mtpValue, {1, 4, 2}, 0xb1, false)) {
+                if (error != nullptr) {
+                    *error =
+                        "failed to allocate Qwen persistent fixture tensors";
+                }
+                return false;
+            }
+            snapshot->mtpValid = true;
+            snapshot->mtpTokens = 4;
+            {
+                std::lock_guard<std::mutex> guard(
+                    Qwen35LinearPrefixSnapshotsMutex());
+                Qwen35LinearPrefixSnapshots()[&model].push_back(
+                    std::move(snapshot));
+            }
+            if (error != nullptr) {
+                error->clear();
+            }
+            return true;
+        }
+#endif
 
         static int Qwen35EnvInt(const char *name, int fallback) {
             const char *value = std::getenv(name);
@@ -6505,6 +6976,16 @@ namespace fastllm {
     }
 #endif
 
+#ifdef USE_CUDA
+    bool ConfigureQwen35PersistentPrefixFixtureForTest(
+            Qwen3_5Model &model,
+            bool installSnapshot,
+            std::string *error) {
+        return ConfigureQwen35PersistentPrefixFixtureImpl(
+            model, installSnapshot, error);
+    }
+#endif
+
     static DataType Qwen35LinearAttentionCacheDataType(DataType modelType) {
         if (modelType == DataType::FLOAT32 ||
             modelType == DataType::FLOAT16 ||
@@ -8083,6 +8564,132 @@ namespace fastllm {
         }
         context->intParams["qwen35_linear_prefix_last_len"] = currentLen;
         context->intParams["qwen35_linear_prefix_count"] = snapshotCount + 1;
+        return true;
+    }
+
+    bool Qwen3_5Model::ExportPersistentPrefixCacheExtras(
+            std::vector<PersistentPayloadRecord> &records,
+            std::string *error) const {
+#ifdef USE_CUDA
+        std::lock_guard<std::mutex> guard(
+            Qwen35LinearPrefixSnapshotsMutex());
+        auto snapshots = Qwen35LinearPrefixSnapshots().find(this);
+        if (snapshots == Qwen35LinearPrefixSnapshots().end()) {
+            return true;
+        }
+        size_t index = 0;
+        for (const auto &snapshot : snapshots->second) {
+            if (snapshot == nullptr ||
+                snapshot->cachedLen <= 0 ||
+                snapshot->layers.size() != (size_t)this->block_cnt) {
+                continue;
+            }
+            Qwen35SnapshotWriter writer;
+            if (!writer.WriteSnapshot(*snapshot)) {
+                if (error != nullptr) {
+                    *error =
+                        "Qwen3.5 prefix snapshot contains a non-CPU tensor";
+                }
+                return false;
+            }
+            PersistentPayloadRecord record;
+            record.kind = PersistentPayloadKind::MODEL_EXTRA;
+            record.name =
+                "qwen35.linear_snapshot.v1." +
+                std::to_string(index++);
+            record.bytes = std::move(writer.bytes);
+            records.push_back(std::move(record));
+        }
+#else
+        (void)records;
+        (void)error;
+#endif
+        return true;
+    }
+
+    bool Qwen3_5Model::ImportPersistentPrefixCacheExtras(
+            const std::vector<PersistentPayloadRecord> &records,
+            std::string *error) {
+#ifdef USE_CUDA
+        std::vector<std::unique_ptr<Qwen35LinearPrefixSnapshot>>
+            restored;
+        long long maxTimestamp = 0;
+        int maxRequestId = 0;
+        const std::string prefix =
+            "qwen35.linear_snapshot.v1.";
+        for (const auto &record : records) {
+            if (record.kind != PersistentPayloadKind::MODEL_EXTRA ||
+                record.name.compare(0, prefix.size(), prefix) != 0) {
+                continue;
+            }
+            std::unique_ptr<Qwen35LinearPrefixSnapshot> snapshot(
+                new Qwen35LinearPrefixSnapshot());
+            Qwen35SnapshotReader reader(record.bytes);
+            if (!reader.ReadSnapshot(*snapshot) ||
+                snapshot->layers.size() !=
+                    (size_t)this->block_cnt) {
+                if (error != nullptr) {
+                    *error =
+                        "persistent Qwen3.5 prefix snapshot is incompatible";
+                }
+                return false;
+            }
+            for (int layer = 0;
+                 layer < this->block_cnt;
+                 layer++) {
+                const bool expectedLinear =
+                    Qwen35LayerIsLinearAttention(this, layer);
+                if (snapshot->layers[layer].linear !=
+                    expectedLinear) {
+                    if (error != nullptr) {
+                        *error =
+                            "persistent Qwen3.5 GDN layout does not match model";
+                    }
+                    return false;
+                }
+            }
+            maxTimestamp =
+                std::max(maxTimestamp, snapshot->timestamp);
+            maxRequestId =
+                std::max(maxRequestId, snapshot->requestId);
+            restored.push_back(std::move(snapshot));
+        }
+        if (!restored.empty()) {
+            std::sort(
+                restored.begin(),
+                restored.end(),
+                [](const std::unique_ptr<Qwen35LinearPrefixSnapshot> &left,
+                   const std::unique_ptr<Qwen35LinearPrefixSnapshot> &right) {
+                    return left->timestamp < right->timestamp;
+                });
+            const int maxRecords =
+                Qwen35LinearPrefixSnapshotMaxRecords();
+            if ((int)restored.size() > maxRecords) {
+                restored.erase(
+                    restored.begin(),
+                    restored.end() - maxRecords);
+            }
+            std::lock_guard<std::mutex> guard(
+                Qwen35LinearPrefixSnapshotsMutex());
+            Qwen35LinearPrefixSnapshots()[this] =
+                std::move(restored);
+            Qwen35LinearPrefixSnapshotTimestamp() =
+                std::max(
+                    Qwen35LinearPrefixSnapshotTimestamp(),
+                    maxTimestamp);
+            int currentRequestId =
+                Qwen35LinearPrefixSnapshotRequestCounter().load();
+            while (currentRequestId < maxRequestId &&
+                   !Qwen35LinearPrefixSnapshotRequestCounter().
+                       compare_exchange_weak(
+                           currentRequestId,
+                           maxRequestId)) {
+            }
+        }
+#else
+        (void)records;
+        (void)error;
+#endif
         return true;
     }
 
@@ -17732,6 +18339,71 @@ namespace fastllm {
         NewMainLoop();
 #else
         Qwen3_5Model *model = this;
+        const PersistentPrefixCacheStatus persistentStatus =
+            GetPersistentPrefixCacheStatus();
+        if (persistentStatus.loadedGeneration > 0 &&
+            !GetKVCacheInCPU()) {
+            std::vector<int> restoreDevices;
+            std::map<int, int> restoreRatios;
+            if (GetQwen35GPUForwardDevices(
+                    model->deviceMap,
+                    restoreDevices,
+                    restoreRatios) &&
+                restoreDevices.size() == 1) {
+                if (model->threadTpPagedCacheBase < 0) {
+                    model->threadTpPagedCacheBase =
+                        qwen35ThreadTpNextPagedCacheBase.fetch_add(
+                            std::max(1, model->block_cnt * 2));
+                }
+                const int device = restoreDevices[0];
+                size_t preparedManagers = 0;
+                auto makeDescriptor =
+                    [&](DataType dataType) {
+                        Data descriptor(dataType);
+                        descriptor.dims = {
+                            model->num_key_value_heads,
+                            1,
+                            model->head_dim,
+                        };
+                        descriptor.dataDevice = DataDevice::CUDA;
+                        descriptor.dataDeviceIds = {device};
+                        descriptor.UpdateUnitSize();
+                        return descriptor;
+                    };
+                for (int layer = 0;
+                     layer < model->block_cnt; layer++) {
+                    if (Qwen35LayerIsLinearAttention(model, layer)) {
+                        continue;
+                    }
+                    const auto cacheTypes =
+                        model->GetKVCacheDataTypes(layer);
+                    Data keyDescriptor =
+                        makeDescriptor(cacheTypes.first);
+                    Data valueDescriptor =
+                        makeDescriptor(cacheTypes.second);
+                    const int cacheLayer =
+                        model->threadTpPagedCacheBase + layer;
+                    AllocatePagedCacheManager(
+                        cacheLayer * 2,
+                        PagedCacheManager::
+                            PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+                        keyDescriptor);
+                    AllocatePagedCacheManager(
+                        cacheLayer * 2 + 1,
+                        PagedCacheManager::
+                            PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+                        valueDescriptor);
+                    preparedManagers += 2;
+                }
+                printf(
+                    "[Prefix-persist] prepared %zu Qwen paged managers "
+                    "for generation %llu.\n",
+                    preparedManagers,
+                    (unsigned long long)
+                        persistentStatus.loadedGeneration);
+                fflush(stdout);
+            }
+        }
         int maxTotalLens = 0;
         int totalPages = 0;
         const bool residentPlainBatchEnabled =

@@ -46,6 +46,11 @@
 #include <vector>
 #include <map>
 
+#ifndef _WIN32
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 namespace fastllm {
     ResponseContext *SelectCpuRequestSwapVictim(
         const std::vector<std::pair<int, ResponseContext*> > &candidates,
@@ -92,6 +97,8 @@ namespace fastllm {
         int bsz, int totalLen, int compressRatio, int wideDim,
         int compressedBlocks, Data &allKV, Data &allScore,
         int &rawTokenBase);
+    bool ConfigureQwen35PersistentPrefixFixtureForTest(
+        Qwen3_5Model &model, bool installSnapshot, std::string *error);
 }
 #endif
 
@@ -101,6 +108,8 @@ namespace {
                         const std::vector<int32_t> &actual,
                         const std::string &name);
     void RunCpuDeepSeekV4IndexerBenchmark(int sequence);
+    void RunPersistentPrefixProcessRestartRegression();
+    int RunPersistentPrefixProcessChildMode();
 
     void RunCpuDeepSeekV4Nvfp4Block32Benchmark() {
         constexpr int rows = 8;
@@ -656,8 +665,32 @@ namespace {
             Expect(!std::filesystem::exists(root.Path() / ".staging-crashed"),
                    "persistent archive did not clean a stale staging directory.");
 
+            PersistedPrefixCacheGeneration third =
+                makeGeneration(3, 49);
+            Expect(fastllm::CommitPersistentPrefixCacheGeneration(
+                       root.Path(), third, refs, &error), error);
+            PersistedPrefixCacheGeneration fourth =
+                makeGeneration(4, 65);
+            Expect(fastllm::CommitPersistentPrefixCacheGeneration(
+                       root.Path(), fourth, refs, &error), error);
+            size_t generationCount = 0;
+            for (const auto &entry :
+                 std::filesystem::directory_iterator(root.Path())) {
+                if (entry.is_directory() &&
+                    entry.path().filename().string().rfind(
+                        "gen-", 0) == 0) {
+                    generationCount++;
+                }
+            }
+            Expect(generationCount <= 2,
+                   "persistent archive retained unbounded generations.");
+            Expect(fastllm::LoadPersistentPrefixCacheGeneration(
+                       root.Path(), loaded, refs, &error), error);
+            Expect(loaded.generation == 4,
+                   "generation pruning changed CURRENT.");
+
             std::filesystem::resize_file(
-                root.Path() / "gen-1" / "pages.bin", 1);
+                root.Path() / "gen-4" / "pages.bin", 1);
             std::vector<uint8_t> bytes;
             Expect(!fastllm::ReadPersistentPrefixCachePayload(
                        root.Path(), loaded.generation, refs[0], bytes, &error),
@@ -668,6 +701,467 @@ namespace {
                    "../../bad",
                "persistent cache key remained path-traversable.");
         std::cout << "persistent prefix archive regression: PASS\n";
+    }
+
+    void RunPersistentPagedTrieRegression() {
+        constexpr int pageLen = 2;
+        constexpr int maxPages = 4;
+        ScopedTempDirectory root("fastllm-prefix-persist-trie-");
+        fastllm::PersistentPrefixCacheOptions options {
+            true, root.Path(), "qwen36-cpu-trie-fixture"
+        };
+        fastllm::PersistentPrefixCacheStatus status;
+        fastllm::PersistentPrefixCheckpointStats stats;
+        std::string error;
+
+        class PersistentExtraProbeModel : public fastllm::basellm {
+        public:
+            bool ExportPersistentPrefixCacheExtras(
+                    std::vector<fastllm::PersistentPayloadRecord> &records,
+                    std::string *error) const override {
+                (void)error;
+                fastllm::PersistentPayloadRecord record;
+                record.kind =
+                    fastllm::PersistentPayloadKind::MODEL_EXTRA;
+                record.name = "test.model_extra";
+                record.bytes = exported;
+                records.push_back(std::move(record));
+                return true;
+            }
+
+            bool ImportPersistentPrefixCacheExtras(
+                    const std::vector<
+                        fastllm::PersistentPayloadRecord> &records,
+                    std::string *error) override {
+                for (const auto &record : records) {
+                    if (record.kind ==
+                            fastllm::PersistentPayloadKind::MODEL_EXTRA &&
+                        record.name == "test.model_extra") {
+                        imported = record.bytes;
+                        return true;
+                    }
+                }
+                if (error != nullptr) {
+                    *error = "test model extra payload is missing";
+                }
+                return false;
+            }
+
+            std::string MakeInput(
+                    const std::string &history,
+                    int round,
+                    const std::string &input) override {
+                (void)round;
+                return history + input;
+            }
+
+            std::string MakeHistory(
+                    const std::string &history,
+                    int round,
+                    const std::string &input,
+                    const std::string &output) override {
+                (void)round;
+                return history + input + output;
+            }
+
+            std::vector<uint8_t> exported;
+            std::vector<uint8_t> imported;
+        };
+        PersistentExtraProbeModel firstModel;
+        firstModel.exported = {0x41, 0x42, 0x43};
+
+        auto makeManager = [](int id, int managerPageLen) {
+            fastllm::Data descriptor(fastllm::DataType::FLOAT16);
+            descriptor.dims = {1, 1, 4};
+            descriptor.strides = {4, 4, 1};
+            descriptor.dataDevice = fastllm::DataDevice::CPU;
+            descriptor.UpdateUnitSize();
+            return fastllm::AllocatePagedCacheManager(
+                id,
+                fastllm::PagedCacheManager::
+                    PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+                descriptor, managerPageLen, maxPages);
+        };
+        auto recordManager = [](fastllm::PagedCacheManager *manager,
+                                uint8_t marker,
+                                std::vector<uint8_t> &expected) {
+            const size_t pageBytes = manager->GetBytes() / maxPages;
+            std::vector<int> pages = {
+                manager->GetUnusedPageIndex(true),
+                manager->GetUnusedPageIndex(true)
+            };
+            expected.resize(pageBytes * pages.size());
+            for (size_t page = 0; page < pages.size(); page++) {
+                for (size_t byte = 0; byte < pageBytes; byte++) {
+                    expected[page * pageBytes + byte] =
+                        (uint8_t)(marker + page * 31 + byte);
+                }
+                std::memcpy(
+                    manager->cpuData + (size_t)pages[page] * pageBytes,
+                    expected.data() + page * pageBytes, pageBytes);
+            }
+            manager->Record({10, 11, 12, 13}, pages);
+            manager->ReleasePageIndices(pages);
+        };
+        auto expectRestored = [](fastllm::PagedCacheManager *manager,
+                                 const std::vector<uint8_t> &expected,
+                                 const std::string &name) {
+            std::vector<int> restored;
+            manager->Query({10, 11, 12, 13}, restored);
+            Expect(restored.size() == 2,
+                   name + " did not restore both prefix pages.");
+            const size_t pageBytes = manager->GetBytes() / maxPages;
+            for (size_t page = 0; page < restored.size(); page++) {
+                Expect(std::memcmp(
+                           manager->cpuData +
+                               (size_t)restored[page] * pageBytes,
+                           expected.data() + page * pageBytes,
+                           pageBytes) == 0,
+                       name + " restored page bytes changed.");
+            }
+        };
+
+        fastllm::ResetPersistentPrefixCacheForTest();
+        Expect(fastllm::PreparePersistentPrefixCache(
+                   options, nullptr, status, &error), error);
+        (void)firstModel;
+        fastllm::PagedCacheManager *key = makeManager(72020, pageLen);
+        fastllm::PagedCacheManager *value = makeManager(72021, pageLen);
+        std::vector<uint8_t> expectedKey;
+        std::vector<uint8_t> expectedValue;
+        recordManager(key, 0x11, expectedKey);
+        recordManager(value, 0x51, expectedValue);
+        Expect(fastllm::CheckpointPersistentPrefixCache(
+                   &firstModel, stats, &error), error);
+        Expect(stats.pages == 4 && stats.bytes > 0,
+               "persistent trie checkpoint reported incorrect statistics.");
+
+        fastllm::ClearAllPagedCacheManagers();
+        fastllm::ResetPersistentPrefixCacheForTest();
+        PersistentExtraProbeModel secondModel;
+        secondModel.exported = {0x51, 0x52, 0x53, 0x54};
+        key = makeManager(72020, pageLen);
+        value = makeManager(72021, pageLen);
+        Expect(fastllm::PreparePersistentPrefixCache(
+                   options, &secondModel, status, &error), error);
+        Expect(status.loadedGeneration == stats.generation,
+               "persistent trie generation was not prepared.");
+        Expect(secondModel.imported == firstModel.exported,
+               "persistent model extra did not survive restart.");
+        expectRestored(key, expectedKey, "persistent K cache");
+        expectRestored(value, expectedValue, "persistent V cache");
+        Expect(fastllm::GetPersistentPrefixCacheStatus().restoreHitCount >= 4,
+               "persistent trie restore hits were not counted.");
+
+        fastllm::PagedCacheManager *extra =
+            makeManager(72022, pageLen);
+        std::vector<uint8_t> expectedExtra;
+        recordManager(extra, 0x71, expectedExtra);
+        const uint64_t firstGeneration = stats.generation;
+        Expect(fastllm::CheckpointPersistentPrefixCache(
+                   &secondModel, stats, &error), error);
+        Expect(stats.generation > firstGeneration,
+               "second persistent checkpoint did not advance generation.");
+
+        fastllm::ClearAllPagedCacheManagers();
+        fastllm::ResetPersistentPrefixCacheForTest();
+        PersistentExtraProbeModel thirdModel;
+        Expect(fastllm::PreparePersistentPrefixCache(
+                   options, &thirdModel, status, &error), error);
+        Expect(status.loadedGeneration == stats.generation,
+               "second persistent generation was not restored.");
+        Expect(thirdModel.imported == secondModel.exported,
+               "second-generation model extra did not survive restart.");
+        key = makeManager(72020, pageLen);
+        extra = makeManager(72022, pageLen);
+        expectRestored(key, expectedKey,
+                       "second-generation persistent K cache");
+        expectRestored(extra, expectedExtra,
+                       "second-generation additional cache");
+
+        fastllm::ClearAllPagedCacheManagers();
+        fastllm::ResetPersistentPrefixCacheForTest();
+        Expect(fastllm::PreparePersistentPrefixCache(
+                   options, nullptr, status, &error), error);
+        fastllm::PagedCacheManager *mismatched =
+            makeManager(72020, pageLen + 1);
+        std::vector<int> miss;
+        mismatched->Query({10, 11, 12, 13}, miss);
+        Expect(miss.empty(),
+               "persistent trie accepted incompatible page geometry.");
+
+        fastllm::ClearAllPagedCacheManagers();
+        fastllm::ResetPersistentPrefixCacheForTest();
+        std::cout << "persistent paged trie regression: PASS\n";
+    }
+
+    void RunPersistentQwenExtraRegression() {
+#ifdef USE_CUDA
+        using fastllm::PersistentPayloadRecord;
+        std::vector<PersistentPayloadRecord> encoded;
+        std::string error;
+        {
+            fastllm::Qwen3_5Model source;
+            Expect(
+                fastllm::ConfigureQwen35PersistentPrefixFixtureForTest(
+                    source, true, &error),
+                error);
+            Expect(source.ExportPersistentPrefixCacheExtras(
+                       encoded, &error), error);
+            Expect(encoded.size() == 1 && !encoded[0].bytes.empty(),
+                   "Qwen persistent fixture did not export one snapshot.");
+        }
+
+        fastllm::Qwen3_5Model restored;
+        Expect(
+            fastllm::ConfigureQwen35PersistentPrefixFixtureForTest(
+                restored, false, &error),
+            error);
+        Expect(restored.ImportPersistentPrefixCacheExtras(
+                   encoded, &error), error);
+        std::vector<PersistentPayloadRecord> roundTrip;
+        Expect(restored.ExportPersistentPrefixCacheExtras(
+                   roundTrip, &error), error);
+        Expect(roundTrip.size() == encoded.size() &&
+                   roundTrip[0].name == encoded[0].name &&
+                   roundTrip[0].bytes == encoded[0].bytes,
+               "Qwen linear/MTP persistent snapshot changed after restore.");
+
+        std::vector<PersistentPayloadRecord> corrupt = encoded;
+        corrupt[0].bytes.back() ^= 0x80;
+        fastllm::Qwen3_5Model rejected;
+        Expect(
+            fastllm::ConfigureQwen35PersistentPrefixFixtureForTest(
+                rejected, false, &error),
+            error);
+        Expect(!rejected.ImportPersistentPrefixCacheExtras(
+                   corrupt, &error),
+               "corrupt Qwen persistent snapshot was accepted.");
+        Expect(!error.empty(),
+               "corrupt Qwen persistent snapshot had no diagnostic.");
+        std::cout << "persistent Qwen linear/MTP regression: PASS\n";
+#endif
+    }
+
+    fastllm::PagedCacheManager *MakePersistentProcessManager() {
+        fastllm::Data descriptor(fastllm::DataType::FLOAT16);
+        descriptor.dims = {1, 1, 4};
+        descriptor.strides = {4, 4, 1};
+        descriptor.dataDevice = fastllm::DataDevice::CPU;
+        descriptor.UpdateUnitSize();
+        return fastllm::AllocatePagedCacheManager(
+            73020,
+            fastllm::PagedCacheManager::
+                PAGED_CACHE_MANAGER_TYPE_KV_CACHE,
+            descriptor,
+            2,
+            4);
+    }
+
+    std::vector<uint8_t> PersistentProcessExpectedBytes(
+            size_t pageBytes) {
+        std::vector<uint8_t> expected(pageBytes * 2);
+        for (size_t page = 0; page < 2; page++) {
+            for (size_t byte = 0; byte < pageBytes; byte++) {
+                expected[page * pageBytes + byte] =
+                    static_cast<uint8_t>(0x31 + page * 29 + byte);
+            }
+        }
+        return expected;
+    }
+
+    int RunPersistentPrefixProcessChildMode() {
+        const char *modeValue =
+            std::getenv("FASTLLM_PREFIX_PERSIST_CHILD");
+        const char *rootValue =
+            std::getenv("FASTLLM_PREFIX_PERSIST_ROOT");
+        if (modeValue == nullptr || rootValue == nullptr) {
+            return 2;
+        }
+        const std::string mode(modeValue);
+        const bool expectMiss =
+            std::getenv("FASTLLM_PREFIX_PERSIST_EXPECT_MISS") !=
+            nullptr;
+        fastllm::PersistentPrefixCacheOptions options {
+            true,
+            std::filesystem::path(rootValue),
+            "qwen36-process-restart-page2",
+        };
+        fastllm::PersistentPrefixCacheStatus status;
+        fastllm::PersistentPrefixCheckpointStats stats;
+        std::string error;
+        fastllm::ResetPersistentPrefixCacheForTest();
+        const bool prepared = fastllm::PreparePersistentPrefixCache(
+            options, nullptr, status, &error);
+        if (mode == "record") {
+            if (!prepared) {
+                std::cerr << "record prepare failed: " << error << "\n";
+                return 3;
+            }
+            fastllm::PagedCacheManager *manager =
+                MakePersistentProcessManager();
+            const size_t pageBytes = manager->GetBytes() / 4;
+            const std::vector<uint8_t> expected =
+                PersistentProcessExpectedBytes(pageBytes);
+            std::vector<int> pages = {
+                manager->GetUnusedPageIndex(true),
+                manager->GetUnusedPageIndex(true),
+            };
+            if (pages[0] < 0 || pages[1] < 0) {
+                return 4;
+            }
+            for (size_t page = 0; page < pages.size(); page++) {
+                std::memcpy(
+                    manager->cpuData +
+                        static_cast<size_t>(pages[page]) * pageBytes,
+                    expected.data() + page * pageBytes,
+                    pageBytes);
+            }
+            manager->Record({40, 41, 42, 43}, pages);
+            manager->ReleasePageIndices(pages);
+            if (!fastllm::CheckpointPersistentPrefixCache(
+                    nullptr, stats, &error) ||
+                stats.generation == 0 || stats.pages != 2) {
+                std::cerr << "record checkpoint failed: "
+                          << error << "\n";
+                return 5;
+            }
+            fastllm::ClearAllPagedCacheManagers();
+            fastllm::ResetPersistentPrefixCacheForTest();
+            return 0;
+        }
+        if (mode != "restore") {
+            return 6;
+        }
+        if (expectMiss) {
+            if (prepared || error.empty()) {
+                std::cerr
+                    << "corrupt generation did not fail open: "
+                    << error << "\n";
+                return 7;
+            }
+        } else if (!prepared || status.loadedGeneration == 0) {
+            std::cerr << "restore prepare failed: " << error << "\n";
+            return 8;
+        }
+        fastllm::PagedCacheManager *manager =
+            MakePersistentProcessManager();
+        std::vector<int> pages;
+        manager->Query({40, 41, 42, 43}, pages);
+        if (expectMiss) {
+            if (!pages.empty()) {
+                std::cerr
+                    << "corrupt generation restored cache pages\n";
+                return 9;
+            }
+        } else {
+            if (pages.size() != 2) {
+                std::cerr
+                    << "process restart restored "
+                    << pages.size() << " pages\n";
+                return 10;
+            }
+            const size_t pageBytes = manager->GetBytes() / 4;
+            const std::vector<uint8_t> expected =
+                PersistentProcessExpectedBytes(pageBytes);
+            for (size_t page = 0; page < pages.size(); page++) {
+                if (std::memcmp(
+                        manager->cpuData +
+                            static_cast<size_t>(pages[page]) *
+                                pageBytes,
+                        expected.data() + page * pageBytes,
+                        pageBytes) != 0) {
+                    std::cerr
+                        << "process restart changed page bytes\n";
+                    return 11;
+                }
+            }
+            const fastllm::PersistentPrefixCacheStatus after =
+                fastllm::GetPersistentPrefixCacheStatus();
+            if (after.restoreHitCount < 2) {
+                std::cerr
+                    << "process restart did not count restore hits\n";
+                return 12;
+            }
+        }
+        fastllm::ClearAllPagedCacheManagers();
+        fastllm::ResetPersistentPrefixCacheForTest();
+        return 0;
+    }
+
+    void RunPersistentPrefixProcessRestartRegression() {
+#ifdef _WIN32
+        std::cout
+            << "persistent paged prefix process-restart regression: SKIP\n"
+            << "persistent corruption fail-open regression: SKIP\n";
+#else
+        ScopedTempDirectory root(
+            "fastllm-prefix-persist-process-");
+        const std::filesystem::path executable =
+            std::filesystem::read_symlink("/proc/self/exe");
+        auto launch = [&](const char *mode, bool expectMiss) {
+            const pid_t child = fork();
+            if (child < 0) {
+                return false;
+            }
+            if (child == 0) {
+                setenv(
+                    "FASTLLM_PREFIX_PERSIST_CHILD",
+                    mode,
+                    1);
+                setenv(
+                    "FASTLLM_PREFIX_PERSIST_ROOT",
+                    root.Path().c_str(),
+                    1);
+                if (expectMiss) {
+                    setenv(
+                        "FASTLLM_PREFIX_PERSIST_EXPECT_MISS",
+                        "1",
+                        1);
+                } else {
+                    unsetenv(
+                        "FASTLLM_PREFIX_PERSIST_EXPECT_MISS");
+                }
+                execl(
+                    executable.c_str(),
+                    executable.c_str(),
+                    static_cast<char *>(nullptr));
+                _exit(127);
+            }
+            int status = 0;
+            if (waitpid(child, &status, 0) != child) {
+                return false;
+            }
+            return WIFEXITED(status) &&
+                WEXITSTATUS(status) == 0;
+        };
+
+        Expect(launch("record", false),
+               "persistent process record child failed.");
+        Expect(launch("restore", false),
+               "persistent process restore child failed.");
+        std::cout
+            << "persistent paged prefix process-restart regression: PASS\n";
+
+        const std::filesystem::path keyRoot =
+            root.Path() /
+            fastllm::PersistentPrefixCacheKeyDirectoryName(
+                "qwen36-process-restart-page2");
+        std::ifstream currentInput(keyRoot / "CURRENT");
+        std::string currentGeneration;
+        std::getline(currentInput, currentGeneration);
+        Expect(!currentGeneration.empty(),
+               "persistent process fixture has no CURRENT generation.");
+        const std::filesystem::path manifest =
+            keyRoot / ("gen-" + currentGeneration) / "manifest.bin";
+        Expect(std::filesystem::exists(manifest),
+               "persistent process fixture manifest is missing.");
+        std::filesystem::resize_file(manifest, 7);
+        Expect(launch("restore", true),
+               "persistent corrupt-generation child failed.");
+        std::cout
+            << "persistent corruption fail-open regression: PASS\n";
+#endif
     }
 
     void RunBFloat16Q8KConversionRegression() {
@@ -17036,6 +17530,9 @@ namespace {
 
 int main(int argc, char **argv) {
     try {
+        if (std::getenv("FASTLLM_PREFIX_PERSIST_CHILD") != nullptr) {
+            return RunPersistentPrefixProcessChildMode();
+        }
         const char *only = std::getenv("FASTLLM_REGRESSION_ONLY");
         if (only != nullptr && std::string(only) == "gguf_dequant") {
 #ifdef USE_CUDA
@@ -17057,6 +17554,9 @@ int main(int argc, char **argv) {
         if (only != nullptr &&
             std::string(only) == "persistent_prefix_cache") {
             RunPersistentPrefixArchiveRegression();
+            RunPersistentPagedTrieRegression();
+            RunPersistentQwenExtraRegression();
+            RunPersistentPrefixProcessRestartRegression();
             return 0;
         }
         if (only != nullptr &&

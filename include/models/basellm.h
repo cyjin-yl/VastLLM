@@ -35,6 +35,7 @@ namespace fastllm {
     };
 
     class basellm;
+    struct PersistentPayloadRecord;
     struct Qwen35LongPrefillProgress {
         bool inProgress = false;
         int total = 0;
@@ -504,6 +505,20 @@ namespace fastllm {
         virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context);
         virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const;
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const;
+        virtual bool ExportPersistentPrefixCacheExtras(
+            std::vector<PersistentPayloadRecord> &records,
+            std::string *error) const {
+            (void)records;
+            (void)error;
+            return true;
+        }
+        virtual bool ImportPersistentPrefixCacheExtras(
+            const std::vector<PersistentPayloadRecord> &records,
+            std::string *error) {
+            (void)records;
+            (void)error;
+            return true;
+        }
 
         // Generic request-state tiering owns pastKeyValues and delegates only
         // model-private state (for example speculative caches) to these hooks.

@@ -24,6 +24,7 @@
 #include <codecvt>
 #include "devices/cpu/alivethreadpool.h"
 #include "json11.hpp"
+#include "prefixcache_persistence.h"
 
 #ifdef USE_SENTENCEPIECE
 #include <sentencepiece_processor.h>
@@ -662,6 +663,10 @@ namespace fastllm {
         size_t uncompressedBytes = 0;
         bool zstdCompressed = false;
         uint64_t checksum = 0;
+        bool persistentArchive = false;
+        std::string persistentRoot;
+        uint64_t persistentGeneration = 0;
+        PersistentPayloadRef persistentRef;
     };
 
     struct CacheTrieNode {
@@ -687,6 +692,9 @@ namespace fastllm {
                 PAGED_CACHE_MANAGER_TYPE_KV_CACHE = 0,
                 PAGED_CACHE_MANAGER_TYPE_MLP_CACHE = 1
             };
+
+            int persistentId = -1;
+            bool persistentRestoreAttempted = false;
 
             // 类型
             PagedCacheManagerType type;
@@ -734,6 +742,17 @@ namespace fastllm {
             static uint64_t HashTokenPage(const int *tokens, int len);
             void Record(const std::vector<int> &tokens, const std::vector<int> &pages);
             void Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds);
+
+            bool ExportPersistentRecords(
+                std::vector<PersistentPayloadRecord> &records,
+                uint64_t &pages,
+                std::string *error);
+            bool ImportPersistentRecords(
+                const std::filesystem::path &root,
+                uint64_t generation,
+                const std::vector<uint8_t> &trieBytes,
+                const std::vector<PersistentPayloadRef> &refs,
+                std::string *error);
     };
 
     bool PagedPrefixCacheCpuTierEnabled();
@@ -1457,6 +1476,12 @@ namespace fastllm {
     PagedCacheManager* GetPagedCacheManager(int layerIndex);
 
     void ClearAllPagedCacheManagers();
+
+    bool ExportPersistentPagedCacheRecords(
+        std::vector<PersistentPayloadRecord> &records,
+        uint64_t &pages,
+        std::string *error);
+    void AttachPreparedPersistentPrefixCacheManagers();
 
     void AppendPagedCache(PagedCacheManager &pagedCacheManager, Data &cache, const Data &input);
     

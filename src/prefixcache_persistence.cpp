@@ -1,6 +1,9 @@
 #include "prefixcache_persistence.h"
+#include "fastllm.h"
+#include "models/basellm.h"
 
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -12,6 +15,7 @@
 #include <set>
 #include <sstream>
 #include <system_error>
+#include <mutex>
 
 #ifdef FASTLLM_USE_ZSTD
 #include <zstd.h>
@@ -609,6 +613,81 @@ namespace {
         return root / ("gen-" + std::to_string(generation));
     }
 
+    bool ParseGenerationDirectoryName(
+            const std::string &name, uint64_t &generation) {
+        if (name.rfind("gen-", 0) != 0 || name.size() <= 4) {
+            return false;
+        }
+        generation = 0;
+        for (size_t index = 4; index < name.size(); index++) {
+            const char digit = name[index];
+            if (digit < '0' || digit > '9' ||
+                generation >
+                    (std::numeric_limits<uint64_t>::max() -
+                     (digit - '0')) / 10) {
+                return false;
+            }
+            generation =
+                generation * 10 + static_cast<uint64_t>(digit - '0');
+        }
+        return generation != 0;
+    }
+
+    bool PrunePersistentPrefixCacheGenerations(
+            const std::filesystem::path &root,
+            uint64_t current,
+            size_t keep,
+            std::string *error) {
+        std::vector<std::pair<uint64_t, std::filesystem::path>>
+            generations;
+        std::error_code filesystemError;
+        for (std::filesystem::directory_iterator it(
+                 root,
+                 std::filesystem::directory_options::
+                     skip_permission_denied,
+                 filesystemError), end;
+             !filesystemError && it != end;
+             it.increment(filesystemError)) {
+            uint64_t generation = 0;
+            if (it->is_directory(filesystemError) &&
+                !filesystemError &&
+                ParseGenerationDirectoryName(
+                    it->path().filename().string(), generation)) {
+                generations.emplace_back(generation, it->path());
+            }
+        }
+        if (filesystemError) {
+            SetError(error,
+                     "failed to inspect persistent prefix cache generations: " +
+                     filesystemError.message());
+            return false;
+        }
+        std::sort(
+            generations.begin(), generations.end(),
+            [](const auto &left, const auto &right) {
+                return left.first > right.first;
+            });
+        size_t retainedOther = 0;
+        for (const auto &generation : generations) {
+            if (generation.first == current) {
+                continue;
+            }
+            if (retainedOther + 1 < keep) {
+                retainedOther++;
+                continue;
+            }
+            std::filesystem::remove_all(
+                generation.second, filesystemError);
+            if (filesystemError) {
+                SetError(error,
+                         "failed to prune persistent prefix cache generation: " +
+                         filesystemError.message());
+                return false;
+            }
+        }
+        return SyncDirectory(root, error);
+    }
+
     bool RemoveStaleStaging(const std::filesystem::path &root,
                             std::string *error) {
         std::error_code filesystemError;
@@ -630,6 +709,14 @@ namespace {
         }
         return true;
     }
+}
+
+uint64_t PrefixCacheChecksum(const uint8_t *data, size_t bytes) {
+    return Checksum(data, bytes);
+}
+
+uint64_t PrefixCacheChecksum(const std::vector<uint8_t> &bytes) {
+    return Checksum(bytes);
 }
 
 std::string PersistentPrefixCacheKeyDirectoryName(
@@ -871,7 +958,9 @@ bool CommitPersistentPrefixCacheGeneration(
                      filesystemError.message());
             return false;
         }
-        if (!SyncDirectory(root, error)) {
+        if (!SyncDirectory(root, error) ||
+            !PrunePersistentPrefixCacheGenerations(
+                root, source.generation, 2, error)) {
             return false;
         }
         return true;
@@ -1022,6 +1111,371 @@ bool ReadPersistentPrefixCachePayload(
                         exception.what());
         bytes.clear();
         return false;
+    }
+}
+
+namespace {
+    struct PersistentPrefixCacheRuntime {
+        std::mutex locker;
+        PersistentPrefixCacheOptions options;
+        std::filesystem::path root;
+        uint64_t generation = 0;
+        std::vector<PersistentPayloadRef> refs;
+        PersistentPrefixCacheStatus status;
+    };
+
+    PersistentPrefixCacheRuntime &GetPersistentPrefixCacheRuntime() {
+        static PersistentPrefixCacheRuntime runtime;
+        return runtime;
+    }
+
+    bool PersistentPrefixCacheEnvEnabled(const char *name) {
+        const char *value = std::getenv(name);
+        if (value == nullptr) {
+            return false;
+        }
+        std::string normalized(value);
+        std::transform(normalized.begin(), normalized.end(),
+                       normalized.begin(), [](unsigned char character) {
+            return (char)std::tolower(character);
+        });
+        return normalized == "1" || normalized == "true" ||
+               normalized == "yes" || normalized == "on";
+    }
+
+    uint64_t NextPersistentPrefixCacheGeneration(
+            const std::filesystem::path &root) {
+        uint64_t next = 1;
+        std::error_code error;
+        for (std::filesystem::directory_iterator it(
+                 root,
+                 std::filesystem::directory_options::skip_permission_denied,
+                 error), end;
+             !error && it != end; it.increment(error)) {
+            const std::string name =
+                it->path().filename().string();
+            uint64_t value = 0;
+            if (ParseGenerationDirectoryName(name, value) &&
+                value >= next &&
+                value < std::numeric_limits<uint64_t>::max()) {
+                next = value + 1;
+            }
+        }
+        return next;
+    }
+}
+
+bool PreparePersistentPrefixCache(
+    const PersistentPrefixCacheOptions &options,
+    basellm *model,
+    PersistentPrefixCacheStatus &status,
+    std::string *error) {
+    (void)model;
+    if (error != nullptr) {
+        error->clear();
+    }
+    PersistentPrefixCacheRuntime &runtime =
+        GetPersistentPrefixCacheRuntime();
+    {
+        std::lock_guard<std::mutex> guard(runtime.locker);
+        runtime.options = options;
+        runtime.root.clear();
+        runtime.generation = 0;
+        runtime.refs.clear();
+        runtime.status = {};
+        runtime.status.enabled = options.enabled;
+    }
+    if (!options.enabled) {
+        status = GetPersistentPrefixCacheStatus();
+        return true;
+    }
+    if (options.diskDirectory.empty() || options.cacheKey.empty()) {
+        SetError(error,
+                 "persistent prefix cache requires a disk directory and key");
+        std::lock_guard<std::mutex> guard(runtime.locker);
+        runtime.status.lastError =
+            error == nullptr ? "invalid persistent prefix cache options" :
+                               *error;
+        status = runtime.status;
+        return false;
+    }
+
+    const std::filesystem::path root =
+        options.diskDirectory /
+        PersistentPrefixCacheKeyDirectoryName(options.cacheKey);
+    std::error_code filesystemError;
+    std::filesystem::create_directories(root, filesystemError);
+    if (filesystemError) {
+        SetError(error, "failed to create persistent prefix cache root: " +
+                        filesystemError.message());
+        std::lock_guard<std::mutex> guard(runtime.locker);
+        runtime.status.lastError =
+            error == nullptr ? "failed to create cache root" : *error;
+        status = runtime.status;
+        return false;
+    }
+    if (!std::filesystem::exists(root / "CURRENT", filesystemError)) {
+        std::lock_guard<std::mutex> guard(runtime.locker);
+        runtime.root = root;
+        status = runtime.status;
+        return true;
+    }
+    if (filesystemError) {
+        SetError(error, "failed to inspect persistent prefix cache CURRENT: " +
+                        filesystemError.message());
+        std::lock_guard<std::mutex> guard(runtime.locker);
+        runtime.status.lastError =
+            error == nullptr ? "failed to inspect cache generation" : *error;
+        status = runtime.status;
+        return false;
+    }
+
+    PersistedPrefixCacheGeneration loaded;
+    std::vector<PersistentPayloadRef> refs;
+    if (!LoadPersistentPrefixCacheGeneration(
+            root, loaded, refs, error) ||
+        loaded.cacheKey != options.cacheKey) {
+        if (loaded.cacheKey != options.cacheKey) {
+            SetError(error, "persistent prefix cache key mismatch");
+        }
+        std::lock_guard<std::mutex> guard(runtime.locker);
+        runtime.root = root;
+        runtime.status.lastError =
+            error == nullptr ? "failed to load cache generation" : *error;
+        status = runtime.status;
+        return false;
+    }
+
+    if (model != nullptr) {
+        std::vector<PersistentPayloadRecord> extras;
+        for (const PersistentPayloadRef &ref : refs) {
+            if (ref.kind != PersistentPayloadKind::MODEL_EXTRA) {
+                continue;
+            }
+            PersistentPayloadRecord record;
+            record.kind = ref.kind;
+            record.name = ref.name;
+            record.dataType = ref.dataType;
+            record.dimensions = ref.dimensions;
+            if (!ReadPersistentPrefixCachePayload(
+                    root,
+                    loaded.generation,
+                    ref,
+                    record.bytes,
+                    error)) {
+                std::lock_guard<std::mutex> guard(runtime.locker);
+                runtime.root = root;
+                runtime.status.lastError =
+                    error == nullptr ?
+                        "failed to load model prefix cache extras" :
+                        *error;
+                status = runtime.status;
+                return false;
+            }
+            extras.push_back(std::move(record));
+        }
+        if (!model->ImportPersistentPrefixCacheExtras(
+                extras, error)) {
+            std::lock_guard<std::mutex> guard(runtime.locker);
+            runtime.root = root;
+            runtime.status.lastError =
+                error == nullptr ?
+                    "model prefix cache extras are incompatible" :
+                    *error;
+            status = runtime.status;
+            return false;
+        }
+    }
+
+    uint64_t payloadBytes = 0;
+    for (const PersistentPayloadRef &ref : refs) {
+        if (ref.uncompressedBytes <=
+            std::numeric_limits<uint64_t>::max() - payloadBytes) {
+            payloadBytes += ref.uncompressedBytes;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> guard(runtime.locker);
+        runtime.root = root;
+        runtime.generation = loaded.generation;
+        runtime.refs = std::move(refs);
+        runtime.status.loadedGeneration = loaded.generation;
+        runtime.status.payloadBytes = payloadBytes;
+    }
+    AttachPreparedPersistentPrefixCacheManagers();
+    status = GetPersistentPrefixCacheStatus();
+    return true;
+}
+
+bool PreparePersistentPrefixCacheFromEnv(
+    basellm *model,
+    PersistentPrefixCacheStatus &status,
+    std::string *error) {
+    PersistentPrefixCacheOptions options;
+    options.enabled =
+        PersistentPrefixCacheEnvEnabled("FASTLLM_PREFIX_CACHE_PERSIST");
+    if (const char *directory =
+            std::getenv("FASTLLM_PREFIX_CACHE_DISK_DIR")) {
+        options.diskDirectory = directory;
+    }
+    if (const char *key =
+            std::getenv("FASTLLM_PREFIX_CACHE_PERSIST_KEY")) {
+        options.cacheKey = key;
+    }
+    return PreparePersistentPrefixCache(
+        options, model, status, error);
+}
+
+bool CheckpointPersistentPrefixCache(
+    basellm *model,
+    PersistentPrefixCheckpointStats &stats,
+    std::string *error) {
+    stats = {};
+    if (error != nullptr) {
+        error->clear();
+    }
+    PersistentPrefixCacheRuntime &runtime =
+        GetPersistentPrefixCacheRuntime();
+    PersistentPrefixCacheOptions options;
+    std::filesystem::path root;
+    {
+        std::lock_guard<std::mutex> guard(runtime.locker);
+        options = runtime.options;
+        root = runtime.root;
+    }
+    if (!options.enabled || root.empty()) {
+        SetError(error, "persistent prefix cache is disabled");
+        return false;
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    std::vector<PersistentPayloadRecord> records;
+    uint64_t pages = 0;
+    if (!ExportPersistentPagedCacheRecords(
+            records, pages, error)) {
+        std::lock_guard<std::mutex> guard(runtime.locker);
+        runtime.status.lastError =
+            error == nullptr ? "failed to export paged cache" : *error;
+        return false;
+    }
+    if (model != nullptr &&
+        !model->ExportPersistentPrefixCacheExtras(
+            records, error)) {
+        std::lock_guard<std::mutex> guard(runtime.locker);
+        runtime.status.lastError =
+            error == nullptr ?
+                "failed to export model prefix cache extras" :
+                *error;
+        return false;
+    }
+    PersistedPrefixCacheGeneration source;
+    source.generation =
+        NextPersistentPrefixCacheGeneration(root);
+    source.cacheKey = options.cacheKey;
+    source.payloads = std::move(records);
+
+    uint64_t payloadBytes = 0;
+    for (const PersistentPayloadRecord &record : source.payloads) {
+        if (record.bytes.size() <=
+            std::numeric_limits<uint64_t>::max() - payloadBytes) {
+            payloadBytes += record.bytes.size();
+        }
+    }
+    std::vector<PersistentPayloadRef> refs;
+    if (!CommitPersistentPrefixCacheGeneration(
+            root, source, refs, error)) {
+        std::lock_guard<std::mutex> guard(runtime.locker);
+        runtime.status.lastError =
+            error == nullptr ? "failed to commit cache generation" : *error;
+        return false;
+    }
+    stats.generation = source.generation;
+    stats.pages = pages;
+    stats.bytes = payloadBytes;
+    stats.durationMs =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started).count();
+    {
+        std::lock_guard<std::mutex> guard(runtime.locker);
+        runtime.status.checkpointCount++;
+        runtime.status.payloadBytes = payloadBytes;
+        runtime.status.lastDurationMs = stats.durationMs;
+        runtime.status.lastError.clear();
+    }
+    return true;
+}
+
+PersistentPrefixCacheStatus GetPersistentPrefixCacheStatus() {
+    PersistentPrefixCacheRuntime &runtime =
+        GetPersistentPrefixCacheRuntime();
+    std::lock_guard<std::mutex> guard(runtime.locker);
+    return runtime.status;
+}
+
+void ResetPersistentPrefixCacheForTest() {
+    PersistentPrefixCacheRuntime &runtime =
+        GetPersistentPrefixCacheRuntime();
+    std::lock_guard<std::mutex> guard(runtime.locker);
+    runtime.options = {};
+    runtime.root.clear();
+    runtime.generation = 0;
+    runtime.refs.clear();
+    runtime.status = {};
+    commitFailpoint.store(
+        PersistentPrefixCommitFailpoint::NONE,
+        std::memory_order_release);
+}
+
+namespace persistent_prefix_cache_internal {
+    void AttachPreparedManager(
+            int managerId, PagedCacheManager *manager) {
+        if (manager == nullptr || manager->persistentRestoreAttempted) {
+            return;
+        }
+        PersistentPrefixCacheRuntime &runtime =
+            GetPersistentPrefixCacheRuntime();
+        std::filesystem::path root;
+        uint64_t generation = 0;
+        std::vector<PersistentPayloadRef> refs;
+        {
+            std::lock_guard<std::mutex> guard(runtime.locker);
+            if (!runtime.status.enabled ||
+                runtime.generation == 0) {
+                return;
+            }
+            root = runtime.root;
+            generation = runtime.generation;
+            refs = runtime.refs;
+        }
+        manager->persistentRestoreAttempted = true;
+        const std::string trieName =
+            "manager/" + std::to_string(managerId) + "/trie";
+        auto trie = std::find_if(
+            refs.begin(), refs.end(),
+            [&](const PersistentPayloadRef &ref) {
+                return ref.kind ==
+                           PersistentPayloadKind::PAGED_CACHE_TRIE &&
+                       ref.name == trieName;
+            });
+        if (trie == refs.end()) {
+            return;
+        }
+        std::vector<uint8_t> trieBytes;
+        std::string restoreError;
+        if (!ReadPersistentPrefixCachePayload(
+                root, generation, *trie, trieBytes, &restoreError) ||
+            !manager->ImportPersistentRecords(
+                root, generation, trieBytes, refs, &restoreError)) {
+            std::lock_guard<std::mutex> guard(runtime.locker);
+            runtime.status.lastError = restoreError;
+        }
+    }
+
+    void ObserveRestoreHit() {
+        PersistentPrefixCacheRuntime &runtime =
+            GetPersistentPrefixCacheRuntime();
+        std::lock_guard<std::mutex> guard(runtime.locker);
+        runtime.status.restoreHitCount++;
     }
 }
 }

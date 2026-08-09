@@ -9,6 +9,7 @@
 namespace fastllm {
     class basellm;
     class Data;
+    class PagedCacheManager;
 
     enum class PersistentPayloadKind : uint32_t {
         PAGED_CACHE_TRIE = 1,
@@ -46,6 +47,9 @@ namespace fastllm {
         NONE = 0,
         BEFORE_CURRENT_RENAME = 1,
     };
+
+    uint64_t PrefixCacheChecksum(const uint8_t *data, size_t bytes);
+    uint64_t PrefixCacheChecksum(const std::vector<uint8_t> &bytes);
 
     bool CommitPersistentPrefixCacheGeneration(
         const std::filesystem::path &root,
@@ -106,6 +110,12 @@ namespace fastllm {
         std::string *error);
     PersistentPrefixCacheStatus GetPersistentPrefixCacheStatus();
     void ResetPersistentPrefixCacheForTest();
+
+    namespace persistent_prefix_cache_internal {
+        void AttachPreparedManager(
+            int managerId, PagedCacheManager *manager);
+        void ObserveRestoreHit();
+    }
 
     bool PersistentPayloadFromData(
         PersistentPayloadKind kind,

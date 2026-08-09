@@ -5005,6 +5005,7 @@ namespace fastllm {
 
         // 设置基本属性
         manager->type = type;
+        manager->persistentId = layerIndex;
 
         // 从 cacheData 中提取信息
         // cacheData 的尺寸应该是 [numHeads, seqLen, headDim] 或类似的形状
@@ -5059,6 +5060,8 @@ namespace fastllm {
             }
             layerPagedCacheManagers[layerIndex] = manager;
         }
+        persistent_prefix_cache_internal::AttachPreparedManager(
+            layerIndex, manager);
 
 #ifdef USE_CUDA
         if (oriDevice >= 0 && oriDevice != targetDevice) {
@@ -5076,6 +5079,50 @@ namespace fastllm {
             delete it.second;
         }
         layerPagedCacheManagers.clear();
+    }
+
+    bool ExportPersistentPagedCacheRecords(
+            std::vector<PersistentPayloadRecord> &records,
+            uint64_t &pages,
+            std::string *error) {
+        records.clear();
+        pages = 0;
+        std::lock_guard<std::mutex> guard(
+            layerPagedCacheManagersMutex);
+        std::vector<std::pair<int, PagedCacheManager*> > managers(
+            layerPagedCacheManagers.begin(),
+            layerPagedCacheManagers.end());
+        std::sort(
+            managers.begin(), managers.end(),
+            [](const auto &left, const auto &right) {
+                return left.first < right.first;
+            });
+        for (const auto &item : managers) {
+            uint64_t managerPages = 0;
+            if (!item.second->ExportPersistentRecords(
+                    records, managerPages, error)) {
+                records.clear();
+                pages = 0;
+                return false;
+            }
+            pages += managerPages;
+        }
+        return true;
+    }
+
+    void AttachPreparedPersistentPrefixCacheManagers() {
+        std::vector<std::pair<int, PagedCacheManager*> > managers;
+        {
+            std::lock_guard<std::mutex> guard(
+                layerPagedCacheManagersMutex);
+            managers.assign(
+                layerPagedCacheManagers.begin(),
+                layerPagedCacheManagers.end());
+        }
+        for (const auto &item : managers) {
+            persistent_prefix_cache_internal::AttachPreparedManager(
+                item.first, item.second);
+        }
     }
 
     static void SetPagedCacheSnapshotError(
@@ -6647,6 +6694,10 @@ namespace fastllm {
             if (reference == nullptr) {
                 return;
             }
+            if (reference->persistentArchive) {
+                reference.reset();
+                return;
+            }
             const uint64_t offset = reference->offset;
             const size_t bytes = reference->storedBytes;
             reference->storedBytes = 0;
@@ -6827,6 +6878,660 @@ namespace fastllm {
         if (accounted) {
             pagedPrefixCacheCpuTierBytes.fetch_sub(bytes.size());
         }
+    }
+
+    namespace {
+        constexpr uint8_t PERSISTENT_TRIE_MAGIC[8] = {
+            'F', 'L', 'P', 'C', 'T', 'R', 'I', '1'
+        };
+        constexpr uint32_t PERSISTENT_TRIE_VERSION = 1;
+        constexpr size_t PERSISTENT_TRIE_MAX_BYTES =
+            (size_t)64 << 20;
+        constexpr uint32_t PERSISTENT_TRIE_MAX_NODES =
+            UINT32_C(1) << 20;
+
+        class PersistentTrieWriter {
+        public:
+            void U32(uint32_t value) {
+                for (int i = 0; i < 4; i++) {
+                    bytes.push_back((uint8_t)(value >> (8 * i)));
+                }
+            }
+            void U64(uint64_t value) {
+                for (int i = 0; i < 8; i++) {
+                    bytes.push_back((uint8_t)(value >> (8 * i)));
+                }
+            }
+            bool String(const std::string &value) {
+                if (value.size() > (size_t)UINT32_MAX) {
+                    return false;
+                }
+                U32((uint32_t)value.size());
+                bytes.insert(bytes.end(), value.begin(), value.end());
+                return bytes.size() <= PERSISTENT_TRIE_MAX_BYTES;
+            }
+            void Raw(const uint8_t *data, size_t count) {
+                bytes.insert(bytes.end(), data, data + count);
+            }
+            std::vector<uint8_t> bytes;
+        };
+
+        class PersistentTrieReader {
+        public:
+            PersistentTrieReader(
+                    const uint8_t *data, size_t size)
+                : data(data), size(size) {}
+            bool U32(uint32_t &value) {
+                if (Remaining() < 4) {
+                    return false;
+                }
+                value = 0;
+                for (int i = 0; i < 4; i++) {
+                    value |= (uint32_t)data[offset + i] << (8 * i);
+                }
+                offset += 4;
+                return true;
+            }
+            bool U64(uint64_t &value) {
+                if (Remaining() < 8) {
+                    return false;
+                }
+                value = 0;
+                for (int i = 0; i < 8; i++) {
+                    value |= (uint64_t)data[offset + i] << (8 * i);
+                }
+                offset += 8;
+                return true;
+            }
+            bool String(std::string &value) {
+                uint32_t length = 0;
+                if (!U32(length) || Remaining() < length) {
+                    return false;
+                }
+                value.assign(
+                    reinterpret_cast<const char*>(data + offset),
+                    length);
+                offset += length;
+                return true;
+            }
+            bool Raw(const uint8_t *&value, size_t count) {
+                if (Remaining() < count) {
+                    return false;
+                }
+                value = data + offset;
+                offset += count;
+                return true;
+            }
+            size_t Remaining() const {
+                return size - offset;
+            }
+        private:
+            const uint8_t *data;
+            size_t size;
+            size_t offset = 0;
+        };
+
+        bool DecodePagedPrefixTierBytes(
+                const std::vector<uint8_t> &stored,
+                size_t uncompressedBytes,
+                bool zstdCompressed,
+                uint64_t checksum,
+                std::vector<uint8_t> &raw) {
+            if (stored.empty() ||
+                PrefixCacheTierChecksum(
+                    stored.data(), stored.size()) != checksum) {
+                return false;
+            }
+            if (!zstdCompressed) {
+                if (stored.size() != uncompressedBytes) {
+                    return false;
+                }
+                raw = stored;
+                return true;
+            }
+#ifdef FASTLLM_USE_ZSTD
+            try {
+                raw.resize(uncompressedBytes);
+            } catch (...) {
+                return false;
+            }
+            const size_t result = ZSTD_decompress(
+                raw.data(), raw.size(),
+                stored.data(), stored.size());
+            if (ZSTD_isError(result) || result != raw.size()) {
+                raw.clear();
+                return false;
+            }
+            return true;
+#else
+            return false;
+#endif
+        }
+
+        bool ReadPagedTrieNodeForCheckpoint(
+                PagedCacheManager *manager,
+                CacheTrieNode *node,
+                size_t pageBytes,
+                std::vector<uint8_t> &raw) {
+            raw.clear();
+            if (node->pageId >= 0) {
+                if (node->pageId >= manager->maxPages ||
+                    node->pageId >=
+                        (int)manager->pageTimestamp.size() ||
+                    manager->pageTimestamp[node->pageId] !=
+                        node->timestamp ||
+                    (size_t)node->pageId >
+                        std::numeric_limits<size_t>::max() /
+                            pageBytes) {
+                    return false;
+                }
+                try {
+                    raw.resize(pageBytes);
+                } catch (...) {
+                    return false;
+                }
+                const size_t offset =
+                    (size_t)node->pageId * pageBytes;
+                if (manager->dataDevice == DataDevice::CPU &&
+                    manager->cpuData != nullptr) {
+                    std::memcpy(
+                        raw.data(), manager->cpuData + offset,
+                        pageBytes);
+                    return true;
+                }
+#ifdef USE_CUDA
+                if (manager->dataDevice == DataDevice::CUDA &&
+                    manager->cudaData != nullptr) {
+                    const int originalDevice =
+                        FastllmCudaGetDevice();
+                    int targetDevice = originalDevice;
+                    if (!manager->dataDeviceIds.empty()) {
+                        targetDevice =
+                            manager->dataDeviceIds[0];
+                    }
+                    FastllmCudaSetDevice(targetDevice);
+                    FastllmCudaCopyFromDeviceToHost(
+                        raw.data(),
+                        (uint8_t*)manager->cudaData + offset,
+                        pageBytes);
+                    FastllmCudaSetDevice(originalDevice);
+                    return true;
+                }
+#endif
+                raw.clear();
+                return false;
+            }
+            if (node->tierPayload != nullptr) {
+                return DecodePagedPrefixTierBytes(
+                    node->tierPayload->bytes,
+                    node->tierPayload->uncompressedBytes,
+                    node->tierPayload->zstdCompressed,
+                    node->tierPayload->checksum,
+                    raw) &&
+                    raw.size() == pageBytes;
+            }
+            if (node->tierDisk == nullptr) {
+                return false;
+            }
+            if (node->tierDisk->persistentArchive) {
+                std::string error;
+                return ReadPersistentPrefixCachePayload(
+                    node->tierDisk->persistentRoot,
+                    node->tierDisk->persistentGeneration,
+                    node->tierDisk->persistentRef,
+                    raw, &error) &&
+                    raw.size() == pageBytes;
+            }
+            std::vector<uint8_t> stored;
+            return GetPagedPrefixCacheDiskStore().Read(
+                       *node->tierDisk, stored) &&
+                   DecodePagedPrefixTierBytes(
+                       stored,
+                       node->tierDisk->uncompressedBytes,
+                       node->tierDisk->zstdCompressed,
+                       node->tierDisk->checksum,
+                       raw) &&
+                   raw.size() == pageBytes;
+        }
+
+        std::vector<CacheTrieNode*> SortedTrieChildren(
+                CacheTrieNode *node) {
+            std::vector<CacheTrieNode*> children;
+            children.reserve(node->children.size());
+            for (const auto &item : node->children) {
+                children.push_back(item.second);
+            }
+            std::sort(
+                children.begin(), children.end(),
+                [](const CacheTrieNode *left,
+                   const CacheTrieNode *right) {
+                    return left->edgeHash < right->edgeHash;
+                });
+            return children;
+        }
+    }
+
+    bool PagedCacheManager::ExportPersistentRecords(
+            std::vector<PersistentPayloadRecord> &records,
+            uint64_t &pages,
+            std::string *error) {
+        pages = 0;
+        std::lock_guard<std::mutex> guard(
+            this->pageIndexLocker);
+        if (this->trieRoot == nullptr ||
+            this->trieRoot->children.empty()) {
+            return true;
+        }
+        if (this->persistentId < 0 ||
+            this->maxPages <= 0 ||
+            this->pageLen <= 0 ||
+            this->GetBytes() == 0 ||
+            this->GetBytes() % (size_t)this->maxPages != 0) {
+            SetPagedCacheSnapshotError(
+                error,
+                "persistent paged cache manager geometry is invalid");
+            return false;
+        }
+        const size_t pageBytes =
+            this->GetBytes() / (size_t)this->maxPages;
+        if (pageBytes == 0) {
+            SetPagedCacheSnapshotError(
+                error, "persistent paged cache page is empty");
+            return false;
+        }
+
+        struct ExportedNode {
+            uint32_t parent = UINT32_MAX;
+            CacheTrieNode *node = nullptr;
+            std::string payloadName;
+        };
+        struct PendingNode {
+            CacheTrieNode *node = nullptr;
+            uint32_t parent = UINT32_MAX;
+        };
+        std::vector<ExportedNode> exported;
+        std::vector<PersistentPayloadRecord> localRecords;
+        std::vector<PendingNode> pending;
+        std::vector<CacheTrieNode*> rootChildren =
+            SortedTrieChildren(this->trieRoot);
+        for (auto it = rootChildren.rbegin();
+             it != rootChildren.rend(); ++it) {
+            pending.push_back({*it, UINT32_MAX});
+        }
+        while (!pending.empty()) {
+            PendingNode current = pending.back();
+            pending.pop_back();
+            if ((int)current.node->edgeTokens.size() !=
+                    this->pageLen ||
+                HashTokenPage(
+                    current.node->edgeTokens.data(),
+                    this->pageLen) != current.node->edgeHash) {
+                SetPagedCacheSnapshotError(
+                    error,
+                    "persistent paged cache trie edge is invalid");
+                return false;
+            }
+            std::vector<uint8_t> raw;
+            if (!ReadPagedTrieNodeForCheckpoint(
+                    this, current.node, pageBytes, raw)) {
+                SetPagedCacheSnapshotError(
+                    error,
+                    "persistent paged cache page cannot be captured");
+                return false;
+            }
+            const uint32_t index = (uint32_t)exported.size();
+            if (index >= PERSISTENT_TRIE_MAX_NODES) {
+                SetPagedCacheSnapshotError(
+                    error,
+                    "persistent paged cache trie exceeds node limit");
+                return false;
+            }
+            const std::string payloadName =
+                "manager/" + std::to_string(this->persistentId) +
+                "/page/" + std::to_string(index);
+            PersistentPayloadRecord page;
+            page.kind =
+                PersistentPayloadKind::PAGED_CACHE_PAGE;
+            page.name = payloadName;
+            page.dataType = (uint32_t)this->dataType;
+            for (size_t dimension = 1;
+                 dimension < this->dims.size(); dimension++) {
+                page.dimensions.push_back(
+                    this->dims[dimension]);
+            }
+            page.bytes = std::move(raw);
+            localRecords.push_back(std::move(page));
+            exported.push_back(
+                {current.parent, current.node, payloadName});
+
+            std::vector<CacheTrieNode*> children =
+                SortedTrieChildren(current.node);
+            for (auto it = children.rbegin();
+                 it != children.rend(); ++it) {
+                pending.push_back({*it, index});
+            }
+        }
+
+        PersistentTrieWriter writer;
+        writer.Raw(
+            PERSISTENT_TRIE_MAGIC,
+            sizeof(PERSISTENT_TRIE_MAGIC));
+        writer.U32(PERSISTENT_TRIE_VERSION);
+        writer.U32((uint32_t)this->persistentId);
+        writer.U32((uint32_t)this->type);
+        writer.U32((uint32_t)this->pageLen);
+        writer.U32((uint32_t)this->maxPages);
+        writer.U32((uint32_t)this->dataType);
+        writer.U32((uint32_t)this->dims.size());
+        for (int dimension : this->dims) {
+            writer.U64((uint64_t)(int64_t)dimension);
+        }
+        writer.U32((uint32_t)exported.size());
+        for (const ExportedNode &item : exported) {
+            writer.U32(item.parent);
+            writer.U64(item.node->edgeHash);
+            writer.U64(item.node->accessCount);
+            writer.U64((uint64_t)std::max<long long>(
+                0, item.node->lastAccessTimestamp));
+            writer.U32((uint32_t)item.node->depthPages);
+            writer.U32(
+                (uint32_t)item.node->maxPrefixDepthPages);
+            writer.U32(
+                (uint32_t)item.node->edgeTokens.size());
+            for (int token : item.node->edgeTokens) {
+                writer.U32((uint32_t)token);
+            }
+            if (!writer.String(item.payloadName)) {
+                SetPagedCacheSnapshotError(
+                    error,
+                    "persistent paged cache trie exceeds byte limit");
+                return false;
+            }
+        }
+        if (writer.bytes.size() > PERSISTENT_TRIE_MAX_BYTES) {
+            SetPagedCacheSnapshotError(
+                error,
+                "persistent paged cache trie exceeds byte limit");
+            return false;
+        }
+        PersistentPayloadRecord trie;
+        trie.kind =
+            PersistentPayloadKind::PAGED_CACHE_TRIE;
+        trie.name =
+            "manager/" + std::to_string(this->persistentId) +
+            "/trie";
+        trie.dataType = (uint32_t)this->dataType;
+        for (int dimension : this->dims) {
+            trie.dimensions.push_back(dimension);
+        }
+        trie.bytes = std::move(writer.bytes);
+        records.push_back(std::move(trie));
+        records.insert(
+            records.end(),
+            std::make_move_iterator(localRecords.begin()),
+            std::make_move_iterator(localRecords.end()));
+        pages = exported.size();
+        return true;
+    }
+
+    bool PagedCacheManager::ImportPersistentRecords(
+            const std::filesystem::path &root,
+            uint64_t generation,
+            const std::vector<uint8_t> &trieBytes,
+            const std::vector<PersistentPayloadRef> &refs,
+            std::string *error) {
+        if (root.empty() || generation == 0 ||
+            trieBytes.size() > PERSISTENT_TRIE_MAX_BYTES) {
+            SetPagedCacheSnapshotError(
+                error,
+                "persistent paged cache trie input is invalid");
+            return false;
+        }
+        PersistentTrieReader reader(
+            trieBytes.data(), trieBytes.size());
+        const uint8_t *magic = nullptr;
+        uint32_t version = 0;
+        uint32_t managerId = 0;
+        uint32_t managerType = 0;
+        uint32_t savedPageLen = 0;
+        uint32_t savedMaxPages = 0;
+        uint32_t savedDataType = 0;
+        uint32_t dimensionCount = 0;
+        if (!reader.Raw(
+                magic, sizeof(PERSISTENT_TRIE_MAGIC)) ||
+            std::memcmp(
+                magic, PERSISTENT_TRIE_MAGIC,
+                sizeof(PERSISTENT_TRIE_MAGIC)) != 0 ||
+            !reader.U32(version) ||
+            version != PERSISTENT_TRIE_VERSION ||
+            !reader.U32(managerId) ||
+            !reader.U32(managerType) ||
+            !reader.U32(savedPageLen) ||
+            !reader.U32(savedMaxPages) ||
+            !reader.U32(savedDataType) ||
+            !reader.U32(dimensionCount) ||
+            dimensionCount > 64) {
+            SetPagedCacheSnapshotError(
+                error,
+                "persistent paged cache trie header is invalid");
+            return false;
+        }
+        std::vector<int> savedDimensions;
+        savedDimensions.reserve(dimensionCount);
+        for (uint32_t i = 0; i < dimensionCount; i++) {
+            uint64_t dimension = 0;
+            if (!reader.U64(dimension) ||
+                dimension > (uint64_t)INT_MAX) {
+                SetPagedCacheSnapshotError(
+                    error,
+                    "persistent paged cache dimensions are invalid");
+                return false;
+            }
+            savedDimensions.push_back((int)dimension);
+        }
+        if (managerId != (uint32_t)this->persistentId ||
+            managerType != (uint32_t)this->type ||
+            savedPageLen != (uint32_t)this->pageLen ||
+            savedMaxPages != (uint32_t)this->maxPages ||
+            savedDataType != (uint32_t)this->dataType ||
+            savedDimensions != this->dims ||
+            this->maxPages <= 0 ||
+            this->GetBytes() % (size_t)this->maxPages != 0) {
+            SetPagedCacheSnapshotError(
+                error,
+                "persistent paged cache geometry mismatch");
+            return false;
+        }
+        const size_t pageBytes =
+            this->GetBytes() / (size_t)this->maxPages;
+        std::vector<int64_t> pageDimensions;
+        for (size_t i = 1; i < this->dims.size(); i++) {
+            pageDimensions.push_back(this->dims[i]);
+        }
+        std::unordered_map<
+            std::string, const PersistentPayloadRef*> pageRefs;
+        for (const PersistentPayloadRef &ref : refs) {
+            if (ref.kind ==
+                PersistentPayloadKind::PAGED_CACHE_PAGE) {
+                pageRefs.emplace(ref.name, &ref);
+            }
+        }
+
+        uint32_t nodeCount = 0;
+        if (!reader.U32(nodeCount) ||
+            nodeCount > PERSISTENT_TRIE_MAX_NODES) {
+            SetPagedCacheSnapshotError(
+                error,
+                "persistent paged cache trie node count is invalid");
+            return false;
+        }
+        std::unique_ptr<CacheTrieNode> newRoot(
+            new CacheTrieNode());
+        std::vector<std::unique_ptr<CacheTrieNode> > nodes;
+        nodes.reserve(nodeCount);
+        long long maxTimestamp = 0;
+        for (uint32_t i = 0; i < nodeCount; i++) {
+            uint32_t parent = 0;
+            uint64_t edgeHash = 0;
+            uint64_t accessCount = 0;
+            uint64_t lastAccess = 0;
+            uint32_t depthPages = 0;
+            uint32_t maxPrefixDepthPages = 0;
+            uint32_t tokenCount = 0;
+            if (!reader.U32(parent) ||
+                !reader.U64(edgeHash) ||
+                !reader.U64(accessCount) ||
+                !reader.U64(lastAccess) ||
+                lastAccess > (uint64_t)LLONG_MAX ||
+                !reader.U32(depthPages) ||
+                !reader.U32(maxPrefixDepthPages) ||
+                !reader.U32(tokenCount) ||
+                tokenCount != (uint32_t)this->pageLen) {
+                SetPagedCacheSnapshotError(
+                    error,
+                    "persistent paged cache trie node is invalid");
+                return false;
+            }
+            std::vector<int> tokens(tokenCount);
+            for (uint32_t token = 0;
+                 token < tokenCount; token++) {
+                uint32_t value = 0;
+                if (!reader.U32(value)) {
+                    SetPagedCacheSnapshotError(
+                        error,
+                        "persistent paged cache tokens are truncated");
+                    return false;
+                }
+                tokens[token] = (int32_t)value;
+            }
+            std::string payloadName;
+            if (!reader.String(payloadName) ||
+                payloadName.empty() ||
+                HashTokenPage(
+                    tokens.data(), tokens.size()) != edgeHash ||
+                maxPrefixDepthPages < depthPages) {
+                SetPagedCacheSnapshotError(
+                    error,
+                    "persistent paged cache trie edge is invalid");
+                return false;
+            }
+            CacheTrieNode *parentNode = nullptr;
+            if (parent == UINT32_MAX) {
+                if (depthPages != 1) {
+                    SetPagedCacheSnapshotError(
+                        error,
+                        "persistent paged cache root depth is invalid");
+                    return false;
+                }
+                parentNode = newRoot.get();
+            } else if (parent < i &&
+                       parent < nodes.size() &&
+                       depthPages ==
+                           (uint32_t)nodes[parent]->depthPages + 1) {
+                parentNode = nodes[parent].get();
+            } else {
+                SetPagedCacheSnapshotError(
+                    error,
+                    "persistent paged cache parent is invalid");
+                return false;
+            }
+            auto ref = pageRefs.find(payloadName);
+            if (ref == pageRefs.end() ||
+                ref->second->dataType !=
+                    (uint32_t)this->dataType ||
+                ref->second->dimensions != pageDimensions ||
+                ref->second->uncompressedBytes != pageBytes) {
+                SetPagedCacheSnapshotError(
+                    error,
+                    "persistent paged cache page reference is incompatible");
+                return false;
+            }
+            if (parentNode->children.count(edgeHash) != 0) {
+                SetPagedCacheSnapshotError(
+                    error,
+                    "persistent paged cache trie edge is duplicated");
+                return false;
+            }
+            std::unique_ptr<CacheTrieNode> node(
+                new CacheTrieNode());
+            node->pageId = -1;
+            node->timestamp = 0;
+            node->accessCount = accessCount;
+            node->lastAccessTimestamp =
+                (long long)lastAccess;
+            node->depthPages = (int)depthPages;
+            node->maxPrefixDepthPages =
+                (int)maxPrefixDepthPages;
+            node->parent = parentNode;
+            node->edgeHash = edgeHash;
+            node->edgeTokens = std::move(tokens);
+            std::shared_ptr<PagedPrefixCacheTierDiskRef> disk(
+                new PagedPrefixCacheTierDiskRef());
+            disk->offset = ref->second->fileOffset;
+            disk->storedBytes =
+                (size_t)ref->second->storedBytes;
+            disk->uncompressedBytes =
+                (size_t)ref->second->uncompressedBytes;
+            disk->zstdCompressed =
+                ref->second->zstdCompressed;
+            disk->checksum = ref->second->checksum;
+            disk->persistentArchive = true;
+            disk->persistentRoot = root.string();
+            disk->persistentGeneration = generation;
+            disk->persistentRef = *ref->second;
+            node->tierDisk = std::move(disk);
+            parentNode->children[edgeHash] = node.get();
+            maxTimestamp = std::max(
+                maxTimestamp, node->lastAccessTimestamp);
+            nodes.push_back(std::move(node));
+        }
+        if (reader.Remaining() != 0) {
+            SetPagedCacheSnapshotError(
+                error,
+                "persistent paged cache trie has trailing bytes");
+            return false;
+        }
+
+        std::lock_guard<std::mutex> guard(
+            this->pageIndexLocker);
+        if (std::any_of(
+                this->pageRefCount.begin(),
+                this->pageRefCount.end(),
+                [](int refs) { return refs != 0; })) {
+            SetPagedCacheSnapshotError(
+                error,
+                "persistent paged cache manager is active");
+            return false;
+        }
+        if (this->trieRoot != nullptr) {
+            for (auto &item : this->trieRoot->children) {
+                EvictTrieSubtree(item.second);
+            }
+            delete this->trieRoot;
+        }
+        this->trieRoot = newRoot.release();
+        for (auto &node : nodes) {
+            node.release();
+        }
+        this->pageToTrieNode.clear();
+        this->triePages.clear();
+        this->triePagesSet.clear();
+        this->freePages.clear();
+        this->freePagesSet.clear();
+        this->freePages.reserve(this->maxPages);
+        this->freePagesSet.reserve(this->maxPages);
+        for (int page = 0; page < this->maxPages; page++) {
+            this->freePages.push_back(page);
+            this->freePagesSet.insert(page);
+        }
+        std::fill(
+            this->pageTimestamp.begin(),
+            this->pageTimestamp.end(), 0);
+        std::fill(
+            this->pageRefCount.begin(),
+            this->pageRefCount.end(), 0);
+        this->currentTimestamp = maxTimestamp;
+        return true;
     }
 
     PagedCacheManager::~PagedCacheManager() {
@@ -7231,6 +7936,9 @@ namespace fastllm {
         size_t uncompressedBytes = 0;
         bool zstdCompressed = false;
         uint64_t checksum = 0;
+        const bool persistentRestore =
+            node->tierDisk != nullptr &&
+            node->tierDisk->persistentArchive;
         if (node->tierPayload != nullptr) {
             storedBytes = &node->tierPayload->bytes;
             uncompressedBytes =
@@ -7255,17 +7963,36 @@ namespace fastllm {
                     true)) {
                 return false;
             }
-            uncompressedBytes =
-                node->tierDisk->uncompressedBytes;
-            zstdCompressed =
-                node->tierDisk->zstdCompressed;
-            checksum = node->tierDisk->checksum;
-            if (!GetPagedPrefixCacheDiskStore().Read(
-                    *node->tierDisk,
-                    diskStoredBytes)) {
-                ReleasePagedPrefixCacheDiskReference(
-                    node->tierDisk);
-                return false;
+            if (node->tierDisk->persistentArchive) {
+                std::string persistentError;
+                if (!ReadPersistentPrefixCachePayload(
+                        node->tierDisk->persistentRoot,
+                        node->tierDisk->persistentGeneration,
+                        node->tierDisk->persistentRef,
+                        diskStoredBytes,
+                        &persistentError)) {
+                    ReleasePagedPrefixCacheDiskReference(
+                        node->tierDisk);
+                    return false;
+                }
+                uncompressedBytes = diskStoredBytes.size();
+                zstdCompressed = false;
+                checksum = PrefixCacheTierChecksum(
+                    diskStoredBytes.data(),
+                    diskStoredBytes.size());
+            } else {
+                uncompressedBytes =
+                    node->tierDisk->uncompressedBytes;
+                zstdCompressed =
+                    node->tierDisk->zstdCompressed;
+                checksum = node->tierDisk->checksum;
+                if (!GetPagedPrefixCacheDiskStore().Read(
+                        *node->tierDisk,
+                        diskStoredBytes)) {
+                    ReleasePagedPrefixCacheDiskReference(
+                        node->tierDisk);
+                    return false;
+                }
             }
             storedBytes = &diskStoredBytes;
         }
@@ -7395,6 +8122,9 @@ namespace fastllm {
         node->timestamp = ++this->currentTimestamp;
         this->pageTimestamp[pageIndex] = node->timestamp;
         this->pageToTrieNode[pageIndex] = node;
+        if (persistentRestore) {
+            persistent_prefix_cache_internal::ObserveRestoreHit();
+        }
         return true;
     }
 

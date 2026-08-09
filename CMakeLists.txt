@@ -674,6 +674,10 @@ if (UNIT_TEST)
         target_compile_options(testDeepSeekV4RouteSeam PRIVATE -UNDEBUG)
         target_compile_options(testDeepSeekV4DsparkHybridLoader PRIVATE -UNDEBUG)
     endif()
+    add_executable(testCheckpointControl
+        test/apiserver/checkpointControlTest.cpp)
+    target_include_directories(testCheckpointControl PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
 
     if (USE_CUDA AND NOT USE_ROCM)
         add_executable(cudaGraphPoolMissRegression test/ops/cudaGraphPoolMissRegression.cpp)
