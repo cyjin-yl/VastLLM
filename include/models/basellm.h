@@ -466,6 +466,7 @@ namespace fastllm {
         // KV-cache calibration so its actual pool footprint is observable.
         virtual void WarmupCudaServingHighWaterBuffers() {}
 
+
         // Some serving resources (notably CUDA Graph objects) retain pointers
         // into the paged KV cache and therefore cannot be materialized by the
         // ordinary pre-calibration warmup.  Models may opt into a two-stage

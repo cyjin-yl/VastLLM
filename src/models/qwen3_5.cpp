@@ -6105,6 +6105,17 @@ namespace fastllm {
                         for (int b = 0; b < batch; b++) {
                             auto updatePageMeta = [](Data *cache, PagedCacheManager *mgr) {
                                 if (cache->pageIndex.empty() || cache->lastPageLen >= cache->pageLen) {
+                                    // 懒分配页池：物理页不足时先扩容再取页。
+                                    if (mgr->FreePageCount() <= 0) {
+                                        int grown = std::min(
+                                            mgr->maxPages,
+                                            std::max(128, mgr->dims[0] * 2));
+                                        if (grown <= mgr->dims[0]) {
+                                            ErrorInFastLLM(
+                                                "Qwen3.5 decode: paged KV pool exhausted at budget.");
+                                        }
+                                        mgr->Grow(grown);
+                                    }
                                     cache->pageIndex.push_back(mgr->GetUnusedPageIndex(true));
                                     cache->lastPageLen = 1;
                                 } else {
@@ -8363,7 +8374,6 @@ namespace fastllm {
 #endif
     }
 
-
     void Qwen3_5Model::SetKVCacheDataType(DataType dataType) {
         if (dataType != DataType::TURBO3_KV) {
             basellm::SetKVCacheDataType(dataType);
@@ -8591,13 +8601,13 @@ namespace fastllm {
             std::lock_guard<std::mutex> guard(mtpCacheMutex);
             auto mtpIt = mtpCaches.find(context);
             if (mtpIt == mtpCaches.end() ||
-                mtpIt->second.tokens != currentLen ||
-                mtpIt->second.key.dims.size() < 2 ||
-                mtpIt->second.value.dims.size() < 2 ||
-                mtpIt->second.key.dims[1] != currentLen ||
-                mtpIt->second.value.dims[1] != currentLen ||
-                !Qwen35SnapshotCopyTensor(mtpIt->second.key, snapshot->mtpKey) ||
-                !Qwen35SnapshotCopyTensor(mtpIt->second.value, snapshot->mtpValue)) {
+                mtpIt->second->tokens != currentLen ||
+                mtpIt->second->key.dims.size() < 2 ||
+                mtpIt->second->value.dims.size() < 2 ||
+                mtpIt->second->key.dims[1] != currentLen ||
+                mtpIt->second->value.dims[1] != currentLen ||
+                !Qwen35SnapshotCopyTensor(mtpIt->second->key, snapshot->mtpKey) ||
+                !Qwen35SnapshotCopyTensor(mtpIt->second->value, snapshot->mtpValue)) {
                 return false;
             }
             snapshot->mtpValid = true;
@@ -8850,7 +8860,7 @@ namespace fastllm {
                 }
                 std::lock_guard<std::mutex> mtpGuard(mtpCacheMutex);
                 mtpCaches.erase(context);
-                MtpKvCache &mtpCache = mtpCaches[context];
+                MtpKvCache &mtpCache = GetMtpCache(context);
                 if (!Qwen35RestoreMtpSnapshotTensor(
                         snapshot->mtpKey, mtpCache.key, devices[0]) ||
                     !Qwen35RestoreMtpSnapshotTensor(
@@ -8936,6 +8946,15 @@ namespace fastllm {
                 context, error)) {
             return false;
         }
+        // 多模态（图像/视频）请求不挂起到 CPU：视觉特征与 paged KV 的
+        // 交换开销大，且实测 swap 恢复与多模态 prefill 交互会长时间卡住
+        // （img+long 组合 800s+ 未完成）。多模态请求保持 GPU 常驻。
+        if (!context->multimodalInput.empty()) {
+            if (error != nullptr) {
+                *error = "multimodal requests are not suspended to CPU";
+            }
+            return false;
+        }
         const bool preserveMtp =
             RequiresMtpPrefixSnapshot(context) &&
             (!context->longPrefill.inProgress ||
@@ -8950,13 +8969,13 @@ namespace fastllm {
             auto it = mtpCaches.find(
                 const_cast<ResponseContext*>(context));
             if (it == mtpCaches.end() ||
-                it->second.tokens <= 0 ||
+                it->second->tokens <= 0 ||
                 (expectedMtpTokens >= 0 &&
-                 it->second.tokens != expectedMtpTokens) ||
-                it->second.key.dims.size() < 2 ||
-                it->second.value.dims.size() < 2 ||
-                it->second.key.dims[1] != it->second.tokens ||
-                it->second.value.dims[1] != it->second.tokens) {
+                 it->second->tokens != expectedMtpTokens) ||
+                it->second->key.dims.size() < 2 ||
+                it->second->value.dims.size() < 2 ||
+                it->second->key.dims[1] != it->second->tokens ||
+                it->second->value.dims[1] != it->second->tokens) {
                 if (error != nullptr) {
                     *error =
                         "Qwen3.5 MTP cache is not at a suspend boundary";
@@ -8996,24 +9015,24 @@ namespace fastllm {
                         context->longPrefill.cursor :
                     -1;
             if (it == mtpCaches.end() ||
-                it->second.tokens <= 0 ||
+                it->second->tokens <= 0 ||
                 (expectedMtpTokens >= 0 &&
-                 it->second.tokens != expectedMtpTokens) ||
-                it->second.key.dims.size() < 2 ||
-                it->second.value.dims.size() < 2 ||
-                it->second.key.dims[1] != it->second.tokens ||
-                it->second.value.dims[1] != it->second.tokens ||
+                 it->second->tokens != expectedMtpTokens) ||
+                it->second->key.dims.size() < 2 ||
+                it->second->value.dims.size() < 2 ||
+                it->second->key.dims[1] != it->second->tokens ||
+                it->second->value.dims[1] != it->second->tokens ||
                 !Qwen35SnapshotCopyTensor(
-                    it->second.key, prepared->mtpKey) ||
+                    it->second->key, prepared->mtpKey) ||
                 !Qwen35SnapshotCopyTensor(
-                    it->second.value, prepared->mtpValue)) {
+                    it->second->value, prepared->mtpValue)) {
                 if (error != nullptr) {
                     *error =
                         "Qwen3.5 MTP cache snapshot is incomplete";
                 }
                 return false;
             }
-            prepared->mtpTokens = it->second.tokens;
+            prepared->mtpTokens = it->second->tokens;
         }
         prepared->mtpValid = true;
         hostBytes += (size_t)prepared->mtpKey.GetBytes();
@@ -9062,7 +9081,7 @@ namespace fastllm {
         }
         std::lock_guard<std::mutex> guard(mtpCacheMutex);
         mtpCaches.erase(context);
-        MtpKvCache &mtpCache = mtpCaches[context];
+        MtpKvCache &mtpCache = GetMtpCache(context);
         if (!Qwen35RestoreMtpSnapshotTensor(
                 qwenState->mtpKey, mtpCache.key, devices[0]) ||
             !Qwen35RestoreMtpSnapshotTensor(
@@ -15052,7 +15071,7 @@ namespace fastllm {
         }
 
         std::lock_guard<std::mutex> mtpCacheGuard(mtpCacheMutex);
-        MtpKvCache &mtpCache = mtpCaches[context];
+        MtpKvCache &mtpCache = GetMtpCache(context);
         if (context->cacheLen > 0 && mtpCache.tokens == 0) {
             logMtpSkip("prefix cache hit without MTP cache");
             return false;
@@ -15388,6 +15407,15 @@ namespace fastllm {
                 }
                 int oldPage = dst.pageIndex.back();
                 manager = dst.pagedKVCacheData;
+                // 懒分配页池：物理页不足时先扩容再取页。
+                if (manager->FreePageCount() <= 0) {
+                    int grown = std::min(
+                        manager->maxPages,
+                        std::max(128, manager->dims[0] * 2));
+                    if (grown > manager->dims[0]) {
+                        manager->Grow(grown);
+                    }
+                }
                 newPage = manager->GetUnusedPageIndex(true);
                 copyPagedCachePage(dst, oldPage, newPage);
                 dst.pageIndex.back() = newPage;
@@ -15504,7 +15532,7 @@ namespace fastllm {
             PagedCacheManager *manager = cache->pagedKVCacheData;
             if (manager->type != PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE ||
                 manager->pageLen != cache->pageLen || manager->maxPages <= 0 ||
-                manager->dims.size() != 4 || manager->dims[0] != manager->maxPages ||
+                manager->dims.size() != 4 ||
                 manager->dims[1] != cache->pageLen ||
                 manager->dims[2] != expectedHeads || manager->dims[3] != head_dim) {
                 return false;
@@ -17468,14 +17496,14 @@ namespace fastllm {
             int expectedMtpTokens = contexts[b]->cacheLen +
                 contexts[b]->preTokens - seqLens[b];
             if (cacheIt == mtpCaches.end() || expectedMtpTokens <= 0 ||
-                cacheIt->second.tokens != expectedMtpTokens ||
-                cacheIt->second.key.dims.size() < 2 ||
-                cacheIt->second.value.dims.size() < 2 ||
-                cacheIt->second.key.dims[1] != expectedMtpTokens ||
-                cacheIt->second.value.dims[1] != expectedMtpTokens) {
+                cacheIt->second->tokens != expectedMtpTokens ||
+                cacheIt->second->key.dims.size() < 2 ||
+                cacheIt->second->value.dims.size() < 2 ||
+                cacheIt->second->key.dims[1] != expectedMtpTokens ||
+                cacheIt->second->value.dims[1] != expectedMtpTokens) {
                 return false;
             }
-            requestMtpCaches[b] = &cacheIt->second;
+            requestMtpCaches[b] = cacheIt->second.get();
         }
 
         std::vector<uint8_t> attentionLayerMask(block_cnt, 0);
@@ -18707,7 +18735,7 @@ namespace fastllm {
                 PagedCacheManager *manager = cache->pagedKVCacheData;
                 if (manager->type != PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE ||
                     manager->pageLen != cache->pageLen || manager->maxPages <= 0 ||
-                    manager->dims.size() != 4 || manager->dims[0] != manager->maxPages ||
+                    manager->dims.size() != 4 ||
                     manager->dims[1] != cache->pageLen ||
                     manager->dims[2] != expectedHeads ||
                     manager->dims[3] != model->head_dim) {
@@ -18919,15 +18947,28 @@ namespace fastllm {
                 if (needIt != needs.end()) need = needIt->second;
                 auto reservationIt = reserved.find(manager);
                 if (reservationIt != reserved.end()) reservation = reservationIt->second;
-                int freePages = 0;
-                {
-                    std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
-                    freePages = manager->FreePageCount();
-                }
-                if (need < 0 || reservation < 0 ||
-                    (long long)need + reservation > freePages) {
+                if (need < 0 || reservation < 0) {
                     return false;
                 }
+                long long required = (long long)need + reservation;
+                if (required > manager->maxPages) {
+                    // 超出逻辑预算（模型 token 上限对应的页数），拒绝。
+                    return false;
+                }
+                {
+                    std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
+                    if (required <= manager->FreePageCount()) {
+                        continue;
+                    }
+                    // 物理页不足但需求在预算内：懒分配页池按需扩容
+                    // （初始池小，避免全量预留把显存占满）。
+                }
+                int currentFree = manager->FreePageCount();
+                int grown = (int)std::max(
+                    (long long)required,
+                    (long long)std::max(128, currentFree * 2));
+                grown = std::min(grown, manager->maxPages);
+                manager->Grow(grown);
             }
             return true;
         };
@@ -18943,9 +18984,18 @@ namespace fastllm {
                     std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
                     freePages = manager->FreePageCount();
                 }
-                if (freePages < it.second) {
+                if (freePages >= it.second) {
+                    continue;
+                }
+                if (it.second > manager->maxPages) {
+                    // 超出逻辑预算，拒绝。
                     return true;
                 }
+                // 懒分配页池：物理页不足但需求在预算内，按需扩容。
+                int grown = std::max(
+                    it.second, std::max(128, freePages * 2));
+                grown = std::min(grown, manager->maxPages);
+                manager->Grow(grown);
             }
             return false;
         };
@@ -19828,8 +19878,11 @@ namespace fastllm {
                 PagedCacheManager *probeManager = findRuntimePagedManager();
                 if (probeManager != nullptr) {
                     std::lock_guard<std::mutex> guard(probeManager->pageIndexLocker);
-                    busyPages = probeManager->maxPages - probeManager->FreePageCount();
-                    totalPages = probeManager->maxPages;
+                    // 页池懒分配（初始小池、运行期 Grow）：busy 页数基于
+                    // 物理池大小（dims[0]），而非逻辑预算 maxPages。
+                    int physicalPages = probeManager->dims[0];
+                    busyPages = physicalPages - probeManager->FreePageCount();
+                    totalPages = physicalPages;
                     pageLen = probeManager->pageLen;
                     maxTotalLens = totalPages * pageLen;
                     pagesLimit = totalPages * 4 / 5;
@@ -20548,19 +20601,19 @@ namespace fastllm {
                                 mtpSeedFailure = "cache-missing-before-target";
                             } else {
                                 const int keyTokens =
-                                    mtpIt->second.key.dims.size() >= 2 ?
-                                        mtpIt->second.key.dims[1] : -1;
+                                    mtpIt->second->key.dims.size() >= 2 ?
+                                        mtpIt->second->key.dims[1] : -1;
                                 const int valueTokens =
-                                    mtpIt->second.value.dims.size() >= 2 ?
-                                        mtpIt->second.value.dims[1] : -1;
+                                    mtpIt->second->value.dims.size() >= 2 ?
+                                        mtpIt->second->value.dims[1] : -1;
                                 seedMtp =
-                                    mtpIt->second.tokens == expectedTokens &&
+                                    mtpIt->second->tokens == expectedTokens &&
                                     keyTokens == expectedTokens &&
                                     valueTokens == expectedTokens;
                                 if (!seedMtp) {
                                     mtpSeedFailure =
                                         "cache-unaligned-before-target(" +
-                                        std::to_string(mtpIt->second.tokens) +
+                                        std::to_string(mtpIt->second->tokens) +
                                         "/" + std::to_string(keyTokens) +
                                         "/" + std::to_string(valueTokens) +
                                         ")";
@@ -20619,7 +20672,8 @@ namespace fastllm {
                         if (cacheIt == model->mtpCaches.end()) {
                             if (expectedTokens == 0) {
                                 cacheIt = model->mtpCaches.emplace(
-                                    singleContext, MtpKvCache()).first;
+                                    singleContext,
+                                    std::make_unique<MtpKvCache>()).first;
                             } else {
                                 seedMtp = false;
                                 mtpSeedFailure =
@@ -20627,16 +20681,16 @@ namespace fastllm {
                             }
                         }
                         if (seedMtp &&
-                            cacheIt->second.tokens != expectedTokens) {
+                            cacheIt->second->tokens != expectedTokens) {
                             mtpSeedFailure =
                                 "cache-unaligned-before-draft(" +
-                                std::to_string(cacheIt->second.tokens) +
+                                std::to_string(cacheIt->second->tokens) +
                                 ")";
                         }
-                        if (seedMtp && cacheIt->second.tokens == expectedTokens) {
+                        if (seedMtp && cacheIt->second->tokens == expectedTokens) {
                             try {
                                 firstDraft = model->RunMtpGreedyDraft(
-                                    mtpDevices[0], mtpDevices, cacheIt->second,
+                                    mtpDevices[0], mtpDevices, *cacheIt->second,
                                     model->speculativeHiddenStates,
                                     mtpInputTokens, *positionIds[0],
                                     (int)mtpInputTokens.size() - 1,
@@ -20648,21 +20702,21 @@ namespace fastllm {
                             }
                             int newTokens = expectedTokens +
                                 selectedLongPrefillQuantum.length;
-                            mtpSeeded = cacheIt->second.tokens == newTokens &&
-                                cacheIt->second.key.dims.size() >= 2 &&
-                                cacheIt->second.value.dims.size() >= 2 &&
-                                cacheIt->second.key.dims[1] == newTokens &&
-                                cacheIt->second.value.dims[1] == newTokens;
+                            mtpSeeded = cacheIt->second->tokens == newTokens &&
+                                cacheIt->second->key.dims.size() >= 2 &&
+                                cacheIt->second->value.dims.size() >= 2 &&
+                                cacheIt->second->key.dims[1] == newTokens &&
+                                cacheIt->second->value.dims[1] == newTokens;
                             if (!mtpSeeded) {
                                 const int keyTokens =
-                                    cacheIt->second.key.dims.size() >= 2 ?
-                                        cacheIt->second.key.dims[1] : -1;
+                                    cacheIt->second->key.dims.size() >= 2 ?
+                                        cacheIt->second->key.dims[1] : -1;
                                 const int valueTokens =
-                                    cacheIt->second.value.dims.size() >= 2 ?
-                                        cacheIt->second.value.dims[1] : -1;
+                                    cacheIt->second->value.dims.size() >= 2 ?
+                                        cacheIt->second->value.dims[1] : -1;
                                 mtpSeedFailure =
                                     "cache-unaligned-after-draft(" +
-                                    std::to_string(cacheIt->second.tokens) +
+                                    std::to_string(cacheIt->second->tokens) +
                                     "/" + std::to_string(keyTokens) +
                                     "/" + std::to_string(valueTokens) +
                                     ")";
@@ -20769,11 +20823,11 @@ namespace fastllm {
                                 auto mtpIt = model->mtpCaches.find(singleContext);
                                 seedLongPrefillMtp =
                                     mtpIt != model->mtpCaches.end() &&
-                                    mtpIt->second.tokens == longPrefillMtpBaseTokens &&
-                                    mtpIt->second.key.dims.size() >= 2 &&
-                                    mtpIt->second.value.dims.size() >= 2 &&
-                                    mtpIt->second.key.dims[1] == longPrefillMtpBaseTokens &&
-                                    mtpIt->second.value.dims[1] == longPrefillMtpBaseTokens;
+                                    mtpIt->second->tokens == longPrefillMtpBaseTokens &&
+                                    mtpIt->second->key.dims.size() >= 2 &&
+                                    mtpIt->second->value.dims.size() >= 2 &&
+                                    mtpIt->second->key.dims[1] == longPrefillMtpBaseTokens &&
+                                    mtpIt->second->value.dims[1] == longPrefillMtpBaseTokens;
                             }
                         }
                         auto eraseLongPrefillMtpCache = [&]() {
@@ -20793,9 +20847,10 @@ namespace fastllm {
                                         return false;
                                     }
                                     cacheIt = model->mtpCaches.emplace(
-                                        singleContext, MtpKvCache()).first;
+                                        singleContext,
+                                        std::make_unique<MtpKvCache>()).first;
                                 }
-                                MtpKvCache &cache = cacheIt->second;
+                                MtpKvCache &cache = *cacheIt->second;
                                 if (cache.tokens != expectedTokens) {
                                     model->mtpCaches.erase(cacheIt);
                                     return false;
@@ -21537,6 +21592,8 @@ namespace fastllm {
                rope_type = RoPEType::LINEAR_SCALE;
             else if (type == "dynamic")
                rope_type = RoPEType::DYMAMIC_NTK;
+            else if (type == "yarn")
+               rope_type = RoPEType::YARN;
         }
         std::string ropeTheta = getDictValue(
             "rope_theta",
@@ -21547,6 +21604,63 @@ namespace fastllm {
         }
         if (this->weight.dicts.find("rope_scaling.factor") != this->weight.dicts.end()) {
             rope_factor = atof(this->weight.dicts["rope_scaling.factor"].c_str());
+        }
+        // YaRN 参数：GGUF rope_scaling.* 优先，FASTLLM_QWEN35_YARN=1 时强制启用
+        //（FASTLLM_QWEN35_YARN_FACTOR 等可覆盖各参数）
+        const char *yarnEnv = std::getenv("FASTLLM_QWEN35_YARN");
+        if (yarnEnv != nullptr && Qwen35MoeIsTrueString(yarnEnv)) {
+            rope_type = RoPEType::YARN;
+        }
+        auto yarnValue = [&](const char *dictKey, const char *envKey, float fallback) -> float {
+            if (this->weight.dicts.find(dictKey) != this->weight.dicts.end()) {
+                return (float)atof(this->weight.dicts[dictKey].c_str());
+            }
+            const char *env = std::getenv(envKey);
+            if (env != nullptr && env[0] != 0) {
+                return (float)atof(env);
+            }
+            return fallback;
+        };
+        if (rope_type == RoPEType::YARN) {
+            rope_yarn_factor = yarnValue(
+                "rope_scaling.yarn_factor", "FASTLLM_QWEN35_YARN_FACTOR",
+                rope_yarn_factor);
+            rope_yarn_attention_factor = yarnValue(
+                "rope_scaling.yarn_attention_factor",
+                "FASTLLM_QWEN35_YARN_ATTENTION_FACTOR",
+                rope_yarn_attention_factor);
+            rope_yarn_beta_fast = yarnValue(
+                "rope_scaling.yarn_beta_fast", "FASTLLM_QWEN35_YARN_BETA_FAST",
+                rope_yarn_beta_fast);
+            rope_yarn_beta_slow = yarnValue(
+                "rope_scaling.yarn_beta_slow", "FASTLLM_QWEN35_YARN_BETA_SLOW",
+                rope_yarn_beta_slow);
+            rope_yarn_original_max_position = yarnValue(
+                "rope_scaling.original_max_position_embeddings",
+                "FASTLLM_QWEN35_YARN_ORIGINAL_MAX",
+                (float)std::max(1, max_positions));
+            // 预计算 correction 区间（与 YarnRopeEncoding 相同公式）
+            auto findCorrectionDim = [&](float rotations) -> float {
+                return (float)((double)rotary_dim *
+                    std::log((double)rope_yarn_original_max_position /
+                        ((double)rotations * 2.0 * (double)M_PI))) /
+                       (2.0 * std::log((double)std::max(rope_base, 1e-6f)));
+            };
+            rope_yarn_correction_low = std::max(
+                0.0f, std::floor(findCorrectionDim(rope_yarn_beta_fast)));
+            rope_yarn_correction_high = std::min(
+                (float)rotary_dim - 1.0f,
+                std::ceil(findCorrectionDim(rope_yarn_beta_slow)));
+            if (rope_yarn_correction_low == rope_yarn_correction_high) {
+                rope_yarn_correction_high += 0.001f;
+            }
+            printf("[Qwen3.5] YaRN enabled: factor=%.3f attention=%.3f "
+                   "beta=%.1f/%.1f original_max=%.0f correction=[%.1f, %.1f]\n",
+                   rope_yarn_factor, rope_yarn_attention_factor,
+                   rope_yarn_beta_fast, rope_yarn_beta_slow,
+                   rope_yarn_original_max_position,
+                   rope_yarn_correction_low, rope_yarn_correction_high);
+            fflush(stdout);
         }
         mrope_sections = {11, 11, 10};
         std::string mropeSection = getDictValue(
@@ -23256,6 +23370,23 @@ namespace fastllm {
     }
 
     void Qwen3_5Model::ApplyMultimodalRotary(Data &input, const Data &positionIds, float ropeScale) {
+        if (rope_type == RoPEType::YARN) {
+            if (positionIds.dims.size() == 2 && positionIds.dims[0] == 3) {
+                fastllm::Qwen35InterleavedRope(
+                    input, positionIds, rotary_dim,
+                    mrope_sections[0], mrope_sections[1], mrope_sections[2],
+                    rope_base, ropeScale,
+                    1, rope_yarn_factor, rope_yarn_attention_factor,
+                    rope_yarn_correction_low, rope_yarn_correction_high);
+            } else {
+                fastllm::YarnRopeEncoding(
+                    input, positionIds, rotary_dim, rope_base,
+                    rope_yarn_factor, rope_yarn_original_max_position,
+                    rope_yarn_beta_fast, rope_yarn_beta_slow,
+                    rope_yarn_attention_factor);
+            }
+            return;
+        }
         if (positionIds.dims.size() == 2 && positionIds.dims[0] == 3) {
             fastllm::Qwen35InterleavedRope(
                 input, positionIds, rotary_dim,

@@ -97,6 +97,8 @@ namespace fastllm {
     bool GetCudaEmbeddingRequested();
     void SetCudaSlabMB(int mb);
     int GetCudaSlabMB();
+    // 释放 CUDA 内存池中所有空闲缓冲区，把显存归还给驱动；无 CUDA 构建为 no-op。
+    void ReleaseCudaIdlePoolMemory();
     int GetThreads();
     bool GetKVCacheInCPU();
     bool GetHistoryCacheInCPU();
@@ -721,11 +723,20 @@ namespace fastllm {
             // 每个页面的引用计数
             std::vector<int> pageRefCount;
 
+            // 页池增长时退役的旧 GPU 缓冲。运行期不立即释放（并发拷贝/引用
+            // 可能仍在使用旧指针，立即 cudaFree 会导致 use-after-free，
+            // cudaMemcpy 报 cudaErrorInvalidValue），统一在析构时释放。
+            std::vector<void*> retiredCudaData;
+
             // Trie树缓存管理
             CacheTrieNode *trieRoot = nullptr;
             std::unordered_map<int, CacheTrieNode*> pageToTrieNode;
 
             void SetMaxPages(int maxPages);
+            // 按需扩大页池：分配更大的底层缓冲区、拷贝旧页并释放旧缓冲，
+            // 物理页号保持不变（pageIndex 无需迁移），新页加入空闲池。
+            // 与 SetMaxPages 不同，Grow 保留已用页的引用/Trie 状态。
+            void Grow(int newMaxPages);
             int GetUnusedPageIndex(bool pick);
             void EvictTrieSubtree(CacheTrieNode *node);
             int GetUnusedPageIndexLocked(
@@ -1398,7 +1409,11 @@ namespace fastllm {
 
     void Qwen35InterleavedRope(Data &input, const Data &positionIds, int rotaryDim,
                                int sectionT, int sectionH, int sectionW,
-                               float ropeTheta, float ropeScale); // Qwen3.5 interleaved MRoPE
+                               float ropeTheta, float ropeScale,
+                               int useYarn = 0, float yarnFactor = 2.0f,
+                               float yarnAttentionFactor = 1.0f,
+                               float yarnCorrectionLow = 0.0f,
+                               float yarnCorrectionHigh = 1.0f); // Qwen3.5 interleaved MRoPE (可选 YaRN)
 
     // 在 qkv 拼接张量上融合执行 RMSNorm + RoPE（仅对 q 和 k 部分），v 不处理
     void QKVRMSNormRope(Data &qkv, Data &qNormWeight, Data &kNormWeight,

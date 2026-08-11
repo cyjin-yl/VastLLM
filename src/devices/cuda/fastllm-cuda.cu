@@ -2573,7 +2573,9 @@ __global__ void FastllmLlama3RopeEncodingKernel(__nv_bfloat16 *data, float *posi
 
 __global__ void FastllmQwen35InterleavedRopeKernel(float *data, float *positionIds,
                                                    int len, int spatial, int n, int m, int positionStride, int rotateDim,
-                                                   int sectionH, int sectionW, float ropeTheta, float ropeScale) {
+                                                   int sectionH, int sectionW, float ropeTheta, float ropeScale,
+                                                   int useYarn, float yarnFactor, float yarnAttentionFactor,
+                                                   float yarnCorrectionLow, float yarnCorrectionHigh) {
     int o = (blockIdx.x / n);
     int l = o % len;
     int j = threadIdx.x;
@@ -2584,10 +2586,22 @@ __global__ void FastllmQwen35InterleavedRopeKernel(float *data, float *positionI
     } else if (j % 3 == 2 && j < sectionW * 3) {
         row = 2;
     }
-    float position = positionIds[row * positionStride + l] / ropeScale;
-    float freq = position / powf(ropeTheta, (float)(2 * j) / rotateDim);
+    float position = positionIds[row * positionStride + l];
+    float invFreq = 1.0f / powf(ropeTheta, (float)(2 * j) / rotateDim);
+    float freq;
+    if (useYarn) {
+        invFreq = FastllmYarnInvFreq(j, rotateDim, ropeTheta,
+                                     yarnFactor, yarnCorrectionLow, yarnCorrectionHigh);
+        freq = position * invFreq;
+    } else {
+        freq = (position / ropeScale) * invFreq;
+    }
     float curSin = sinf(freq);
     float curCos = cosf(freq);
+    if (useYarn) {
+        curSin *= yarnAttentionFactor;
+        curCos *= yarnAttentionFactor;
+    }
     float *d = (float *) data + o * spatial + j;
     int i = blockIdx.x % n;
     float va = d[i * m], vb = d[i * m + half];
@@ -2597,7 +2611,9 @@ __global__ void FastllmQwen35InterleavedRopeKernel(float *data, float *positionI
 
 __global__ void FastllmQwen35InterleavedRopeKernel(half *data, float *positionIds,
                                                    int len, int spatial, int n, int m, int positionStride, int rotateDim,
-                                                   int sectionH, int sectionW, float ropeTheta, float ropeScale) {
+                                                   int sectionH, int sectionW, float ropeTheta, float ropeScale,
+                                                   int useYarn, float yarnFactor, float yarnAttentionFactor,
+                                                   float yarnCorrectionLow, float yarnCorrectionHigh) {
     int o = (blockIdx.x / n);
     int l = o % len;
     int j = threadIdx.x;
@@ -2608,10 +2624,22 @@ __global__ void FastllmQwen35InterleavedRopeKernel(half *data, float *positionId
     } else if (j % 3 == 2 && j < sectionW * 3) {
         row = 2;
     }
-    float position = positionIds[row * positionStride + l] / ropeScale;
-    float freq = position / powf(ropeTheta, (float)(2 * j) / rotateDim);
+    float position = positionIds[row * positionStride + l];
+    float invFreq = 1.0f / powf(ropeTheta, (float)(2 * j) / rotateDim);
+    float freq;
+    if (useYarn) {
+        invFreq = FastllmYarnInvFreq(j, rotateDim, ropeTheta,
+                                     yarnFactor, yarnCorrectionLow, yarnCorrectionHigh);
+        freq = position * invFreq;
+    } else {
+        freq = (position / ropeScale) * invFreq;
+    }
     float curSin = sinf(freq);
     float curCos = cosf(freq);
+    if (useYarn) {
+        curSin *= yarnAttentionFactor;
+        curCos *= yarnAttentionFactor;
+    }
     half *d = (half *) data + o * spatial + j;
     int i = blockIdx.x % n;
     float va = __half2float(d[i * m]), vb = __half2float(d[i * m + half_dim]);
@@ -2621,7 +2649,9 @@ __global__ void FastllmQwen35InterleavedRopeKernel(half *data, float *positionId
 
 __global__ void FastllmQwen35InterleavedRopeKernel(__nv_bfloat16 *data, float *positionIds,
                                                    int len, int spatial, int n, int m, int positionStride, int rotateDim,
-                                                   int sectionH, int sectionW, float ropeTheta, float ropeScale) {
+                                                   int sectionH, int sectionW, float ropeTheta, float ropeScale,
+                                                   int useYarn, float yarnFactor, float yarnAttentionFactor,
+                                                   float yarnCorrectionLow, float yarnCorrectionHigh) {
     int o = (blockIdx.x / n);
     int l = o % len;
     int j = threadIdx.x;
@@ -2632,10 +2662,22 @@ __global__ void FastllmQwen35InterleavedRopeKernel(__nv_bfloat16 *data, float *p
     } else if (j % 3 == 2 && j < sectionW * 3) {
         row = 2;
     }
-    float position = positionIds[row * positionStride + l] / ropeScale;
-    float freq = position / powf(ropeTheta, (float)(2 * j) / rotateDim);
+    float position = positionIds[row * positionStride + l];
+    float invFreq = 1.0f / powf(ropeTheta, (float)(2 * j) / rotateDim);
+    float freq;
+    if (useYarn) {
+        invFreq = FastllmYarnInvFreq(j, rotateDim, ropeTheta,
+                                     yarnFactor, yarnCorrectionLow, yarnCorrectionHigh);
+        freq = position * invFreq;
+    } else {
+        freq = (position / ropeScale) * invFreq;
+    }
     float curSin = sinf(freq);
     float curCos = cosf(freq);
+    if (useYarn) {
+        curSin *= yarnAttentionFactor;
+        curCos *= yarnAttentionFactor;
+    }
     __nv_bfloat16 *d = (__nv_bfloat16 *) data + o * spatial + j;
     int i = blockIdx.x % n;
     float va = __bfloat162float(d[i * m]), vb = __bfloat162float(d[i * m + half_dim]);
@@ -4033,6 +4075,56 @@ static size_t FastllmCudaReleaseIdleBigBuffersLocked(int id, std::vector<CudaMem
     }
     bigBuffers.swap(keep);
     return released;
+}
+
+// 释放内存池中所有空闲（无使用者）的 CUDA 缓冲区，把显存真正归还给驱动。
+// 仅供模型级 suspend（/admin/suspend）在确认无在途请求后调用；运行期正常
+// 路径不会调用本函数。跳过的条件与 FastllmCudaForceFree 一致：busy 缓冲区、
+// CUDA Graph 引脚/保护中的缓冲区、以及尚未满足延迟复用事件的缓冲区。
+void FastllmCudaReleaseIdlePoolMemory() {
+    std::vector<FastllmCudaMemPoolView> views =
+        FastllmSnapshotCudaMemPoolViews();
+    for (auto &view : views) {
+        std::lock_guard<std::mutex> lock(*view.lock);
+        if (fastllmCudaNcclActive.load(std::memory_order_relaxed)) {
+            cudaDeviceSynchronize();
+        }
+        cudaError_t setState = cudaSetDevice(view.device);
+        if (cudaSuccess != setState) {
+            continue;
+        }
+        auto releaseIdle = [&](std::vector<CudaMemoryBuffer> &buffers) {
+            std::vector<CudaMemoryBuffer> keep;
+            keep.reserve(buffers.size());
+            for (auto &buffer : buffers) {
+                if (buffer.busy || buffer.graphPins > 0 ||
+                    FastllmCudaGraphPoolPointerProtectedLocked(buffer.data) ||
+                    !FastllmCudaBufferReadyForReuseLocked(buffer)) {
+                    keep.push_back(buffer);
+                    continue;
+                }
+                FastllmCudaDestroyReuseEventLocked(buffer);
+                cudaError_t state = cudaFree(buffer.data);
+                if (cudaSuccess != state) {
+                    printf("Error: CUDA error when releasing idle pooled memory on device %d!",
+                           view.device);
+                    checkCudaErrors("", state);
+                    keep.push_back(buffer);
+                }
+            }
+            buffers.swap(keep);
+        };
+        releaseIdle(*view.bigBuffers);
+        releaseIdle(*view.smallBuffers);
+        *view.noBusy = 0;
+        *view.minId = (int)view.smallBuffers->size();
+        for (int i = 0; i < (int)view.smallBuffers->size(); i++) {
+            if (!(*view.smallBuffers)[i].busy) {
+                *view.noBusy += (*view.smallBuffers)[i].size;
+                *view.minId = std::min(*view.minId, i);
+            }
+        }
+    }
 }
 
 static cudaError_t FastllmCudaCheckedMallocWithIdlePoolRetry(
@@ -5485,6 +5577,25 @@ void FastllmCudaHostUnregister(void *ptr) {
     }
 }
 
+static void FastllmCudaDumpPointerRange(const char *tag, const void *ptr) {
+    if (ptr == nullptr) {
+        fprintf(stderr, "[FastllmCudaCopy] %s ptr=%p NULL\n", tag, ptr);
+        return;
+    }
+    CUdeviceptr base = 0;
+    size_t allocation = 0;
+    CUresult rangeState = cuMemGetAddressRange(
+        &base, &allocation, (CUdeviceptr)ptr);
+    if (rangeState == CUDA_SUCCESS && base != 0) {
+        fprintf(stderr, "[FastllmCudaCopy] %s ptr=%p base=%p size=%zu\n",
+                tag, ptr, (void*)base, allocation);
+    } else {
+        fprintf(stderr,
+                "[FastllmCudaCopy] %s ptr=%p INVALID (err=%d)\n",
+                tag, ptr, (int)rangeState);
+    }
+}
+
 void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size) {
     if (size == 0 || dst == src) {
         return;
@@ -5495,11 +5606,25 @@ void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size) {
     checkCudaErrors("Error: CUDA error when checking CUDA graph capture status!", state);
     if (captureStatus != cudaStreamCaptureStatusNone) {
         state = cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        if (state != cudaSuccess) {
+            fprintf(stderr,
+                    "[FastllmCudaCopy] async D2D copy failed (%s) size=%zu\n",
+                    cudaGetErrorString(state), size);
+            FastllmCudaDumpPointerRange("dst", dst);
+            FastllmCudaDumpPointerRange("src", src);
+        }
         checkCudaErrors("Error: CUDA error when async copy on GPU!", state);
         return;
     }
 
     state = cudaMemcpy(dst, src, size, cudaMemcpyDeviceToDevice);
+    if (state != cudaSuccess) {
+        fprintf(stderr,
+                "[FastllmCudaCopy] D2D copy failed (%s) size=%zu\n",
+                cudaGetErrorString(state), size);
+        FastllmCudaDumpPointerRange("dst", dst);
+        FastllmCudaDumpPointerRange("src", src);
+    }
     checkCudaErrors("Error: CUDA error when copy on GPU!", state);
     //cudaDeviceSynchronize();
 }
@@ -13409,7 +13534,11 @@ bool FastllmCudaLlama3RopeEncoding(fastllm::Data &data, const fastllm::Data &pos
 
 bool FastllmCudaQwen35InterleavedRope(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim,
                                       int sectionT, int sectionH, int sectionW,
-                                      float ropeTheta, float ropeScale) {
+                                      float ropeTheta, float ropeScale,
+                                      int useYarn, float yarnFactor,
+                                      float yarnAttentionFactor,
+                                      float yarnCorrectionLow,
+                                      float yarnCorrectionHigh) {
     fastllm::AssertInFastLLM(data.dims.size() == 4, "Qwen3.5 interleaved RoPE expects [batch, seq, heads, dim] input.");
     fastllm::AssertInFastLLM(data.dims[0] == 1, "Qwen3.5 interleaved RoPE currently supports batch size 1 only.");
     fastllm::AssertInFastLLM(positionIds.dims.size() == 2 && positionIds.dims[0] == 3,
@@ -13430,15 +13559,21 @@ bool FastllmCudaQwen35InterleavedRope(fastllm::Data &data, const fastllm::Data &
     if (data.dataType == fastllm::DataType::FLOAT32) {
         FastllmQwen35InterleavedRopeKernel <<< outer * n, halfDim >>> (
             cudaData, cudaPositionIds, len, spatial, n, m, positionStride,
-            rotaryDim, sectionH, sectionW, ropeTheta, ropeScale);
+            rotaryDim, sectionH, sectionW, ropeTheta, ropeScale,
+            useYarn, yarnFactor, yarnAttentionFactor,
+            yarnCorrectionLow, yarnCorrectionHigh);
     } else if (data.dataType == fastllm::DataType::FLOAT16) {
         FastllmQwen35InterleavedRopeKernel <<< outer * n, halfDim >>> (
             (half*) cudaData, cudaPositionIds, len, spatial, n, m, positionStride,
-            rotaryDim, sectionH, sectionW, ropeTheta, ropeScale);
+            rotaryDim, sectionH, sectionW, ropeTheta, ropeScale,
+            useYarn, yarnFactor, yarnAttentionFactor,
+            yarnCorrectionLow, yarnCorrectionHigh);
     } else if (data.dataType == fastllm::DataType::BFLOAT16) {
         FastllmQwen35InterleavedRopeKernel <<< outer * n, halfDim >>> (
             (__nv_bfloat16*) cudaData, cudaPositionIds, len, spatial, n, m, positionStride,
-            rotaryDim, sectionH, sectionW, ropeTheta, ropeScale);
+            rotaryDim, sectionH, sectionW, ropeTheta, ropeScale,
+            useYarn, yarnFactor, yarnAttentionFactor,
+            yarnCorrectionLow, yarnCorrectionHigh);
     }
     FastllmCudaFinishInput(positionIds, cudaPositionIds);
     FastllmCudaFinishOutput(data, cudaData);

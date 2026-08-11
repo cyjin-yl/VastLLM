@@ -252,6 +252,7 @@ namespace fastllm {
 
         virtual void WarmupCudaServingHighWaterBuffers() override;
 
+
         virtual bool MaterializeCudaServingForFinalKvCalibration() override;
 
         virtual void ResetCudaServingForKvCacheResize() override;
@@ -361,6 +362,16 @@ namespace fastllm {
 
         float rope_factor = 1.f;
 
+        // YaRN rope scaling（超过原生上下文的扩展）。GGUF rope_scaling.type=yarn
+        // 或 FASTLLM_QWEN35_YARN=1 启用；correction_low/high 在 InitParams 预计算。
+        float rope_yarn_factor = 2.0f;
+        float rope_yarn_attention_factor = 1.0f;
+        float rope_yarn_beta_fast = 32.0f;
+        float rope_yarn_beta_slow = 1.0f;
+        float rope_yarn_original_max_position = 262144.0f;
+        float rope_yarn_correction_low = 0.0f;
+        float rope_yarn_correction_high = 1.0f;
+
         int num_key_value_heads = num_attention_heads;
 
         float rms_norm_eps = 1e-6;
@@ -378,6 +389,16 @@ namespace fastllm {
             Data key;
             Data value;
             int tokens = 0;
+            MtpKvCache() = default;
+            // Data 是浅拷贝（裸指针共享），MtpKvCache 的拷贝会导致
+            // unordered_map rehash/erase 时 double-free（同一 cudaData
+            // 析构多次），进而释放的地址被 cudaMalloc 复用给 paged KV 池，
+            // 表现为 Grow 时 "old pool already freed"。禁拷贝，map 存
+            // unique_ptr（移动安全）。
+            MtpKvCache(const MtpKvCache &) = delete;
+            MtpKvCache &operator=(const MtpKvCache &) = delete;
+            MtpKvCache(MtpKvCache &&) = default;
+            MtpKvCache &operator=(MtpKvCache &&) = default;
         };
         bool mtpWeightsPrepared = false;
         bool mtpSharedWeightsPrepared = false;
@@ -395,8 +416,18 @@ namespace fastllm {
         std::vector<std::vector<int> > speculativeLinearCaptureMask;
         std::vector<std::pair<Data, Data> > speculativeFirstTokenLinearStates;
         std::vector<int> speculativeFirstTokenLinearCaptureMask;
-        mutable std::unordered_map<ResponseContext*, MtpKvCache> mtpCaches;
+        mutable std::unordered_map<ResponseContext*, std::unique_ptr<MtpKvCache> > mtpCaches;
         mutable std::mutex mtpCacheMutex;
+
+        // mtpCaches 的值是 unique_ptr（MtpKvCache 禁拷贝：Data 浅拷贝在
+        // map rehash/erase 时 double-free）。调用者须已持有 mtpCacheMutex。
+        MtpKvCache &GetMtpCache(ResponseContext *context) const {
+            auto &ptr = mtpCaches[context];
+            if (!ptr) {
+                ptr = std::make_unique<MtpKvCache>();
+            }
+            return *ptr;
+        }
         std::atomic<bool> mtpLogPrinted{false};
         std::atomic<bool> mtpSkipLogPrinted{false};
         std::atomic<long long> mtpValidationCount{0};

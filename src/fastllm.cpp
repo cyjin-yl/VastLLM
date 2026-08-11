@@ -445,6 +445,12 @@ namespace fastllm {
         return cudaSlabMB;
     }
 
+    void ReleaseCudaIdlePoolMemory() {
+#ifdef USE_CUDA
+        FastllmCudaReleaseIdlePoolMemory();
+#endif
+    }
+
     void SetCudaSharedExpert(bool v) {
         cudaSharedExpert = v;
     }
@@ -4765,11 +4771,18 @@ namespace fastllm {
 
     void Qwen35InterleavedRope(Data &input, const Data &positionIds, int rotaryDim,
                                int sectionT, int sectionH, int sectionW,
-                               float ropeTheta, float ropeScale) {
+                               float ropeTheta, float ropeScale,
+                               int useYarn, float yarnFactor,
+                               float yarnAttentionFactor,
+                               float yarnCorrectionLow,
+                               float yarnCorrectionHigh) {
         curExecutor->Run("Qwen35InterleavedRope", {
                 {"input", &input}, {"positionIds", (Data*)&positionIds}
-        }, {{"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}},
-        {{"rotaryDim", rotaryDim}, {"sectionT", sectionT}, {"sectionH", sectionH}, {"sectionW", sectionW}});
+        }, {{"ropeTheta", ropeTheta}, {"ropeScale", ropeScale},
+            {"yarnFactor", yarnFactor}, {"yarnAttentionFactor", yarnAttentionFactor},
+            {"yarnCorrectionLow", yarnCorrectionLow}, {"yarnCorrectionHigh", yarnCorrectionHigh}},
+        {{"rotaryDim", rotaryDim}, {"sectionT", sectionT}, {"sectionH", sectionH}, {"sectionW", sectionW},
+         {"useYarn", useYarn}});
     }
 
     void QKVRMSNormRope(Data &qkv, Data &qNormWeight, Data &kNormWeight,
@@ -5029,19 +5042,27 @@ namespace fastllm {
             }
         }
 
+        // 懒分配页池：maxPages 作为逻辑预算（scheduler 预留检查、页不足时
+        // Grow 的上限），物理初始池只分配少量页，页数不足时运行期按需增长。
+        // 若按 maxPages 全量预留，V100 上 240K 上下文的 paged KV 池合计约
+        // 7 GB，会叠加在模型加载峰值上导致图像 prefill 运行期 CUDA OOM。
+        const int initialPages = std::max(1, std::min(128, maxPages));
+
         // 初始化 pagedKVCacheData
         ((Data*)manager)->directMemory = true;
         ((Data*)manager)->ToDevice(cacheData.dataDevice, cacheData.dataDeviceIds, false);
 
-        // Resize manager: [maxPages, pageLen, numHeads, headDim]
-        ((Data*)manager)->Resize({maxPages, pageLen, numHeads, headDim});
+        // Resize manager: [initialPages, pageLen, numHeads, headDim]
+        ((Data*)manager)->Resize({initialPages, pageLen, numHeads, headDim});
         if (!metadataOnlyMultiCudaRoot) {
             ((Data*)manager)->Allocate();
         }
 
-        // 初始化 pageLen 和 unusedPageIndex
+        // 初始化 pageLen 和 unusedPageIndex（物理页 = initialPages）
         manager->pageLen = pageLen;
-        manager->SetMaxPages(maxPages);
+        manager->SetMaxPages(initialPages);
+        // 逻辑预算（预留检查/增长上限）保持全量；物理页由 Grow 按需扩容。
+        manager->maxPages = maxPages;
 
         // 记录到静态 map 中
         {
@@ -5182,7 +5203,6 @@ namespace fastllm {
 
         PagedCacheManager *manager = cache.pagedKVCacheData;
         if (manager->maxPages <= 0 || manager->dims.size() != 4 ||
-            manager->dims[0] != manager->maxPages ||
             manager->pageLen != cache.pageLen ||
             manager->dataType != cache.dataType) {
             SetPagedCacheSnapshotError(
@@ -5858,14 +5878,24 @@ namespace fastllm {
         PagedCacheManager *manager = part.manager;
         if (manager == nullptr || manager->maxPages <= 0 ||
             manager->dims.size() != 4 ||
-            manager->dims[0] != manager->maxPages ||
             manager->pageLen != part.metadata.pageLen ||
             manager->dataType != part.metadata.dataType ||
-            manager->GetBytes() % (uint64_t)manager->maxPages != 0 ||
-            manager->GetBytes() / (uint64_t)manager->maxPages !=
+            manager->GetBytes() % (uint64_t)std::max(1, manager->dims[0]) != 0 ||
+            manager->GetBytes() / (uint64_t)std::max(1, manager->dims[0]) !=
                 part.pageBytes) {
             SetPagedCacheSnapshotError(
                 error, "paged CPU snapshot no longer matches its manager");
+            return false;
+        }
+        // 页池懒分配（初始小池、按需 Grow）：恢复需要更多页时先扩容，
+        // 但不超过逻辑预算。
+        if (manager->dims[0] < part.pageCount) {
+            manager->Grow(
+                std::min(manager->maxPages, (int)part.pageCount));
+        }
+        if (manager->dims[0] < part.pageCount) {
+            SetPagedCacheSnapshotError(
+                error, "paged cache restore exceeds manager page budget");
             return false;
         }
 
@@ -7536,6 +7566,14 @@ namespace fastllm {
 
     PagedCacheManager::~PagedCacheManager() {
         std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+#ifdef USE_CUDA
+        for (void *ptr : this->retiredCudaData) {
+            if (ptr != nullptr) {
+                FastllmCudaDirectFree(ptr);
+            }
+        }
+        this->retiredCudaData.clear();
+#endif
         if (this->trieRoot != nullptr) {
             for (auto &item : this->trieRoot->children) {
                 EvictTrieSubtree(item.second);
@@ -7543,6 +7581,67 @@ namespace fastllm {
             this->trieRoot->children.clear();
             delete this->trieRoot;
             this->trieRoot = nullptr;
+        }
+    }
+
+    void PagedCacheManager::Grow(int newMaxPages) {
+        // 全程持锁：并发 Grow 或取页时，旧池释放与内容拷贝必须串行，
+        // 否则第二个拷贝会读已释放的 cudaData（cudaErrorInvalidValue）。
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        const int oldPhysicalPages = this->dims[0];
+        if (newMaxPages <= oldPhysicalPages) {
+            return;
+        }
+#ifdef USE_CUDA
+        // 页池运行期增长：cudaStreamPerThread 上的在途写入先同步，保证旧页
+        // 内容完整后再拷贝；物理页号不变，已用页引用与 Trie 状态原样保留。
+        FastllmCudaSyncCurrentThreadStream();
+        size_t oldElements =
+            (size_t)oldPhysicalPages * this->pageLen *
+            this->dims[2] * this->dims[3];
+        size_t newElements =
+            (size_t)newMaxPages * this->pageLen *
+            this->dims[2] * this->dims[3];
+        size_t oldBytes = oldElements * this->unitSize;
+        size_t newBytes = newElements * this->unitSize;
+        uint8_t *newData = (uint8_t*)FastllmCudaDirectMalloc(newBytes);
+        if (newData == nullptr) {
+            ErrorInFastLLM(
+                "PagedCacheManager::Grow: failed to allocate larger page pool.");
+        }
+        if (this->cudaData != nullptr && oldBytes > 0) {
+            int deviceId = FastllmCudaGetDevice();
+            if (FastllmCudaValidatePointerRange(
+                    this->cudaData, oldBytes, deviceId)) {
+                FastllmCudaCopyFromDeviceToDevice(
+                    newData, this->cudaData, oldBytes);
+                // 退役旧池：不立即释放（并发拷贝/引用可能仍持有旧指针），
+                // 由析构统一 cudaFree。页池增长次数少，滞留量可接受。
+                this->retiredCudaData.push_back(this->cudaData);
+            } else {
+                // 旧池在运行期已被外部释放：无法拷贝旧页，新池清零避免
+                // 未初始化数据触发后续崩溃；旧指针不入 retired 列表。
+                FastllmCudaMemset0(newData, oldBytes);
+            }
+        }
+        this->cudaData = newData;
+#endif
+        this->dims[0] = newMaxPages;
+        // 逻辑预算只扩不缩；新增物理页追加到空闲池（页号连续）。
+        if (newMaxPages > this->maxPages) {
+            this->maxPages = newMaxPages;
+        }
+        this->freePages.reserve(newMaxPages);
+        this->freePagesSet.reserve(newMaxPages);
+        for (int i = oldPhysicalPages; i < newMaxPages; i++) {
+            this->freePages.push_back(i);
+            this->freePagesSet.insert(i);
+        }
+        if ((int)this->pageTimestamp.size() < newMaxPages) {
+            this->pageTimestamp.resize(newMaxPages, 0);
+        }
+        if ((int)this->pageRefCount.size() < newMaxPages) {
+            this->pageRefCount.resize(newMaxPages, 0);
         }
     }
 
@@ -7608,9 +7707,33 @@ namespace fastllm {
     }
 
     int PagedCacheManager::GetUnusedPageIndex(bool pick) {
-        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
-        const int pageIndex =
-            GetUnusedPageIndexLocked(pick, nullptr);
+        int pageIndex;
+        {
+            std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+            pageIndex = GetUnusedPageIndexLocked(pick, nullptr);
+        }
+        if (pageIndex < 0) {
+            fprintf(stderr,
+                    "[PagedCache] GetUnusedPageIndex no page: dims0=%d maxPages=%d free=%d trie=%d\n",
+                    this->dims[0], this->maxPages,
+                    (int)this->freePages.size(), (int)this->triePages.size());
+            // 懒分配页池兜底：无可用页且逻辑预算未用完时扩容后重试。
+            // 所有调用方（decode、MTP 校验 CoW、prefix restore、swap）
+            // 无需各自处理页不足。
+            if (this->maxPages > this->dims[0]) {
+                int grown = std::min(
+                    this->maxPages,
+                    std::max(128, this->dims[0] * 2));
+                if (grown > this->dims[0]) {
+                    fprintf(stderr,
+                            "[PagedCache] Grow fallback: dims0=%d -> %d\n",
+                            this->dims[0], grown);
+                    this->Grow(grown);
+                }
+                std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+                pageIndex = GetUnusedPageIndexLocked(pick, nullptr);
+            }
+        }
         if (pageIndex < 0) {
             ErrorInFastLLM(
                 "PagedCacheManager::GetUnusedPageIndex: "

@@ -2702,9 +2702,18 @@ namespace fastllm {
                     std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
                     freePages = manager->FreePageCount();
                 }
-                if (freePages < it.second) {
+                if (freePages >= it.second) {
+                    continue;
+                }
+                if (it.second > manager->maxPages) {
+                    // 超出逻辑预算，拒绝。
                     return true;
                 }
+                // 懒分配页池：物理页不足但需求在预算内，按需扩容。
+                int grown = std::max(
+                    it.second, std::max(128, freePages * 2));
+                grown = std::min(grown, manager->maxPages);
+                manager->Grow(grown);
             }
             return false;
         };
@@ -3032,8 +3041,10 @@ namespace fastllm {
                 PagedCacheManager *probeManager = findRuntimePagedManager();
                 if (probeManager != nullptr) {
                     std::lock_guard<std::mutex> guard(probeManager->pageIndexLocker);
-                    busyPages = probeManager->maxPages - probeManager->FreePageCount();
-                    totalPages = probeManager->maxPages;
+                    // 页池懒分配（初始小池、运行期 Grow）：busy/total 基于物理池大小。
+                    int physicalPages = probeManager->dims[0];
+                    busyPages = physicalPages - probeManager->FreePageCount();
+                    totalPages = physicalPages;
                     pageLen = probeManager->pageLen;
                     maxTotalLens = totalPages * pageLen;
                     pagesLimit = totalPages * 4 / 5;
@@ -3416,7 +3427,7 @@ namespace fastllm {
                                     }
                                     {
                                         std::lock_guard<std::mutex> guard(probeManager->pageIndexLocker);
-                                        curBusyPages = probeManager->maxPages - probeManager->FreePageCount() + pendingNewPages;
+                                        curBusyPages = probeManager->dims[0] - probeManager->FreePageCount() + pendingNewPages;
                                     }
                                 }
                             }

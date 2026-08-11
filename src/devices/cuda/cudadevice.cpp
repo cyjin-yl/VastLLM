@@ -6772,8 +6772,20 @@ namespace fastllm {
         int sectionW = intParams.find("sectionW") != intParams.end() ? intParams.find("sectionW")->second : 0;
         float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
         float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
+        int useYarn = intParams.find("useYarn") != intParams.end() ? intParams.find("useYarn")->second : 0;
+        float yarnFactor = floatParams.find("yarnFactor") != floatParams.end() ?
+            floatParams.find("yarnFactor")->second : 2.0f;
+        float yarnAttentionFactor = floatParams.find("yarnAttentionFactor") != floatParams.end() ?
+            floatParams.find("yarnAttentionFactor")->second : 1.0f;
+        float yarnCorrectionLow = floatParams.find("yarnCorrectionLow") != floatParams.end() ?
+            floatParams.find("yarnCorrectionLow")->second : 0.0f;
+        float yarnCorrectionHigh = floatParams.find("yarnCorrectionHigh") != floatParams.end() ?
+            floatParams.find("yarnCorrectionHigh")->second : 1.0f;
 
-        FastllmCudaQwen35InterleavedRope(data, positionIds, rotaryDim, sectionT, sectionH, sectionW, ropeTheta, ropeScale);
+        FastllmCudaQwen35InterleavedRope(data, positionIds, rotaryDim, sectionT, sectionH, sectionW,
+                                         ropeTheta, ropeScale,
+                                         useYarn, yarnFactor, yarnAttentionFactor,
+                                         yarnCorrectionLow, yarnCorrectionHigh);
     }
 
     void CudaQKVRMSNormRopeOp::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -8942,13 +8954,17 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         int totalNeededPages = (totalNeededTokens + cache.pageLen - 1) / cache.pageLen;
         int maxPages = cache.pagedKVCacheData->dims[0];
         if (totalNeededPages > maxPages) {
-            ErrorInFastLLM("CudaAppendPagedCacheOp: No more pages available. Need to resize pagedKVCacheData. "
-                           "seqLen = " + std::to_string(seqLen) +
-                           ", currentUsedTokens = " + std::to_string(currentUsedTokens) +
-                           ", pageLen = " + std::to_string(cache.pageLen) +
-                           ", currentPages = " + std::to_string((int)cache.pageIndex.size()) +
-                           ", totalNeededPages = " + std::to_string(totalNeededPages) +
-                           ", maxPages = " + std::to_string(maxPages) + ".\n");
+            // 页池按需增长：初始池按小容量创建（避免全量预留把显存占满导致
+            // 图像 prefill 运行期 OOM），页数不足时翻倍扩容并保留旧页内容。
+            // 物理页号不变，pageIndex 无需迁移。
+            PagedCacheManager *pagedManager =
+                (PagedCacheManager*)cache.pagedKVCacheData;
+            int grownMaxPages = std::min(
+                pagedManager->maxPages,
+                std::max(totalNeededPages,
+                         std::max(128, maxPages * 2)));
+            pagedManager->Grow(grownMaxPages);
+            maxPages = grownMaxPages;
         }
 
         if (cache.dims.size() == 0) {
@@ -9016,9 +9032,35 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 pagedData, appendPages.data(), (int)appendPages.size(),
                 firstPageOffset, pageLen, numHeads, headDim,
                 pagedKVCache->dataType, inputData, input.dataType, seqLen);
-            AssertInFastLLM(
-                launched,
-                "CudaAppendPagedCacheOp failed to launch multi-page copy.\n");
+            if (!launched) {
+                // 多页批量拷贝失败（并发 Grow 竞态等）时降级到逐页复制，
+                // 避免直接 abort 中断整个服务。
+                printf("[PagedCache] multi-page copy failed, "
+                       "falling back to per-page copy (%d pages).\n",
+                       (int)appendPages.size());
+                fflush(stdout);
+                int firstPageCapacity = pageLen - firstPageOffset;
+                for (int pi = 0; pi < (int)appendPages.size(); pi++) {
+                    int pageStartToken = pi == 0 ? 0 :
+                        firstPageCapacity + (pi - 1) * pageLen;
+                    int remaining = seqLen - pageStartToken;
+                    if (remaining <= 0) {
+                        break;
+                    }
+                    int pageOffset = pi == 0 ? firstPageOffset : 0;
+                    int len = std::min(pageLen - pageOffset, remaining);
+                    bool ok = FastllmCudaPackedKVCacheCopy(
+                        pagedData, appendPages[pi], pageLen, numHeads, headDim,
+                        pagedKVCache->dataType, inputData, input.dataType,
+                        seqLen, pageStartToken, len, pageOffset);
+                    if (!ok) {
+                        printf("[PagedCache] per-page copy failed on page %d\n",
+                               pi);
+                        fflush(stdout);
+                        break;
+                    }
+                }
+            }
             return;
         }
         

@@ -224,6 +224,8 @@ void FastllmCudaSetWeightSlabBytes(size_t bytes);
 size_t FastllmCudaGetWeightSlabBytes();
 void *FastllmCudaMallocModelWeight(size_t size, const std::string &name);
 void FastllmCudaMemPoolStats();
+// 释放内存池中所有空闲缓冲区，把显存归还给驱动（模型级 suspend 使用）。
+void FastllmCudaReleaseIdlePoolMemory();
 void * FastllmCudaDirectMalloc(size_t size);
 void FastllmCudaDirectFree(void *ret);
 void FastllmCudaMemset0(void *ret, size_t size);
@@ -1037,7 +1039,11 @@ bool FastllmCudaYarnRopeEncoding(fastllm::Data &data, const fastllm::Data &posit
                                  float correctionLow, float correctionHigh);
 bool FastllmCudaQwen35InterleavedRope(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim,
                                       int sectionT, int sectionH, int sectionW,
-                                      float ropeTheta, float ropeScale);
+                                      float ropeTheta, float ropeScale,
+                                      int useYarn = 0, float yarnFactor = 2.0f,
+                                      float yarnAttentionFactor = 1.0f,
+                                      float yarnCorrectionLow = 0.0f,
+                                      float yarnCorrectionHigh = 1.0f);
 bool FastllmCudaQKVRMSNormRope(fastllm::Data &qkv, fastllm::Data &qNormWeight, fastllm::Data &kNormWeight,
                                 const fastllm::Data &positionIds,
                                 int q_heads, int k_heads, int head_dim,

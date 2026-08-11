@@ -319,13 +319,33 @@ bool LaunchCopy(uint8_t *pagedData, int pageIdx, int pageLen, int numHeads,
                 int headDim, fastllm::DataType dstType, const SrcT *inputData,
                 int seqLen, int inputOffset, int copyLen, int pageOffset) {
     if (headDim != kHeadDim || copyLen <= 0 || inputOffset < 0 ||
-        pageOffset < 0 || pageOffset + copyLen > pageLen) return false;
+        pageOffset < 0 || pageOffset + copyLen > pageLen) {
+        printf("[TurboKV] Copy invalid args: headDim=%d kHeadDim=%d "
+               "copyLen=%d inputOffset=%d pageOffset=%d pageLen=%d "
+               "pageIdx=%d numHeads=%d dstType=%d pagedData=%p inputData=%p "
+               "seqLen=%d\n",
+               headDim, kHeadDim, copyLen, inputOffset, pageOffset, pageLen,
+               pageIdx, numHeads, (int)dstType, pagedData, (const void*)inputData,
+               seqLen);
+        fflush(stdout);
+        return false;
+    }
     int32_t *meta = static_cast<int32_t *>(FastllmCudaMalloc(2 * sizeof(int32_t)));
-    if (meta == nullptr) return false;
+    if (meta == nullptr) {
+        printf("[TurboKV] Copy meta malloc failed: pageIdx=%d copyLen=%d\n",
+               pageIdx, copyLen);
+        fflush(stdout);
+        return false;
+    }
     int32_t host[2] = {pageIdx, pageOffset};
     cudaError_t error = cudaMemcpyAsync(meta, host, sizeof(host), cudaMemcpyHostToDevice,
                                         cudaStreamPerThread);
-    if (error != cudaSuccess) { FastllmCudaFree(meta); cudaGetLastError(); return false; }
+    if (error != cudaSuccess) {
+        printf("[TurboKV] Copy meta H2D error: %d (%s)\n",
+               (int)error, cudaGetErrorString(error));
+        fflush(stdout);
+        FastllmCudaFree(meta); cudaGetLastError(); return false;
+    }
     int rows = numHeads * copyLen;
     PackedKVMultiPageList noMultiPages = {};
     if (dstType == fastllm::DataType::Q8_0_KV) {
@@ -339,10 +359,24 @@ bool LaunchCopy(uint8_t *pagedData, int pageIdx, int pageLen, int numHeads,
             inputData, pagedData, meta, meta + 1, rows, seqLen, pageLen,
             numHeads, headDim, false, inputOffset, noMultiPages, 0, 0);
     } else {
+        printf("[TurboKV] Copy unsupported dstType=%d\n", (int)dstType);
+        fflush(stdout);
         FastllmCudaFree(meta); return false;
     }
     error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        printf("[TurboKV] Copy launch error: %d (%s), pageIdx=%d "
+               "copyLen=%d rows=%d pagedData=%p inputData=%p\n",
+               (int)error, cudaGetErrorString(error),
+               pageIdx, copyLen, rows, pagedData, (const void*)inputData);
+        cudaGetLastError();
+    }
     cudaError_t syncError = cudaStreamSynchronize(cudaStreamPerThread);
+    if (syncError != cudaSuccess) {
+        printf("[TurboKV] Copy sync error: %d (%s)\n",
+               (int)syncError, cudaGetErrorString(syncError));
+        cudaGetLastError();
+    }
     FastllmCudaFree(meta);
     return error == cudaSuccess && syncError == cudaSuccess;
 }
@@ -380,7 +414,15 @@ bool LaunchCopyMultiPage(uint8_t *pagedData, const int *pageIdxHost,
                          const SrcT *inputData, int seqLen) {
     if (headDim != kHeadDim || seqLen <= 0 || pageIdxHost == nullptr ||
         pageCount <= 0 || pageCount > kMaxMultiPageCount ||
-        firstPageOffset < 0 || firstPageOffset >= pageLen) return false;
+        firstPageOffset < 0 || firstPageOffset >= pageLen) {
+        printf("[TurboKV] MultiPageCopy invalid args: headDim=%d kHeadDim=%d "
+               "seqLen=%d pageCount=%d max=%d firstPageOffset=%d pageLen=%d "
+               "pagedData=%p inputData=%p\n",
+               headDim, kHeadDim, seqLen, pageCount, kMaxMultiPageCount,
+               firstPageOffset, pageLen, pagedData, inputData);
+        fflush(stdout);
+        return false;
+    }
     PackedKVMultiPageList multiPages = {};
     for (int i = 0; i < pageCount; i++)
         multiPages.pageIdx[i] = pageIdxHost[i];
@@ -396,10 +438,24 @@ bool LaunchCopyMultiPage(uint8_t *pagedData, const int *pageIdxHost,
             inputData, pagedData, nullptr, nullptr, rows, seqLen, pageLen,
             numHeads, headDim, false, 0, multiPages, pageCount, firstPageOffset);
     } else {
+        printf("[TurboKV] MultiPageCopy unsupported dstType=%d\n", (int)dstType);
+        fflush(stdout);
         return false;
     }
     cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        printf("[TurboKV] MultiPageCopy launch error: %d (%s), "
+               "seqLen=%d pageCount=%d rows=%d pagedData=%p inputData=%p\n",
+               (int)error, cudaGetErrorString(error),
+               seqLen, pageCount, rows, pagedData, inputData);
+        cudaGetLastError();
+    }
     cudaError_t syncError = cudaStreamSynchronize(cudaStreamPerThread);
+    if (syncError != cudaSuccess) {
+        printf("[TurboKV] MultiPageCopy sync error: %d (%s)\n",
+               (int)syncError, cudaGetErrorString(syncError));
+        cudaGetLastError();
+    }
     return error == cudaSuccess && syncError == cudaSuccess;
 }
 
@@ -432,8 +488,13 @@ bool FastllmCudaPackedKVCacheCopyMultiPage(
         int firstPageOffset, int pageLen, int numHeads, int headDim,
         fastllm::DataType dstType, uint8_t *inputData,
         fastllm::DataType srcType, int seqLen) {
-    if (!fastllm::IsPackedKVCacheDataType(dstType) || pagedData == nullptr || inputData == nullptr)
+    if (!fastllm::IsPackedKVCacheDataType(dstType) || pagedData == nullptr || inputData == nullptr) {
+        printf("[TurboKV] MultiPage entry reject: dstType=%d packed=%d pagedData=%p inputData=%p seqLen=%d\n",
+               (int)dstType, (int)fastllm::IsPackedKVCacheDataType(dstType),
+               pagedData, inputData, seqLen);
+        fflush(stdout);
         return false;
+    }
     if (srcType == fastllm::DataType::FLOAT16)
         return LaunchCopyMultiPage(pagedData, pageIdxHost, pageCount, firstPageOffset,
                           pageLen, numHeads, headDim, dstType,
@@ -446,6 +507,9 @@ bool FastllmCudaPackedKVCacheCopyMultiPage(
         return LaunchCopyMultiPage(pagedData, pageIdxHost, pageCount, firstPageOffset,
                           pageLen, numHeads, headDim, dstType,
                           reinterpret_cast<const float *>(inputData), seqLen);
+    printf("[TurboKV] MultiPage unsupported srcType=%d seqLen=%d\n",
+           (int)srcType, seqLen);
+    fflush(stdout);
     return false;
 }
 

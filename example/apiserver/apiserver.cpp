@@ -381,7 +381,13 @@ struct WorkQueue {
     bool checkpointInProgress = false;
     bool stopping = false;
     std::atomic<uint64_t> cacheMutationEpoch {0};
+    std::atomic<bool> pagedManagersPreallocated {false};
     std::atomic<uint64_t> checkpointedMutationEpoch {0};
+    // 模型级 suspend/resume：suspend 释放全部 GPU 内存（进程常驻），
+    // resume 从 GGUF + 磁盘前缀缓存重建模型。执行期间禁止派发新请求。
+    std::atomic<bool> suspended {false};
+    std::atomic<bool> suspendInProgress {false};
+    std::atomic<bool> resumeInProgress {false};
 
     void Push(char *buffer, int client) {
         locker.lock();
@@ -426,6 +432,8 @@ struct WorkQueue {
                 ts->cv.wait(lock, [ts]() {
                     const bool canDispatch =
                         !ts->checkpointInProgress &&
+                        !ts->suspendInProgress &&
+                        !ts->resumeInProgress &&
                         ts->activateQueryNumber <
                             ts->maxActivateQueryNumber &&
                         !ts->q.empty();
@@ -442,6 +450,8 @@ struct WorkQueue {
                     return;
                 }
                 while (!ts->checkpointInProgress &&
+                       !ts->suspendInProgress &&
+                       !ts->resumeInProgress &&
                        ts->activateQueryNumber <
                            ts->maxActivateQueryNumber &&
                        !ts->q.empty()) {
@@ -511,6 +521,238 @@ struct WorkQueue {
                                 "invalid_request_error", "method_not_allowed"),
                 {{"Allow", allowed}});
         };
+        // 从请求头读取 Bearer 控制令牌（与 checkpoint 端点一致）。
+        auto readControlAuthorization = [&]() -> std::string {
+            std::string authorization;
+            for (const auto &header : req->headers) {
+                if (HttpHeaderNameEquals(
+                        header.first, "Authorization")) {
+                    authorization =
+                        TrimHttpHeaderValue(header.second);
+                    break;
+                }
+            }
+            const char *configured = std::getenv(
+                "FASTLLM_PREFIX_CACHE_CONTROL_TOKEN");
+            const std::string expectedToken =
+                configured == nullptr ? std::string() :
+                    std::string(configured);
+            const std::string bearerPrefix = "Bearer ";
+            if (expectedToken.empty() ||
+                authorization.size() <= bearerPrefix.size() ||
+                authorization.compare(0, bearerPrefix.size(),
+                                      bearerPrefix) != 0) {
+                return std::string();
+            }
+            const std::string presented =
+                authorization.substr(bearerPrefix.size());
+            if (!fastllm::apiserver::ConstantTimeCheckpointTokenEqual(
+                    presented, expectedToken)) {
+                return std::string();
+            }
+            return presented;
+        };
+
+        // suspend 后模型对象被释放，除 resume/health/suspend 外的路由一律 503，
+        // 防止对空模型解引用。
+        if (suspended.load(std::memory_order_acquire) &&
+            route != "/admin/resume" &&
+            route != "/admin/suspend" &&
+            route != "/health") {
+            writeJsonAndClose(
+                503,
+                OpenAIHttpError(
+                    "backend is suspended; call POST /admin/resume",
+                    "server_error", "backend_suspended"));
+            return;
+        }
+
+        if (route == "/admin/suspend") {
+            if (req->method != "POST") {
+                writeMethodNotAllowed("POST");
+                return;
+            }
+            if (readControlAuthorization().empty()) {
+                writeJsonAndClose(
+                    403,
+                    OpenAIHttpError(
+                        "missing or invalid control token",
+                        "authentication_error",
+                        "invalid_control_token"));
+                return;
+            }
+            std::string tier = "memory";
+            if (node->config["tier"].is_string()) {
+                tier = node->config["tier"].string_value();
+            }
+            if (tier != "memory" && tier != "disk") {
+                writeJsonAndClose(
+                    400,
+                    OpenAIHttpError(
+                        "tier must be \"memory\" or \"disk\"",
+                        "invalid_request_error", "invalid_tier"));
+                return;
+            }
+            if (suspended.load(std::memory_order_acquire) ||
+                resumeInProgress.load(std::memory_order_acquire)) {
+                writeJsonAndClose(
+                    409,
+                    OpenAIHttpError(
+                        "backend is already suspended",
+                        "conflict_error", "backend_suspended"));
+                return;
+            }
+            suspendInProgress.store(true, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lock(locker);
+                if (checkpointInProgress ||
+                    activateQueryNumber != 1 || !q.empty()) {
+                    suspendInProgress.store(
+                        false, std::memory_order_release);
+                    writeJsonAndClose(
+                        409,
+                        OpenAIHttpError(
+                            "suspend requires no active or queued requests",
+                            "conflict_error",
+                            "suspend_requires_idle_server"));
+                    return;
+                }
+            }
+            const auto suspendStarted =
+                std::chrono::steady_clock::now();
+            // 先把最新前缀缓存落盘（仅当 checkpoint 之后又有 KV 变更），
+            // 这样 resume 能从磁盘恢复 KV 状态。
+            if (fastllm::GetPersistentPrefixCacheStatus().enabled &&
+                cacheMutationEpoch.load(std::memory_order_relaxed) !=
+                    checkpointedMutationEpoch.load(
+                        std::memory_order_relaxed)) {
+                fastllm::PersistentPrefixCheckpointStats stats;
+                std::string checkpointError;
+                if (!fastllm::CheckpointPersistentPrefixCache(
+                        model.get(), stats, &checkpointError)) {
+                    std::fprintf(
+                        stderr,
+                        "[suspend] prefix-cache checkpoint failed: %s\n",
+                        checkpointError.empty() ?
+                            "unknown error" : checkpointError.c_str());
+                } else {
+                    checkpointedMutationEpoch.store(
+                        cacheMutationEpoch.load(
+                            std::memory_order_relaxed),
+                        std::memory_order_relaxed);
+                }
+            }
+            // 释放全部 GPU 内存：模型权重/工作区 -> 全局 paged KV 池 -> 内存池
+            // 空闲缓冲。进程保持常驻，端口继续监听。
+            model.reset();
+            fastllm::ClearAllPagedCacheManagers();
+            fastllm::ReleaseCudaIdlePoolMemory();
+            suspended.store(true, std::memory_order_release);
+            suspendInProgress.store(false, std::memory_order_release);
+            cv.notify_all();
+            const double durationMs =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() -
+                        suspendStarted).count();
+            writeJsonAndClose(200, json11::Json::object {
+                {"status", "ok"},
+                {"tier", tier},
+                {"state", "suspended"},
+                {"duration_ms", durationMs},
+                {"note", "tier=disk currently keeps weights on the source "
+                          "GGUF file and behaves like memory tier"}
+            });
+            return;
+        }
+
+        if (route == "/admin/resume") {
+            if (req->method != "POST") {
+                writeMethodNotAllowed("POST");
+                return;
+            }
+            if (readControlAuthorization().empty()) {
+                writeJsonAndClose(
+                    403,
+                    OpenAIHttpError(
+                        "missing or invalid control token",
+                        "authentication_error",
+                        "invalid_control_token"));
+                return;
+            }
+            if (!suspended.load(std::memory_order_acquire) ||
+                suspendInProgress.load(std::memory_order_acquire)) {
+                writeJsonAndClose(
+                    409,
+                    OpenAIHttpError(
+                        "backend is not suspended",
+                        "conflict_error", "backend_not_suspended"));
+                return;
+            }
+            resumeInProgress.store(true, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lock(locker);
+                if (checkpointInProgress ||
+                    activateQueryNumber != 1 || !q.empty()) {
+                    resumeInProgress.store(
+                        false, std::memory_order_release);
+                    writeJsonAndClose(
+                        409,
+                        OpenAIHttpError(
+                            "resume requires no active or queued requests",
+                            "conflict_error",
+                            "resume_requires_idle_server"));
+                    return;
+                }
+            }
+            const auto resumeStarted =
+                std::chrono::steady_clock::now();
+            std::string resumeError;
+            try {
+                // 从磁盘（GGUF 权重文件 + 持久化前缀缓存）重建模型，
+                // 应用与启动时一致的配置。
+                model = fastllm::CreateLLMModelFromFile(
+                    ::config.path, ::config.multimodalProjectorPath);
+                model->SetTokenLimit(::config.tokens);
+                model->SetDataType(::config.atype);
+                if (::config.kvCacheDtype !=
+                    fastllm::DataType::DATA_AUTO_NONE) {
+                    model->SetKVCacheDataType(::config.kvCacheDtype);
+                }
+                model->maxBatch = maxActivateQueryNumber;
+                pagedManagersPreallocated.store(
+                    false, std::memory_order_relaxed);
+                // 恢复 KV 状态（磁盘持久化前缀缓存），失败不阻塞恢复。
+                PrepareServerPersistentPrefixCache(model.get());
+                suspended.store(false, std::memory_order_release);
+            } catch (const std::exception &error) {
+                resumeError = error.what();
+            } catch (...) {
+                resumeError = "unknown error";
+            }
+            resumeInProgress.store(false, std::memory_order_release);
+            cv.notify_all();
+            if (!resumeError.empty()) {
+                std::fprintf(
+                    stderr, "[resume] model restore failed: %s\n",
+                    resumeError.c_str());
+                writeJsonAndClose(
+                    500,
+                    OpenAIHttpError(
+                        "resume failed: " + resumeError,
+                        "server_error", "resume_failed"));
+                return;
+            }
+            const double durationMs =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() -
+                        resumeStarted).count();
+            writeJsonAndClose(200, json11::Json::object {
+                {"status", "ok"},
+                {"state", "ready"},
+                {"duration_ms", durationMs}
+            });
+            return;
+        }
 
         if (route == "/admin/prefix-cache/checkpoint") {
             std::string authorization;
@@ -654,9 +896,12 @@ struct WorkQueue {
                     activeRequests = std::max(0, activateQueryNumber - 1);
                     queuedRequests = static_cast<int>(q.size());
                 }
+                const bool suspendedNow =
+                    suspended.load(std::memory_order_acquire);
                 writeJsonAndClose(200, json11::Json::object {
                     {"status", "ok"},
-                    {"ready", true},
+                    {"ready", !suspendedNow},
+                    {"suspended", suspendedNow},
                     {"accepting", activeRequests < maxActivateQueryNumber},
                     {"active_requests", activeRequests},
                     {"queued_requests", queuedRequests},
@@ -923,9 +1168,6 @@ struct WorkQueue {
             if (rawPrompt) {
                 if (!node->config["prompt"].is_string()) {
                     node->error = "raw_prompt requires a string prompt.\n";
-                } else if (!parsedChatInput.imageUrls.empty()) {
-                    node->error =
-                        "raw_prompt cannot be combined with image content.\n";
                 } else {
                     prompt = node->config["prompt"].string_value();
                 }
@@ -1453,6 +1695,9 @@ int main(int argc, char** argv) {
     if (config.kvCacheDtype != fastllm::DataType::DATA_AUTO_NONE) {
         workQueue.model->SetKVCacheDataType(config.kvCacheDtype);
     }
+    // Paged KV managers are preallocated lazily on the first request (see
+    // WorkQueue::Deal) so the ~5 GB allocation never stacks with the model
+    // load peak or the persistent-prefix-cache restore.
     workQueue.maxActivateQueryNumber = std::max(1, std::min(256, config.batch));
     workQueue.model->maxBatch = workQueue.maxActivateQueryNumber;
     PrepareServerPersistentPrefixCache(workQueue.model.get());
@@ -1544,6 +1789,7 @@ int main(int argc, char** argv) {
 #ifndef _WIN32
     if (shutdownSignal != 0 &&
         fastllm::GetPersistentPrefixCacheStatus().enabled &&
+        !workQueue.suspended.load(std::memory_order_acquire) &&
         workQueue.cacheMutationEpoch.load(std::memory_order_relaxed) !=
             workQueue.checkpointedMutationEpoch.load(
                 std::memory_order_relaxed)) {

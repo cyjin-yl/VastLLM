@@ -1888,6 +1888,18 @@ void FastllmCudaPagedCacheCopy(
         if (!FastllmCudaPackedKVCacheCopy(
                 pagedData, pageIdx, pageLen, numHeads, headDim, dstType,
                 inputData, srcType, seqLen, inputOffset, copyLen, pageOffset)) {
+            printf("[PagedCache] packed copy FAILED: pageIdx=%d pageLen=%d "
+                   "pageOffset=%d copyLen=%d numHeads=%d headDim=%d "
+                   "dstType=%d srcType=%d seqLen=%d inputOffset=%d "
+                   "pagedData=%p inputData=%p dstValid=%d srcValid=%d\n",
+                   pageIdx, pageLen, pageOffset, copyLen, numHeads, headDim,
+                   (int)dstType, (int)srcType, seqLen, inputOffset,
+                   pagedData, inputData,
+                   (int)FastllmCudaValidatePointerRange(
+                       pagedData, (size_t)pageLen, 0),
+                   (int)FastllmCudaValidatePointerRange(
+                       inputData, (size_t)seqLen, 0));
+            fflush(stdout);
             fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopy: packed KV cache copy failed.\n");
         }
         return;
@@ -2042,6 +2054,13 @@ bool FastllmCudaPagedCacheCopyMultiPage(
     if (pageIdxHost == nullptr || pageCount <= 0 ||
         pageCount > FASTLLM_PAGED_CACHE_COPY_MULTI_MAX_PAGES ||
         firstPageOffset < 0 || firstPageOffset >= pageLen) {
+        printf("[PagedCache] MultiPageCopy invalid args: pageCount=%d "
+               "max=%d firstPageOffset=%d pageLen=%d pagedData=%p inputData=%p "
+               "seqLen=%d srcType=%d dstType=%d\n",
+               pageCount, FASTLLM_PAGED_CACHE_COPY_MULTI_MAX_PAGES,
+               firstPageOffset, pageLen, pagedData, inputData,
+               seqLen, (int)srcType, (int)dstType);
+        fflush(stdout);
         return false;
     }
 
@@ -2470,9 +2489,13 @@ void *FastllmBorrowCudaTempBuffer(size_t needBytes, size_t *outBytes, bool *outO
     size_t allocBytes = FastllmCudaTempAlignBytes(needBytes);
     if (holder.size < allocBytes) {
         if (holder.data != nullptr) {
-            FastllmCudaDirectFree(holder.data);
-            holder.data = nullptr;
-            holder.size = 0;
+            // 其他借用者可能仍持有旧缓冲指针（MTP 校验/conv 与主 forward
+            // 并行借用同一设备临时缓冲，img+long 组合可复现）。扩容时保留
+            // 旧缓冲（只增不减），避免 use-after-free 导致 kernel 启动报
+            // cudaErrorInvalidValue。设备临时缓冲常驻，泄漏量=扩容差值。
+            printf("[Fastllm] Temp buffer grow: keep old %p (%zu), alloc %zu\n",
+                   holder.data, holder.size, allocBytes);
+            fflush(stdout);
         }
         holder.data = FastllmCudaDirectMalloc(allocBytes);
         if (holder.data == nullptr) {
