@@ -1785,12 +1785,14 @@ void ParseArgs(int argc, char **argv, APIConfig &config) {
     }
 }
 
-// 8 MiB request buffer: the accept loop reads until Content-Length is
+// 64 MiB request buffer: the accept loop reads until Content-Length is
 // satisfied (or the buffer is full), so a request whose body exceeds the
 // buffer is dropped with a connection close. Long-context requests
-// (>=262144 tokens) carry multi-MiB JSON bodies; 1 MiB used to reject
-// them. Must stay >= the 8 MiB caps in HttpRequest::Init/IsValid.
-char buff[8 * 1024 * 1024] = {0};
+// (>=262144 tokens) carry multi-MiB JSON bodies; 4K images re-encoded by
+// the proxy to PNG reach ~10 MiB of base64 JSON, so 8 MiB rejected them
+// with a silent connection close (ReadError/503 upstream). Must stay >=
+// the caps in HttpRequest::Init/IsValid.
+char buff[64 * 1024 * 1024] = {0};
 std::string url = "generate";
 std::mutex locker;
 
