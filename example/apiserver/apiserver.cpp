@@ -119,6 +119,8 @@ using socket_t = int;
 #include <string>
 #include <sys/stat.h>
 #include <thread>
+#include <vector>
+#include <chrono>
 #include "model.h"
 #include "http_request_reader.h"
 #include "http_response.h"
@@ -130,6 +132,7 @@ using socket_t = int;
 #include "openai_multimodal_request.h"
 #include "checkpoint_control.h"
 #include "utils/stop_string_matcher.h"
+#include "host_offload.h"
 
 class MultimodalInputGuard {
 public:
@@ -194,6 +197,7 @@ struct APIConfig {
     bool cudaEmbedding = false; // 是否使用cudaEmbedding
     int port = 8080; // 端口号
     int tokens = -1; // token容量限制
+    int chunkedPrefillSize = -1; // 分块 prefill 切片大小；-1 使用模型默认值
     int batch = 256; // batch数限制
     int defaultMaxTokens = kDefaultOutputTokenLimit; // 请求省略max_tokens时的输出上限
     fastllm::DataType dtype = fastllm::DataType::FLOAT16;
@@ -204,6 +208,7 @@ struct APIConfig {
     std::map <std::string, int> devices;
 };
 APIConfig config;
+
 
 bool PrepareServerPersistentPrefixCache(
         fastllm::basellm *model) {
@@ -275,7 +280,7 @@ struct HttpRequest {
         ToNext(buffer, " ", route);
         ToNext(buffer, "\r\n", type);
         while (true) {
-            if (buffer[0] == 0 || ((long long)(buffer - old)) > 1024 * 1024) {
+            if (buffer[0] == 0 || ((long long)(buffer - old)) > 8 * 1024 * 1024) {
                 break;
             }
             if (buffer[0] == '\r' && buffer[1] == '\n') {
@@ -297,7 +302,7 @@ struct HttpRequest {
         ToNext(buffer, " ", route);
         ToNext(buffer, "\r\n", type);
         while (true) {
-            if (buffer[0] == 0 || ((long long)(buffer - old)) > 1024 * 1024) {
+            if (buffer[0] == 0 || ((long long)(buffer - old)) > 8 * 1024 * 1024) {
                 break;
             }
             if (buffer[0] == '\r' && buffer[1] == '\n') {
@@ -388,6 +393,27 @@ struct WorkQueue {
     std::atomic<bool> suspended {false};
     std::atomic<bool> suspendInProgress {false};
     std::atomic<bool> resumeInProgress {false};
+    std::unique_ptr<fastllm::HostOffloadManager> hostOffloadManager;
+    uint64_t hostOffloadGeneration = 0;
+    std::string suspendedTier = "disk";
+
+    void ConfigureHostOffloadManager() {
+        hostOffloadManager.reset();
+        if (model == nullptr ||
+            !fastllm::HostCacheBudget::SharedBudgetEnabled() ||
+            model->GetWeightMaterializationPlan().Size() == 0) {
+            return;
+        }
+        hostOffloadManager.reset(new fastllm::HostOffloadManager(
+            model->weight.weight,
+            model->GetWeightMaterializationPlan(),
+            fastllm::HostCacheBudget::Global(),
+            [this](const std::vector<std::string> &names,
+                   std::string *error) {
+                return model != nullptr &&
+                    model->ReloadGGUFWeightSubset(names, error);
+            }));
+    }
 
     void Push(char *buffer, int client) {
         locker.lock();
@@ -642,11 +668,34 @@ struct WorkQueue {
                         std::memory_order_relaxed);
                 }
             }
-            // 释放全部 GPU 内存：模型权重/工作区 -> 全局 paged KV 池 -> 内存池
-            // 空闲缓冲。进程保持常驻，端口继续监听。
-            model.reset();
-            fastllm::ClearAllPagedCacheManagers();
-            fastllm::ReleaseCudaIdlePoolMemory();
+            bool memoryTierReady = false;
+            fastllm::HostOffloadTransitionResult hostResult;
+            if (tier == "memory" && hostOffloadManager != nullptr) {
+                model->PrepareHostWeightSuspend();
+                hostResult = hostOffloadManager->Suspend(
+                    ++hostOffloadGeneration);
+                memoryTierReady =
+                    hostResult.outcome ==
+                    fastllm::HostOffloadOutcome::SUSPENDED_HOST;
+                if (memoryTierReady) {
+                    fastllm::ReleaseCudaIdlePoolMemory();
+                } else {
+                    std::fprintf(
+                        stderr,
+                        "[suspend] RAM tier unavailable, falling back to "
+                        "disk: %s\n",
+                        hostResult.reason.c_str());
+                }
+            }
+            if (!memoryTierReady) {
+                hostOffloadManager.reset();
+                model.reset();
+                fastllm::ClearAllPagedCacheManagers();
+                fastllm::ReleaseCudaIdlePoolMemory();
+                suspendedTier = "disk";
+            } else {
+                suspendedTier = "memory";
+            }
             suspended.store(true, std::memory_order_release);
             suspendInProgress.store(false, std::memory_order_release);
             cv.notify_all();
@@ -656,11 +705,16 @@ struct WorkQueue {
                         suspendStarted).count();
             writeJsonAndClose(200, json11::Json::object {
                 {"status", "ok"},
-                {"tier", tier},
+                {"tier", suspendedTier},
+                {"requested_tier", tier},
                 {"state", "suspended"},
                 {"duration_ms", durationMs},
-                {"note", "tier=disk currently keeps weights on the source "
-                          "GGUF file and behaves like memory tier"}
+                {"cached_bytes", (double)hostResult.cachedBytes},
+                {"source_evicted_bytes",
+                 (double)hostResult.sourceEvictedBytes},
+                {"cache_hit_ratio", hostResult.cacheHitRatio},
+                {"fallback_reason",
+                 memoryTierReady ? std::string() : hostResult.reason}
             });
             return;
         }
@@ -707,22 +761,73 @@ struct WorkQueue {
             const auto resumeStarted =
                 std::chrono::steady_clock::now();
             std::string resumeError;
+            double cacheHitRatio = 0.0;
+            uint64_t rebuiltBytes = 0;
             try {
-                // 从磁盘（GGUF 权重文件 + 持久化前缀缓存）重建模型，
-                // 应用与启动时一致的配置。
-                model = fastllm::CreateLLMModelFromFile(
-                    ::config.path, ::config.multimodalProjectorPath);
-                model->SetTokenLimit(::config.tokens);
-                model->SetDataType(::config.atype);
-                if (::config.kvCacheDtype !=
-                    fastllm::DataType::DATA_AUTO_NONE) {
-                    model->SetKVCacheDataType(::config.kvCacheDtype);
+                if (suspendedTier == "memory" &&
+                    model != nullptr &&
+                    hostOffloadManager != nullptr) {
+                    const auto hostResult =
+                        hostOffloadManager->Resume(
+                            hostOffloadGeneration);
+                    cacheHitRatio = hostResult.cacheHitRatio;
+                    rebuiltBytes = hostResult.rebuiltBytes;
+                    if (hostResult.outcome ==
+                        fastllm::HostOffloadOutcome::READY) {
+                        model->RestoreAfterHostWeightResume();
+                        PrepareServerPersistentPrefixCache(model.get());
+                    } else {
+                        std::fprintf(
+                            stderr,
+                            "[resume] RAM tier failed, rebuilding from "
+                            "disk: %s\n",
+                            hostResult.reason.c_str());
+                        hostOffloadManager.reset();
+                        model.reset();
+                        fastllm::ClearAllPagedCacheManagers();
+                        fastllm::ReleaseCudaIdlePoolMemory();
+                        suspendedTier = "disk";
+                        model = fastllm::CreateLLMModelFromFile(
+                            ::config.path,
+                            ::config.multimodalProjectorPath);
+                        model->SetTokenLimit(::config.tokens);
+                        if (::config.chunkedPrefillSize > 0) {
+                            model->SetChunkedPrefillSize(
+                                ::config.chunkedPrefillSize);
+                        }
+                        model->SetDataType(::config.atype);
+                        if (::config.kvCacheDtype !=
+                            fastllm::DataType::DATA_AUTO_NONE) {
+                            model->SetKVCacheDataType(
+                                ::config.kvCacheDtype);
+                        }
+                        model->maxBatch =
+                            maxActivateQueryNumber;
+                        PrepareServerPersistentPrefixCache(
+                            model.get());
+                        ConfigureHostOffloadManager();
+                    }
+                } else {
+                    model = fastllm::CreateLLMModelFromFile(
+                        ::config.path,
+                        ::config.multimodalProjectorPath);
+                    model->SetTokenLimit(::config.tokens);
+                    if (::config.chunkedPrefillSize > 0) {
+                        model->SetChunkedPrefillSize(
+                            ::config.chunkedPrefillSize);
+                    }
+                    model->SetDataType(::config.atype);
+                    if (::config.kvCacheDtype !=
+                        fastllm::DataType::DATA_AUTO_NONE) {
+                        model->SetKVCacheDataType(
+                            ::config.kvCacheDtype);
+                    }
+                    model->maxBatch = maxActivateQueryNumber;
+                    PrepareServerPersistentPrefixCache(model.get());
+                    ConfigureHostOffloadManager();
                 }
-                model->maxBatch = maxActivateQueryNumber;
                 pagedManagersPreallocated.store(
                     false, std::memory_order_relaxed);
-                // 恢复 KV 状态（磁盘持久化前缀缓存），失败不阻塞恢复。
-                PrepareServerPersistentPrefixCache(model.get());
                 suspended.store(false, std::memory_order_release);
             } catch (const std::exception &error) {
                 resumeError = error.what();
@@ -749,7 +854,10 @@ struct WorkQueue {
             writeJsonAndClose(200, json11::Json::object {
                 {"status", "ok"},
                 {"state", "ready"},
-                {"duration_ms", durationMs}
+                {"duration_ms", durationMs},
+                {"tier", suspendedTier},
+                {"cache_hit_ratio", cacheHitRatio},
+                {"rebuilt_bytes", (double)rebuiltBytes}
             });
             return;
         }
@@ -902,6 +1010,12 @@ struct WorkQueue {
                     {"status", "ok"},
                     {"ready", !suspendedNow},
                     {"suspended", suspendedNow},
+                    {"tier_state",
+                     suspendedNow
+                         ? (suspendedTier == "memory"
+                                ? "suspended_host"
+                                : "suspended_disk")
+                         : "ready"},
                     {"accepting", activeRequests < maxActivateQueryNumber},
                     {"active_requests", activeRequests},
                     {"queued_requests", queuedRequests},
@@ -1588,6 +1702,7 @@ void Usage() {
     std::cout << "<--kv_cache_dtype> <args>:    设置KV Cache数据类型(auto/float32/float16/bfloat16/fp8_e4m3/turbo3; Qwen3.5/3.6 turbo3 uses q8_0 K + TurboQuant3 V)" << std::endl;
     std::cout << "<--batch> <args>:             最大batch数" << std::endl;
     std::cout << "<--tokens> <args>:            最大tokens容量" << std::endl;
+    std::cout << "<--chunked_prefill_size> <args>: 分块prefill切片大小（调小可降低峰值显存）" << std::endl;
     std::cout << "<--default_max_tokens> <args>: 请求省略max_tokens时的默认输出上限（默认16384）" << std::endl;
     std::cout << "<--model_name> <args>:        模型名(openai api中使用)" << std::endl;
     std::cout << "<--port> <args>:              网页端口号" << std::endl;
@@ -1629,6 +1744,16 @@ void ParseArgs(int argc, char **argv, APIConfig &config) {
             config.dtype = dataTypeDict[dtypeStr];
         } else if (sargv[i] == "--tokens") {
             config.tokens = atoi(sargv[++i].c_str());
+        } else if (sargv[i] == "--chunked_prefill_size" ||
+                   sargv[i] == "--chunked-prefill-size") {
+            fastllm::AssertInFastLLM(
+                i + 1 < argc,
+                "--chunked_prefill_size requires a value");
+            std::string error;
+            fastllm::AssertInFastLLM(
+                ParsePositiveInt(
+                    sargv[++i], config.chunkedPrefillSize, error),
+                "Invalid --chunked_prefill_size: " + error);
         } else if (sargv[i] == "--default_max_tokens" || sargv[i] == "--default-max-tokens") {
             fastllm::AssertInFastLLM(i + 1 < argc,
                                     "--default_max_tokens requires a value");
@@ -1660,7 +1785,12 @@ void ParseArgs(int argc, char **argv, APIConfig &config) {
     }
 }
 
-char buff[1024 * 1024] = {0};
+// 8 MiB request buffer: the accept loop reads until Content-Length is
+// satisfied (or the buffer is full), so a request whose body exceeds the
+// buffer is dropped with a connection close. Long-context requests
+// (>=262144 tokens) carry multi-MiB JSON bodies; 1 MiB used to reject
+// them. Must stay >= the 8 MiB caps in HttpRequest::Init/IsValid.
+char buff[8 * 1024 * 1024] = {0};
 std::string url = "generate";
 std::mutex locker;
 
@@ -1687,10 +1817,16 @@ int main(int argc, char** argv) {
     fastllm::AssertInFastLLM(
         !isHFDir || config.multimodalProjectorPath.empty(),
         "--mmproj currently requires a GGUF text model.");
-    workQueue.model = isHFDir ? fastllm::CreateLLMModelFromHF(config.path, config.dtype, config.groupCnt)
+    workQueue.model = isHFDir
+        ? fastllm::CreateLLMModelFromHF(
+              config.path, config.dtype, config.groupCnt)
         : fastllm::CreateLLMModelFromFile(
               config.path, config.multimodalProjectorPath);
     workQueue.model->SetTokenLimit(config.tokens);
+    if (config.chunkedPrefillSize > 0) {
+        workQueue.model->SetChunkedPrefillSize(
+            config.chunkedPrefillSize);
+    }
     workQueue.model->SetDataType(config.atype);
     if (config.kvCacheDtype != fastllm::DataType::DATA_AUTO_NONE) {
         workQueue.model->SetKVCacheDataType(config.kvCacheDtype);
@@ -1701,6 +1837,7 @@ int main(int argc, char** argv) {
     workQueue.maxActivateQueryNumber = std::max(1, std::min(256, config.batch));
     workQueue.model->maxBatch = workQueue.maxActivateQueryNumber;
     PrepareServerPersistentPrefixCache(workQueue.model.get());
+    workQueue.ConfigureHostOffloadManager();
     workQueue.Start();
 
     int local_fd = socket(AF_INET, SOCK_STREAM, 0);

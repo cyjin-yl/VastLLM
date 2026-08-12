@@ -257,6 +257,10 @@ namespace fastllm {
 
         virtual void ResetCudaServingForKvCacheResize() override;
 
+        virtual void PrepareHostWeightSuspend() override;
+
+        virtual void RestoreAfterHostWeightResume() override;
+
         virtual void OnResponseContextCreated(ResponseContext *context) override;
 
         virtual void OnResponseContextRemoved(ResponseContext *context) override;

@@ -32,6 +32,7 @@
 
 namespace fastllm {
     class Data;
+    class HostCacheReservation;
 
     class FastllmEnv {
     public:
@@ -454,6 +455,13 @@ namespace fastllm {
     };
 
     class PagedCacheManager;
+    struct DataOffloadRecord {
+        DataDevice originalDevice = DataDevice::CPU;
+        int originalDeviceId = 0;
+        uint64_t bytes = 0;
+        uint64_t checksum = 0;
+    };
+
 
     class Data {
     public:
@@ -614,6 +622,11 @@ namespace fastllm {
         void ToDevice(DataDevice device, const std::vector <int> &deviceIds, bool copyData = true); // 移动到指定device
 
         void ToDevice(void *device, bool copyData = true);
+        bool MoveCudaStorageToHost(DataOffloadRecord &record, std::string *error = nullptr);
+        bool RestoreCudaStorageFromHost(const DataOffloadRecord &record, std::string *error = nullptr);
+        bool ReleaseCudaAuxiliaryStorage(std::string *error = nullptr);
+        bool ReleaseCudaStorageWithoutHostCopy(std::string *error = nullptr);
+
 
         void ToCudaTemporary(const std::vector <int> &deviceIds, bool copyData, void *stream = nullptr); // 临时移动到cuda
 
@@ -655,6 +668,7 @@ namespace fastllm {
         bool zstdCompressed = false;
         uint64_t checksum = 0;
 
+        std::shared_ptr<HostCacheReservation> budgetReservation;
         bool accounted = false;
         ~PagedPrefixCacheTierPayload();
     };
@@ -743,6 +757,7 @@ namespace fastllm {
                 bool pick,
                 const std::unordered_set<int> *protectedPages);
             bool PageOutTrieNode(CacheTrieNode *node);
+            uint64_t EvictCpuTierPayloads(uint64_t bytesNeeded);
             bool MaterializeTrieNode(
                 CacheTrieNode *node,
                 const std::unordered_set<int> &protectedPages);

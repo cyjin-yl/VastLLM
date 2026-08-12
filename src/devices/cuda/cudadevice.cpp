@@ -9028,10 +9028,49 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 cache.lastPageLen = copyLen;
                 remaining -= copyLen;
             }
+            // 页分配（GetUnusedPageIndex 可能在页池耗尽时触发并发 Grow）
+            // 之后再取页池指针：Grow 会把 cudaData 换成新分配的更大池
+            // （旧池仅退役不释放），若 kernel 仍用 Run 开头取的旧指针，
+            // 物理页号虽然不变，但写的是退役缓冲，且并发 Grow 后旧指针
+            // 可能与其它分配器状态冲突（CUDA 700 非法地址）。
+            pagedData = (uint8_t*)pagedKVCache->cudaData;
+            {
+                // 诊断：定位 CUDA 700 非法地址是页号越界还是源/目标指针失效
+                int minPg = appendPages[0], maxPg = appendPages[0];
+                for (int p : appendPages) {
+                    minPg = std::min(minPg, p);
+                    maxPg = std::max(maxPg, p);
+                }
+                size_t poolBytes = (size_t)maxPages * pageLen *
+                    numHeads * headDim * pagedKVCache->unitSize;
+                size_t inputBytes = (size_t)seqLen * numHeads *
+                    headDim * input.unitSize;
+                printf("[PagedCache] multi-page launch: pages=%zu [%d,%d] "
+                       "maxPages=%d dims0=%d pagedValid=%d inputValid=%d "
+                       "pagedData=%p inputData=%p seqLen=%d numHeads=%d "
+                       "headDim=%d pageLen=%d unitSize=%d inputUnit=%d "
+                       "mgr=%p cachePages=%zu lastPageLen=%d\n",
+                       appendPages.size(), minPg, maxPg, maxPages,
+                       pagedKVCache->dims[0],
+                       (int)FastllmCudaValidatePointerRange(
+                           pagedData, poolBytes, 0),
+                       (int)FastllmCudaValidatePointerRange(
+                           inputData, inputBytes, 0),
+                       pagedData, inputData, seqLen, numHeads, headDim,
+                       pageLen, pagedKVCache->unitSize, input.unitSize,
+                       (void*)pagedKVCache, cache.pageIndex.size(),
+                       cache.lastPageLen);
+                printf("[PagedCache] pool dims=[%d,%d,%d,%d] kbytes=%zu\n",
+                       pagedKVCache->dims[0], pagedKVCache->dims[1],
+                       pagedKVCache->dims[2], pagedKVCache->dims[3],
+                       pagedKVCache->GetBytes());
+                fflush(stdout);
+            }
             bool launched = FastllmCudaPagedCacheCopyMultiPage(
                 pagedData, appendPages.data(), (int)appendPages.size(),
                 firstPageOffset, pageLen, numHeads, headDim,
-                pagedKVCache->dataType, inputData, input.dataType, seqLen);
+                pagedKVCache->dataType, inputData, input.dataType, seqLen,
+                maxPages * pageLen * numHeads);
             if (!launched) {
                 // 多页批量拷贝失败（并发 Grow 竞态等）时降级到逐页复制，
                 // 避免直接 abort 中断整个服务。

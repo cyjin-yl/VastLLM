@@ -2094,6 +2094,16 @@ namespace fastllm {
 #endif
     }
 
+    void basellm::PrepareHostWeightSuspend() {
+        ResetCudaServingForKvCacheResize();
+        ClearAllPagedCacheManagers();
+        FastllmCudaClearBigBuffer();
+    }
+
+    void basellm::RestoreAfterHostWeightResume() {
+        AutoWarmup();
+    }
+
     basellm::~basellm() {
         ShutdownRuntime();
         this->weight.ReleaseWeight();

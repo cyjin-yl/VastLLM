@@ -1,7 +1,7 @@
 # FastLLM 受预算的进程内模型卸载设计
 
 **日期：** 2026-08-12  
-**状态：** 已确认方案，待书面复核
+**状态：** 已确认，按 IQ6 256K 带图稳定性范围实施
 
 ## 1. 问题
 
@@ -24,12 +24,13 @@
 
 ### 目标
 
+本实现属于现有 `VRAM → RAM → disk` 三级缓存体系：READY 模型在 VRAM；memory-tier suspend 将可复用 tensor 和剩余 prefix KV 放入受预算的 RAM 层；disk tier 继续保存 GGUF/source recipe 与 persistent prefix generation。不得并列建立第二套卸载缓存或第二份独立预算。
 - memory-tier suspend 后 FastLLM 进程和 model 拓扑保持存活，GPU 显存回到冷基线。
 - 在统一、硬上限的 host RAM 预算内缓存任意比例的 GPU-ready tensor；部分缓存也必须减少恢复工作。
 - warmup/merge 派生状态优先于普通权重，普通权重优先于 prefix KV 的 RAM 副本。
 - READY 稳态不保留 manager-owned host 权重副本；SUSPENDED 稳态不保留对应 GPU 权重副本。
 - 任意缓存分配、校验或 materialization 失败都回落到现有 `CreateLLMModelFromFile + disk prefix restore`。
-- 与 320K/512K/更大 YaRN context、Turbo3 KV、MTP、persistent prefix cache 兼容；不得改变 context/KV geometry。
+- 与 IQ6（当前 abliterated i1_Q6_K）256K、Turbo3 KV、MTP2 和 persistent prefix cache 兼容；不得改变 context/KV geometry。
 
 ### 非目标
 
@@ -41,9 +42,9 @@
 
 ## 4. 核心对象
 
-### 4.1 `HostOffloadManager`
+### 4.1 RAM tier：`HostOffloadManager`
 
-进程内、每个 model 实例一个 manager，负责：
+`HostOffloadManager` 是三级缓存的 RAM 层实现，不是独立于 tiering 的旁路。进程内、每个 model 实例一个 manager，负责：
 
 - 读取动态预算；
 - 枚举、排序和迁移 candidate；
@@ -52,16 +53,16 @@
 - 在 resume 成功后逐块释放 host storage；
 - 在错误时整体 invalidate 并触发磁盘回退。
 
-默认预算：
+统一预算由模型 host 热缓存和 prefix KV RAM payload 共同消费。默认预算：
 
 ```text
 budget = min(
-  FASTLLM_HOST_SUSPEND_CACHE_MAX_BYTES,          # 默认 20 GiB
+  FASTLLM_HOST_SUSPEND_CACHE_MAX_BYTES,          # 默认 12 GiB
   MemAvailable - FASTLLM_HOST_SUSPEND_MIN_FREE_BYTES  # 默认保留 12 GiB
 )
 ```
 
-当 `MemAvailable <= reserve` 时 budget 为 0，直接使用 disk tier。manager 按 tensor/chunk 增量分配，每次分配前重新读取 `MemAvailable`；不先申请一个 20GB 连续 arena。新页必须被实际触页后才计入 resident bytes，分配失败只停止增加缓存，不继续逼近 OOM。
+当 `MemAvailable <= reserve` 时 budget 为 0，直接使用 disk tier。manager 按 tensor/chunk 增量分配，每次分配前重新读取 `MemAvailable`；不先申请一个 12GB 连续 arena。新页必须被实际触页后才计入 resident bytes，分配失败只停止增加缓存，不继续逼近 OOM。prefix KV 通过同一预算控制器计费，不能再单独获得额外的 CPU tier 配额。
 
 缓存使用普通 pageable anonymous memory。H2D/D2H 通过一个固定上限的 pinned staging buffer 流水传输，避免 page-lock 数十 GB。
 
@@ -168,7 +169,7 @@ SUSPENDED_HOST|SUSPENDED_DISK
 
 ```text
 FASTLLM_HOST_SUSPEND_CACHE=1
-FASTLLM_HOST_SUSPEND_CACHE_MAX_BYTES=21474836480
+FASTLLM_HOST_SUSPEND_CACHE_MAX_BYTES=12884901888
 FASTLLM_HOST_SUSPEND_MIN_FREE_BYTES=12884901888
 FASTLLM_HOST_SUSPEND_STAGING_BYTES=268435456
 FASTLLM_HOST_SUSPEND_PREFIX_MODE=opportunistic
@@ -200,12 +201,12 @@ FASTLLM_HOST_SUSPEND_PREFIX_MODE=opportunistic
 
 ### V100 端到端
 
-1. Q6 262K MTP2 启动，记录完整磁盘启动、warmup 分段耗时和 greedy 输出 hash。
-2. 用 20GB cache suspend：GPU 回到冷基线，host 增量不超过 budget，`/dev/shm` 无模型文件。
-3. resume：输出 hash 一致，READY 后 host weight cache 为 0，TTFT/恢复耗时明显低于磁盘基线。
-4. 分别用 8GB、1GB、0GB budget 重复；只比较 resume 的 materialize + warmup 段，缓存 bytes 增加不应增加该段耗时（允许 suspend 的 D2H 时间变长）；0GB 必须等价于现有 disk tier。
+1. IQ6 256K Turbo3 KV MTP2 启动，记录完整磁盘启动、warmup 分段耗时和 greedy 输出 hash。
+2. 用 12GiB shared cache suspend：GPU 回到冷基线，host 增量不超过 budget，`/dev/shm` 无模型文件。
+3. resume：输出 hash 一致，READY 后 host weight cache 为 0，TTFT/恢复耗时低于磁盘基线。
+4. 分别用 8GiB、1GiB、0GiB budget 重复；只比较 resume 的 materialize + warmup 段，缓存 bytes 增加不应增加该段耗时（允许 suspend 的 D2H 时间变长）；0GiB 必须等价于现有 disk tier。
 5. 人为破坏 checksum、修改源 identity、注入分配/H2D 失败，确认自动完整磁盘恢复。
-6. 在 320K 与当前可承载的 512K/更高 YaRN profile 上重复 suspend/resume；KV geometry、prefix restore 和短请求均不回归。
+6. 连续执行带图请求、memory-tier suspend/resume、同图和不同图请求；验证 KV geometry、prefix restore、图片编码和短文本请求均不回归。
 7. 生产 profile 只在以上 gates 通过后启用；默认代码路径保持关闭。
 
 验收阈值：

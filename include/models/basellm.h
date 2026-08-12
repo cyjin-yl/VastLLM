@@ -5,6 +5,7 @@
 #include "fastllm.h"
 #include "baseblock.h"
 #include "template.h"
+#include "weight_materialization.h"
 
 #include <atomic>
 #include <thread>
@@ -259,6 +260,14 @@ namespace fastllm {
 
         virtual void LoadFromFile(const std::string &fileName); // 从文件读取 
 
+        const WeightMaterializationPlan &GetWeightMaterializationPlan() const {
+            return weightMaterializationPlan;
+        }
+
+        bool ReloadGGUFWeightSubset(
+            const std::vector<std::string> &weightNames,
+            std::string *error = nullptr);
+
         virtual void InitParams(); // 初始化参数信息 
 
         // 根据原始的tensorNames获得映射表
@@ -478,6 +487,14 @@ namespace fastllm {
         // the provisional cache is destroyed and reallocated at its final size.
         virtual void ResetCudaServingForKvCacheResize() {}
 
+        // Release model-specific CUDA serving objects before model weights are
+        // migrated to host RAM. Callers must hold an exclusive idle-server
+        // transition; the model object and its scheduler remain alive.
+        virtual void PrepareHostWeightSuspend();
+
+        // Rebuild serving state after every model weight has returned to CUDA.
+        virtual void RestoreAfterHostWeightResume();
+
         // 当前运行配置是否可以使用 ForwardGPU。
         // 默认仅在纯 GPU 设备映射下启用；有混合设备实现的模型可以覆盖此判断。
         virtual bool CanUseGPUForward() const;
@@ -676,6 +693,7 @@ namespace fastllm {
         bool norm_topk_prob;
 
         std::vector <WeightMergeRule> weightMergeRules;
+        WeightMaterializationPlan weightMaterializationPlan;
         std::map <std::string, std::string> specialWeights; //一些特殊层，可以提前注册（一般用于TFACC）
         std::map <std::string, int> specialWeightLayerIds;
         std::set <std::string> cantQuantLinears; // 不能量化的Linear层

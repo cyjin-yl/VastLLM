@@ -5,6 +5,7 @@
 #include "utils.h"
 
 #include "fastllm.h"
+#include "host_offload.h"
 
 #include "executor.h"
 
@@ -23,6 +24,7 @@
 #include <chrono>
 #include <filesystem>
 #include <limits>
+#include <new>
 #ifndef _WIN32
 #include <fcntl.h>
 #include <sys/file.h>
@@ -96,6 +98,23 @@ namespace fastllm {
             return value != "0" && value != "false" && value != "off" &&
                    value != "no" && value != "disable" && value != "disabled";
         }
+
+        static uint64_t HashOffloadBytes(const uint8_t *data, uint64_t bytes) {
+            uint64_t hash = UINT64_C(1469598103934665603);
+            for (uint64_t i = 0; i < bytes; ++i) {
+                hash ^= data[i];
+                hash *= UINT64_C(1099511628211);
+            }
+            return hash;
+        }
+
+        static bool SetOffloadError(std::string *error, const std::string &message) {
+            if (error != nullptr) {
+                *error = message;
+            }
+            return false;
+        }
+
 
         static void PrintDimsInline(const std::vector <int> &dims) {
             for (int dim : dims) {
@@ -2665,6 +2684,187 @@ namespace fastllm {
         this->dataDevice = device;
     }
 
+    bool Data::MoveCudaStorageToHost(DataOffloadRecord &record, std::string *error) {
+        if (error != nullptr) {
+            error->clear();
+        }
+#ifndef USE_CUDA
+        return SetOffloadError(error, "CUDA support is disabled");
+#else
+        if (this->isFake || this->cudaDataBorrowed) {
+            return SetOffloadError(error, "borrowed or fake CUDA storage has no transferable ownership");
+        }
+        if (this->multiDeviceData || this->IsTensorParallel()) {
+            return SetOffloadError(error, "tensor-parallel CUDA storage cannot be migrated as one allocation");
+        }
+        if (this->isPagedKVCache || !this->pageIndex.empty()) {
+            return SetOffloadError(error, "paged KV storage must be migrated by its cache manager");
+        }
+        if (this->dataDevice != DataDevice::CUDA || this->cudaData == nullptr ||
+            this->expansionBytes == 0) {
+            return SetOffloadError(error, "tensor has no owned CUDA allocation to migrate");
+        }
+
+        std::unique_ptr<uint8_t[]> staged(new (std::nothrow) uint8_t[this->expansionBytes]);
+        if (!staged) {
+            return SetOffloadError(error, "host allocation failed while staging CUDA storage");
+        }
+
+        int deviceId = GetPointerDeviceId(this->cudaData);
+        if (deviceId < 0) {
+            deviceId = this->dataDeviceIds.empty()
+                ? FastllmCudaGetDevice()
+                : this->dataDeviceIds.front();
+        }
+        FastllmCudaSetDevice(deviceId);
+        FastllmCudaCopyFromDeviceToHost(staged.get(), this->cudaData, this->expansionBytes);
+        const uint64_t checksum = HashOffloadBytes(staged.get(), this->expansionBytes);
+
+        CudaFreeForData(*this, this->cudaData);
+        this->cudaData = nullptr;
+        this->cudaDataBorrowed = false;
+
+        if (this->cpuData != nullptr && this->mapFile == nullptr) {
+            delete[] this->cpuData;
+        }
+        this->cpuData = staged.release();
+        this->mapFile.reset();
+        this->dataDevice = DataDevice::CPU;
+        this->dataDeviceIds.clear();
+
+        record.originalDevice = DataDevice::CUDA;
+        record.originalDeviceId = deviceId;
+        record.bytes = this->expansionBytes;
+        record.checksum = checksum;
+        return true;
+#endif
+    }
+
+    bool Data::RestoreCudaStorageFromHost(const DataOffloadRecord &record, std::string *error) {
+        if (error != nullptr) {
+            error->clear();
+        }
+#ifndef USE_CUDA
+        return SetOffloadError(error, "CUDA support is disabled");
+#else
+        if (this->isFake || this->multiDeviceData || this->IsTensorParallel()) {
+            return SetOffloadError(error, "non-owning or tensor-parallel storage cannot be restored as one allocation");
+        }
+        if (record.originalDevice != DataDevice::CUDA || record.bytes == 0 ||
+            record.bytes != this->expansionBytes) {
+            return SetOffloadError(error, "offload record does not match tensor allocation geometry");
+        }
+        if (this->dataDevice != DataDevice::CPU || this->cpuData == nullptr ||
+            this->cudaData != nullptr) {
+            return SetOffloadError(error, "tensor is not in a host-only offloaded state");
+        }
+        if (HashOffloadBytes(this->cpuData, record.bytes) != record.checksum) {
+            return SetOffloadError(error, "host offload checksum mismatch");
+        }
+
+        std::unique_ptr<uint8_t[]> verification(new (std::nothrow) uint8_t[record.bytes]);
+        if (!verification) {
+            return SetOffloadError(error, "host allocation failed while verifying restored CUDA storage");
+        }
+
+        FastllmCudaSetDevice(record.originalDeviceId);
+        void *restored = CudaMallocForData(*this, record.bytes);
+        if (restored == nullptr) {
+            return SetOffloadError(error, "CUDA allocation failed while restoring host storage");
+        }
+        FastllmCudaCopyFromHostToDevice(restored, this->cpuData, record.bytes);
+        FastllmCudaCopyFromDeviceToHost(verification.get(), restored, record.bytes);
+        if (HashOffloadBytes(verification.get(), record.bytes) != record.checksum) {
+            CudaFreeForData(*this, restored);
+            return SetOffloadError(error, "restored CUDA storage checksum mismatch");
+        }
+
+        this->cudaData = restored;
+        this->cudaDataBorrowed = false;
+        if (this->mapFile == nullptr) {
+            delete[] this->cpuData;
+        }
+        this->cpuData = nullptr;
+        this->mapFile.reset();
+        this->dataDevice = DataDevice::CUDA;
+        this->dataDeviceIds = {record.originalDeviceId};
+        return true;
+#endif
+    }
+
+    bool Data::ReleaseCudaAuxiliaryStorage(std::string *error) {
+        if (error != nullptr) {
+            error->clear();
+        }
+#ifndef USE_CUDA
+        if (!this->extraCudaData.empty() ||
+            !this->extraCudaHalfData.empty()) {
+            return SetOffloadError(
+                error, "CUDA support is disabled");
+        }
+        return true;
+#else
+        std::unordered_set<void*> allocations;
+        auto collect = [&](const std::vector<void*> &pointers) {
+            for (void *pointer : pointers) {
+                if (pointer != nullptr &&
+                    pointer != this->cudaData) {
+                    allocations.insert(pointer);
+                }
+            }
+        };
+        collect(this->extraCudaData);
+        collect(this->extraCudaHalfData);
+
+        const int originalDevice = FastllmCudaGetDevice();
+        for (void *pointer : allocations) {
+            const int ownerDevice = GetPointerDeviceId(pointer);
+            if (ownerDevice >= 0) {
+                FastllmCudaSetDevice(ownerDevice);
+            }
+            if (!FastllmCudaFreeAfterCurrentThreadStream(pointer)) {
+                FastllmCudaFree(pointer);
+            }
+        }
+        if (originalDevice >= 0) {
+            FastllmCudaSetDevice(originalDevice);
+        }
+        this->extraCudaData.clear();
+        this->extraCudaHalfData.clear();
+        return true;
+#endif
+    }
+
+    bool Data::ReleaseCudaStorageWithoutHostCopy(std::string *error) {
+        if (error != nullptr) {
+            error->clear();
+        }
+        if (this->isFake || this->cudaDataBorrowed) {
+            return SetOffloadError(error, "borrowed or fake storage cannot be released by this tensor");
+        }
+        if (this->multiDeviceData || this->IsTensorParallel()) {
+            return SetOffloadError(error, "tensor-parallel storage must be released by its owner");
+        }
+        if (this->isPagedKVCache || !this->pageIndex.empty()) {
+            return SetOffloadError(error, "paged KV storage must be released by its cache manager");
+        }
+#ifdef USE_CUDA
+        if (this->cudaData != nullptr) {
+            CudaFreeForData(*this, this->cudaData);
+            this->cudaData = nullptr;
+        }
+#endif
+        this->cudaDataBorrowed = false;
+        if (this->cpuData != nullptr && this->mapFile == nullptr) {
+            delete[] this->cpuData;
+        }
+        this->cpuData = nullptr;
+        this->mapFile.reset();
+        this->dataDevice = DataDevice::CPU;
+        this->dataDeviceIds.clear();
+        return true;
+    }
+
     // 临时移动到cuda 
     void Data::ToCudaTemporary(const std::vector <int> &deviceIds, bool copyData, void *stream) { 
 #ifdef USE_CUDA
@@ -4954,6 +5154,46 @@ namespace fastllm {
     static std::unordered_map<int, PagedCacheManager*> layerPagedCacheManagers;
     static std::mutex layerPagedCacheManagersMutex;
 
+    static uint64_t EvictPagedPrefixCacheCpuTierBytes(
+            uint64_t bytesNeeded) {
+        if (bytesNeeded == 0) {
+            return 0;
+        }
+        std::lock_guard<std::mutex> guard(
+            layerPagedCacheManagersMutex);
+        std::vector<std::pair<int, PagedCacheManager*> > managers(
+            layerPagedCacheManagers.begin(),
+            layerPagedCacheManagers.end());
+        std::sort(
+            managers.begin(), managers.end(),
+            [](const auto &left, const auto &right) {
+                return left.first < right.first;
+            });
+        uint64_t freed = 0;
+        for (const auto &item : managers) {
+            freed += item.second->EvictCpuTierPayloads(
+                bytesNeeded > freed ? bytesNeeded - freed : 0);
+            if (freed >= bytesNeeded) {
+                break;
+            }
+        }
+        return freed;
+    }
+
+    static void EnsurePagedPrefixSharedBudgetRegistration() {
+        if (!HostCacheBudget::SharedBudgetEnabled()) {
+            return;
+        }
+        static std::once_flag registration;
+        std::call_once(registration, []() {
+            HostCacheBudget::Global().RegisterPrefixEvictor(
+                [](uint64_t bytesNeeded) {
+                    return EvictPagedPrefixCacheCpuTierBytes(
+                        bytesNeeded);
+                });
+        });
+    }
+
     PagedCacheManager* GetPagedCacheManager(int layerIndex) {
         std::lock_guard<std::mutex> guard(layerPagedCacheManagersMutex);
         auto it = layerPagedCacheManagers.find(layerIndex);
@@ -5042,11 +5282,16 @@ namespace fastllm {
             }
         }
 
-        // 懒分配页池：maxPages 作为逻辑预算（scheduler 预留检查、页不足时
-        // Grow 的上限），物理初始池只分配少量页，页数不足时运行期按需增长。
-        // 若按 maxPages 全量预留，V100 上 240K 上下文的 paged KV 池合计约
-        // 7 GB，会叠加在模型加载峰值上导致图像 prefill 运行期 CUDA OOM。
-        const int initialPages = std::max(1, std::min(128, maxPages));
+        // Default to a small physical pool and grow on demand so ordinary
+        // image requests retain activation headroom.  Capacity profiles can
+        // opt into full first-use allocation: this avoids geometric Grow
+        // generations (and their retired buffers) when a request is expected
+        // to consume nearly the entire configured context.
+        const bool preallocateMax = IsEnvValueTrueIgnoreCase(
+            std::getenv("FASTLLM_PAGED_CACHE_PREALLOCATE_MAX"));
+        const int initialPages = preallocateMax
+            ? maxPages
+            : std::max(1, std::min(128, maxPages));
 
         // 初始化 pagedKVCacheData
         ((Data*)manager)->directMemory = true;
@@ -7596,14 +7841,15 @@ namespace fastllm {
         // 页池运行期增长：cudaStreamPerThread 上的在途写入先同步，保证旧页
         // 内容完整后再拷贝；物理页号不变，已用页引用与 Trie 状态原样保留。
         FastllmCudaSyncCurrentThreadStream();
-        size_t oldElements =
-            (size_t)oldPhysicalPages * this->pageLen *
-            this->dims[2] * this->dims[3];
-        size_t newElements =
-            (size_t)newMaxPages * this->pageLen *
-            this->dims[2] * this->dims[3];
-        size_t oldBytes = oldElements * this->unitSize;
-        size_t newBytes = newElements * this->unitSize;
+        const size_t oldRows =
+            (size_t)oldPhysicalPages * this->pageLen * this->dims[2];
+        const size_t newRows =
+            (size_t)newMaxPages * this->pageLen * this->dims[2];
+        const size_t oldBytes =
+            GetDataBytes(this->dataType, oldRows, this->dims[3]);
+        const size_t newBytes =
+            GetDataBytes(this->dataType, newRows, this->dims[3]);
+        const size_t newElements = newRows * this->dims[3];
         uint8_t *newData = (uint8_t*)FastllmCudaDirectMalloc(newBytes);
         if (newData == nullptr) {
             ErrorInFastLLM(
@@ -7625,6 +7871,12 @@ namespace fastllm {
             }
         }
         this->cudaData = newData;
+        // Grow bypasses Data::MallocSpace, so keep Data's ownership metadata
+        // consistent with the new allocation.  Packed KV types cannot derive
+        // bytes from element count * unitSize (Q8 rows are 272 B while
+        // Turbo3 rows are 100 B for headDim=256).
+        this->expansionSize = newElements;
+        this->expansionBytes = newBytes;
 #endif
         this->dims[0] = newMaxPages;
         // 逻辑预算只扩不缩；新增物理页追加到空闲池（页号连续）。
@@ -8014,18 +8266,36 @@ namespace fastllm {
             return true;
         }
 
+        const uint64_t payloadBytes = storedBytes.size();
         const uint64_t maxCpuBytes = PrefixCacheEnvBytes(
             "FASTLLM_PREFIX_CACHE_CPU_MAX_BYTES",
             UINT64_C(4294967296));
+        std::shared_ptr<HostCacheReservation> budgetReservation;
+        if (HostCacheBudget::SharedBudgetEnabled()) {
+            EnsurePagedPrefixSharedBudgetRegistration();
+            HostCacheReservation reservation =
+                HostCacheBudget::Global().TryReserve(
+                    payloadBytes, HostCacheClass::PREFIX_KV);
+            if (!reservation) {
+                return false;
+            }
+            try {
+                budgetReservation =
+                    std::make_shared<HostCacheReservation>(
+                        std::move(reservation));
+            } catch (...) {
+                return false;
+            }
+        }
         uint64_t current =
             pagedPrefixCacheCpuTierBytes.load();
         while (maxCpuBytes == 0 ||
                (current <= maxCpuBytes &&
-                storedBytes.size() <= maxCpuBytes - current)) {
+                payloadBytes <= maxCpuBytes - current)) {
             if (pagedPrefixCacheCpuTierBytes.
                     compare_exchange_weak(
                         current,
-                        current + storedBytes.size())) {
+                        current + payloadBytes)) {
                 try {
                     std::shared_ptr<PagedPrefixCacheTierPayload>
                         payload(new PagedPrefixCacheTierPayload());
@@ -8033,17 +8303,70 @@ namespace fastllm {
                     payload->uncompressedBytes = pageBytes;
                     payload->zstdCompressed = zstdCompressed;
                     payload->checksum = checksum;
+                    payload->budgetReservation =
+                        std::move(budgetReservation);
                     payload->accounted = true;
                     node->tierPayload = std::move(payload);
                     return true;
                 } catch (...) {
                     pagedPrefixCacheCpuTierBytes.fetch_sub(
-                        storedBytes.size());
+                        payloadBytes);
                     return false;
                 }
             }
         }
         return false;
+    }
+
+    uint64_t PagedCacheManager::EvictCpuTierPayloads(
+            uint64_t bytesNeeded) {
+        if (bytesNeeded == 0) {
+            return 0;
+        }
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        std::vector<CacheTrieNode*> candidates;
+        std::function<void(CacheTrieNode*)> collect =
+            [&](CacheTrieNode *node) {
+                if (node == nullptr) {
+                    return;
+                }
+                if (node->tierPayload != nullptr) {
+                    candidates.push_back(node);
+                }
+                for (const auto &item : node->children) {
+                    collect(item.second);
+                }
+            };
+        collect(this->trieRoot);
+        std::sort(
+            candidates.begin(), candidates.end(),
+            [](const CacheTrieNode *left,
+               const CacheTrieNode *right) {
+                if (left->accessCount != right->accessCount) {
+                    return left->accessCount < right->accessCount;
+                }
+                if (left->lastAccessTimestamp !=
+                    right->lastAccessTimestamp) {
+                    return left->lastAccessTimestamp <
+                        right->lastAccessTimestamp;
+                }
+                return left->depthPages > right->depthPages;
+            });
+        uint64_t freed = 0;
+        for (CacheTrieNode *node : candidates) {
+            const uint64_t before =
+                pagedPrefixCacheCpuTierBytes.load();
+            node->tierPayload.reset();
+            const uint64_t after =
+                pagedPrefixCacheCpuTierBytes.load();
+            if (before > after) {
+                freed += before - after;
+            }
+            if (freed >= bytesNeeded) {
+                break;
+            }
+        }
+        return freed;
     }
 
     bool PagedCacheManager::MaterializeTrieNode(

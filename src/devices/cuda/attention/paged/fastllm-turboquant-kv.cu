@@ -210,7 +210,7 @@ __global__ void QuantizeTurbo3RowsKernel(
         const int32_t *pageOffsets, int rows, int sourceSeqLen,
         int pageLen, int numHeads, int headDim, bool batchLayout,
         int sourceTokenOffset, PackedKVMultiPageList multiPages,
-        int multiPageCount, int firstPageOffset) {
+        int multiPageCount, int firstPageOffset, int dstRowLimit) {
     int row = blockIdx.x;
     int group = blockIdx.y;
     int lane = threadIdx.x;
@@ -228,6 +228,27 @@ __global__ void QuantizeTurbo3RowsKernel(
                      (batchLayout ? 0 : token);
     }
     if (pageOffset < 0 || pageOffset >= pageLen) return;
+    // 诊断：页号异常时打印（定位 700 非法地址是页号越界还是指针失效）
+    if (page < 0 || page >= 1024 * 1024) {
+        if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+            printf("[TurboKV] BAD page=%d pageOffset=%d token=%d seqLen=%d "
+                   "pageCount=%d firstPageOffset=%d dst=%p src=%p\n",
+                   page, pageOffset, token, sourceSeqLen,
+                   multiPageCount, firstPageOffset, dst, src);
+        }
+        return;
+    }
+    const size_t dstRow =
+        ((size_t)page * pageLen + pageOffset) * numHeads + head;
+    if (dstRowLimit > 0 && dstRow >= (size_t)dstRowLimit) {
+        if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+            printf("[TurboKV] ROW OOB dstRow=%llu limit=%d page=%d "
+                   "pageOffset=%d token=%d\n",
+                   (unsigned long long)dstRow,
+                   dstRowLimit, page, pageOffset, token);
+        }
+        return;
+    }
     size_t sourceRow = batchLayout
         ? (size_t)token * numHeads + head
         : (size_t)head * sourceSeqLen + sourceTokenOffset + token;
@@ -254,7 +275,6 @@ __global__ void QuantizeTurbo3RowsKernel(
     float totalRecon = warpSums[0] + warpSums[1] + warpSums[2] + warpSums[3];
     float correctedNorm = totalRecon > 1.0e-10f ? norm / sqrtf(totalRecon) : norm;
     constexpr size_t rowBytes = kTurbo3RowBytes;
-    size_t dstRow = ((size_t)page * pageLen + pageOffset) * numHeads + head;
     Turbo3KvBlock *out = reinterpret_cast<Turbo3KvBlock *>(dst + dstRow * rowBytes) + group;
     if (lane == 0) out->norm = FloatToHalfBits(correctedNorm);
     unsigned warpMask = 0xffffffffu;
@@ -357,7 +377,8 @@ bool LaunchCopy(uint8_t *pagedData, int pageIdx, int pageLen, int numHeads,
         dim3 grid(rows, headDim / 128, 1);
         QuantizeTurbo3RowsKernel<SrcT><<<grid, 128, 0, cudaStreamPerThread>>>(
             inputData, pagedData, meta, meta + 1, rows, seqLen, pageLen,
-            numHeads, headDim, false, inputOffset, noMultiPages, 0, 0);
+            numHeads, headDim, false, inputOffset, noMultiPages, 0, 0,
+            -1);
     } else {
         printf("[TurboKV] Copy unsupported dstType=%d\n", (int)dstType);
         fflush(stdout);
@@ -398,7 +419,8 @@ bool LaunchCopyBatch(uint8_t *pagedData, int32_t *pageIds,
         dim3 grid(rows, headDim / 128, 1);
         QuantizeTurbo3RowsKernel<SrcT><<<grid, 128, 0, cudaStreamPerThread>>>(
             inputData, pagedData, pageIds, pageOffsets, rows, 1,
-            pageLen, numHeads, headDim, true, 0, noMultiPages, 0, 0);
+            pageLen, numHeads, headDim, true, 0, noMultiPages, 0, 0,
+            -1);
     } else {
         return false;
     }
@@ -411,7 +433,8 @@ template <typename SrcT>
 bool LaunchCopyMultiPage(uint8_t *pagedData, const int *pageIdxHost,
                          int pageCount, int firstPageOffset, int pageLen,
                          int numHeads, int headDim, fastllm::DataType dstType,
-                         const SrcT *inputData, int seqLen) {
+                         const SrcT *inputData, int seqLen,
+                         int dstRowLimit) {
     if (headDim != kHeadDim || seqLen <= 0 || pageIdxHost == nullptr ||
         pageCount <= 0 || pageCount > kMaxMultiPageCount ||
         firstPageOffset < 0 || firstPageOffset >= pageLen) {
@@ -436,7 +459,8 @@ bool LaunchCopyMultiPage(uint8_t *pagedData, const int *pageIdxHost,
         dim3 grid(rows, headDim / 128, 1);
         QuantizeTurbo3RowsKernel<SrcT><<<grid, 128, 0, cudaStreamPerThread>>>(
             inputData, pagedData, nullptr, nullptr, rows, seqLen, pageLen,
-            numHeads, headDim, false, 0, multiPages, pageCount, firstPageOffset);
+            numHeads, headDim, false, 0, multiPages, pageCount,
+            firstPageOffset, dstRowLimit);
     } else {
         printf("[TurboKV] MultiPageCopy unsupported dstType=%d\n", (int)dstType);
         fflush(stdout);
@@ -487,7 +511,7 @@ bool FastllmCudaPackedKVCacheCopyMultiPage(
         uint8_t *pagedData, const int *pageIdxHost, int pageCount,
         int firstPageOffset, int pageLen, int numHeads, int headDim,
         fastllm::DataType dstType, uint8_t *inputData,
-        fastllm::DataType srcType, int seqLen) {
+        fastllm::DataType srcType, int seqLen, int dstRowLimit) {
     if (!fastllm::IsPackedKVCacheDataType(dstType) || pagedData == nullptr || inputData == nullptr) {
         printf("[TurboKV] MultiPage entry reject: dstType=%d packed=%d pagedData=%p inputData=%p seqLen=%d\n",
                (int)dstType, (int)fastllm::IsPackedKVCacheDataType(dstType),
@@ -498,15 +522,18 @@ bool FastllmCudaPackedKVCacheCopyMultiPage(
     if (srcType == fastllm::DataType::FLOAT16)
         return LaunchCopyMultiPage(pagedData, pageIdxHost, pageCount, firstPageOffset,
                           pageLen, numHeads, headDim, dstType,
-                          reinterpret_cast<const half *>(inputData), seqLen);
+                          reinterpret_cast<const half *>(inputData), seqLen,
+                          dstRowLimit);
     if (srcType == fastllm::DataType::BFLOAT16)
         return LaunchCopyMultiPage(pagedData, pageIdxHost, pageCount, firstPageOffset,
                           pageLen, numHeads, headDim, dstType,
-                          reinterpret_cast<const __nv_bfloat16 *>(inputData), seqLen);
+                          reinterpret_cast<const __nv_bfloat16 *>(inputData), seqLen,
+                          dstRowLimit);
     if (srcType == fastllm::DataType::FLOAT32)
         return LaunchCopyMultiPage(pagedData, pageIdxHost, pageCount, firstPageOffset,
                           pageLen, numHeads, headDim, dstType,
-                          reinterpret_cast<const float *>(inputData), seqLen);
+                          reinterpret_cast<const float *>(inputData), seqLen,
+                          dstRowLimit);
     printf("[TurboKV] MultiPage unsupported srcType=%d seqLen=%d\n",
            (int)srcType, seqLen);
     fflush(stdout);

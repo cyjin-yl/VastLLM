@@ -860,6 +860,26 @@ namespace {
                "persistent trie generation was not prepared.");
         Expect(secondModel.imported == firstModel.exported,
                "persistent model extra did not survive restart.");
+        auto expectLazyDiskMetadata = [](
+                fastllm::PagedCacheManager *manager,
+                const std::string &name) {
+            Expect(manager->pageToTrieNode.empty(),
+                   name + " materialized pages before a token match.");
+            Expect(manager->freePagesSet.size() ==
+                       (size_t)manager->maxPages,
+                   name + " reserved a physical page during metadata restore.");
+            Expect(manager->trieRoot != nullptr &&
+                       !manager->trieRoot->children.empty(),
+                   name + " did not restore trie metadata.");
+            const fastllm::CacheTrieNode *node =
+                manager->trieRoot->children.begin()->second;
+            Expect(node->pageId == -1 &&
+                       node->tierDisk != nullptr &&
+                       node->tierDisk->persistentArchive,
+                   name + " did not retain a lazy persistent disk reference.");
+        };
+        expectLazyDiskMetadata(key, "persistent K cache");
+        expectLazyDiskMetadata(value, "persistent V cache");
         expectRestored(key, expectedKey, "persistent K cache");
         expectRestored(value, expectedValue, "persistent V cache");
         Expect(fastllm::GetPersistentPrefixCacheStatus().restoreHitCount >= 4,
@@ -1375,7 +1395,8 @@ namespace {
             fastllm::Data tensor(
                 fastllm::DataType::FLOAT32,
                 {1, tokens, 1}, values);
-            MtpKvCache &cache = mtpCaches[context];
+            std::lock_guard<std::mutex> guard(mtpCacheMutex);
+            MtpKvCache &cache = GetMtpCache(context);
             cache.key.CopyFrom(tensor);
             cache.value.CopyFrom(tensor);
             cache.tokens = tokens;
@@ -6930,7 +6951,8 @@ namespace {
                 Expect(FastllmCudaPackedKVCacheCopyMultiPage(
                            packedMp, hostPages, 2, 0, pageLen, numHeads,
                            headDim, type, (uint8_t*)source.cudaData,
-                           source.dataType, seqLen),
+                           source.dataType, seqLen,
+                           maxPages * pageLen * numHeads),
                        "packed KV multi-page copy failed.");
                 for (int head = 0; head < numHeads; head++) {
                     void *gHalfMp = FastllmCudaMalloc((size_t)seqLen * headDim * sizeof(uint16_t));

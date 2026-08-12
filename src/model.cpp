@@ -2256,6 +2256,324 @@ namespace fastllm {
         }
     }
 
+    static uint64_t HashMaterializationBytes(uint64_t hash,
+                                             const void *data,
+                                             size_t bytes) {
+        const uint8_t *cursor = static_cast<const uint8_t*>(data);
+        for (size_t i = 0; i < bytes; ++i) {
+            hash ^= cursor[i];
+            hash *= UINT64_C(1099511628211);
+        }
+        return hash;
+    }
+
+    static uint64_t HashMaterializationString(uint64_t hash,
+                                              const std::string &value) {
+        hash = HashMaterializationBytes(hash, value.data(), value.size());
+        const uint8_t terminator = 0;
+        return HashMaterializationBytes(hash, &terminator, sizeof(terminator));
+    }
+
+    static uint64_t GGUFTaskTableFingerprint(
+            const std::vector<ReadGGUFTask> &tasks,
+            const std::string &fileName) {
+        uint64_t hash = UINT64_C(1469598103934665603);
+        for (const auto &task : tasks) {
+            if (task.fileName != fileName) {
+                continue;
+            }
+            hash = HashMaterializationString(hash, task.tensor.name);
+            const int type = static_cast<int>(task.tensor.type);
+            hash = HashMaterializationBytes(hash, &type, sizeof(type));
+            hash = HashMaterializationBytes(hash, &task.offset,
+                                             sizeof(task.offset));
+            const uint64_t bytes = ggml_nbytes(&task.tensor);
+            hash = HashMaterializationBytes(hash, &bytes, sizeof(bytes));
+            const uint64_t dimCount = task.tensor.dims.size();
+            hash = HashMaterializationBytes(hash, &dimCount,
+                                             sizeof(dimCount));
+            if (!task.tensor.dims.empty()) {
+                hash = HashMaterializationBytes(
+                    hash, task.tensor.dims.data(),
+                    task.tensor.dims.size() * sizeof(task.tensor.dims[0]));
+            }
+        }
+        return hash;
+    }
+
+    static uint64_t MaterializedDataChecksum(const Data &data) {
+        const uint64_t bytes = data.GetBytes();
+        AssertInFastLLM(bytes == 0 || data.cpuData != nullptr,
+                        "Materialized tensor checksum requires CPU data.");
+        return HashMaterializationBytes(
+            UINT64_C(1469598103934665603), data.cpuData, bytes);
+    }
+
+    bool basellm::ReloadGGUFWeightSubset(
+            const std::vector<std::string> &weightNames,
+            std::string *error) {
+        if (error != nullptr) {
+            error->clear();
+        }
+        auto fail = [&](const std::string &message) {
+            if (error != nullptr) {
+                *error = message;
+            }
+            return false;
+        };
+
+        try {
+            std::string closureError;
+            const auto closure =
+                weightMaterializationPlan.BuildReloadClosure(
+                    weightNames, &closureError);
+            if (closure.size() == 0 && !weightNames.empty()) {
+                return fail(closureError.empty()
+                                ? "GGUF reload closure is empty"
+                                : closureError);
+            }
+
+            std::map<std::string, std::vector<ReadGGUFTask>> parsedSources;
+            std::map<std::string, std::string> sourceArchitectures;
+            for (const auto *recipe : closure) {
+                if (recipe->kind != WeightRecipeKind::GGUF_DIRECT) {
+                    continue;
+                }
+                const std::string &path = recipe->source.canonicalPath;
+                auto architecture = sourceArchitectures.find(path);
+                if (architecture != sourceArchitectures.end() &&
+                    architecture->second != recipe->sourceArch) {
+                    return fail("conflicting GGUF source architectures for " +
+                                path);
+                }
+                sourceArchitectures[path] = recipe->sourceArch;
+                if (parsedSources.find(path) != parsedSources.end()) {
+                    continue;
+                }
+                std::vector<ReadGGUFTask> parsed;
+                AppendGGUFTasks(recipe->sourceArch, path, parsed);
+                const uint64_t fingerprint =
+                    GGUFTaskTableFingerprint(parsed, path);
+                std::string identityError;
+                if (!ValidateWeightSourceIdentity(
+                        recipe->source, fingerprint, &identityError)) {
+                    return fail(identityError);
+                }
+                parsedSources.emplace(path, std::move(parsed));
+            }
+
+            std::map<uint64_t, size_t> remainingUses;
+            for (const auto *recipe : closure) {
+                remainingUses.emplace(recipe->id, 0);
+            }
+            for (const auto *recipe : closure) {
+                for (uint64_t inputId : recipe->inputIds) {
+                    ++remainingUses[inputId];
+                }
+            }
+
+            const std::set<std::string> requested(weightNames.begin(),
+                                                  weightNames.end());
+            std::set<std::string> published;
+            std::map<uint64_t, std::unique_ptr<Data>> materialized;
+            for (const auto *recipe : closure) {
+                std::unique_ptr<Data> output;
+                if (recipe->kind == WeightRecipeKind::GGUF_DIRECT) {
+                    auto source = parsedSources.find(
+                        recipe->source.canonicalPath);
+                    if (source == parsedSources.end()) {
+                        return fail("validated GGUF source is missing");
+                    }
+                    const ReadGGUFTask *sourceTask = nullptr;
+                    for (const auto &candidate : source->second) {
+                        if (candidate.tensor.name ==
+                                recipe->sourceTensorName &&
+                            candidate.offset == recipe->sourceOffset) {
+                            sourceTask = &candidate;
+                            break;
+                        }
+                    }
+                    if (sourceTask == nullptr ||
+                        static_cast<int>(sourceTask->tensor.type) !=
+                            recipe->ggmlType ||
+                        ggml_nbytes(&sourceTask->tensor) !=
+                            recipe->sourceBytes) {
+                        return fail("GGUF tensor metadata changed for " +
+                                    recipe->outputName);
+                    }
+
+                    std::string sourcePath = source->first;
+                    output.reset(new Data());
+                    WeightImportGGUFTensor(
+                        output.get(),
+                        const_cast<ggml_tensor*>(&sourceTask->tensor),
+                        sourcePath,
+                        recipe->sourceOffset,
+                        static_cast<
+                            GGUFWeightReplaceRule::GGUFWeightReplaceType>(
+                                recipe->replaceType),
+                        recipe->untileNumKHeads,
+                        recipe->untileNumVHeads,
+                        recipe->untileVRowStart,
+                        recipe->untileComposeNegLog);
+                    output->name = recipe->outputName;
+                    output->isModelWeight = true;
+                } else {
+                    if (recipe->inputIds.empty()) {
+                        return fail("merge recipe has no inputs: " +
+                                    recipe->outputName);
+                    }
+                    std::vector<Data*> inputs;
+                    inputs.reserve(recipe->inputIds.size());
+                    for (uint64_t inputId : recipe->inputIds) {
+                        auto input = materialized.find(inputId);
+                        if (input == materialized.end()) {
+                            return fail("merge dependency is unavailable for " +
+                                        recipe->outputName);
+                        }
+                        inputs.push_back(input->second.get());
+                    }
+                    const Data &first = *inputs.front();
+                    if (first.dims.empty() || first.dims.size() > 2) {
+                        return fail("unsupported merge rank for " +
+                                    recipe->outputName);
+                    }
+                    std::vector<int> dims = first.dims;
+                    dims[0] = 0;
+                    for (const Data *input : inputs) {
+                        if (input->dataType != first.dataType ||
+                            input->dims.size() != first.dims.size() ||
+                            (input->dims.size() == 2 &&
+                             input->dims[1] != first.dims[1])) {
+                            return fail("merge dependency metadata mismatch for " +
+                                        recipe->outputName);
+                        }
+                        dims[0] += input->dims[0];
+                    }
+
+                    if (first.dataType == DataType::DATA_GGUF_FORMAT) {
+                        output.reset(new Data(first.dataType));
+                        output->ggmlType = first.ggmlType;
+                        output->Resize(dims);
+                        if (first.ggmlTensor == nullptr) {
+                            return fail("GGUF merge input has no tensor metadata");
+                        }
+                        output->ggmlTensor =
+                            static_cast<void*>(new ggml_tensor(
+                                *static_cast<ggml_tensor*>(
+                                    first.ggmlTensor)));
+                        UpdateGGUFTensorShape(
+                            static_cast<ggml_tensor*>(output->ggmlTensor),
+                            dims);
+                        output->isGGUFData = true;
+                        output->expansionBytes = ggml_nbytes(
+                            static_cast<ggml_tensor*>(output->ggmlTensor));
+                    } else {
+                        output.reset(new Data(first.dataType, dims));
+                    }
+                    output->name = recipe->outputName;
+                    output->isModelWeight = true;
+                    output->perChannelAxis = first.perChannelAxis;
+                    output->group = first.group;
+                    output->groupCnt = first.groupCnt;
+                    output->blockK = first.blockK;
+                    output->blockM = first.blockM;
+                    output->Allocate();
+                    uint64_t weightOffset = 0;
+                    uint64_t scaleOffset = 0;
+                    const bool compactNVFP4 =
+                        IsCompactNVFP4Weight(*output);
+                    for (const Data *input : inputs) {
+                        output->perChannelsConfigs = AppendVector(
+                            output->perChannelsConfigs,
+                            input->perChannelsConfigs);
+                        output->zeros = AppendVector(output->zeros,
+                                                     input->zeros);
+                        output->scales = AppendVector(output->scales,
+                                                      input->scales);
+                        output->mins = AppendVector(output->mins,
+                                                    input->mins);
+                        output->halfScales = AppendVector(
+                            output->halfScales, input->halfScales);
+                        if (compactNVFP4) {
+                            AppendCompactNVFP4Weight(
+                                *output, *input,
+                                weightOffset, scaleOffset);
+                        } else {
+                            std::memcpy(
+                                output->cpuData + weightOffset,
+                                input->cpuData, input->GetBytes());
+                            weightOffset += input->GetBytes();
+                        }
+                    }
+                    output->CalcWeightSum();
+                }
+
+                if (output->dataType != recipe->outputType ||
+                    output->dims != recipe->outputDims ||
+                    output->GetBytes() != recipe->finalBytes) {
+                    return fail("materialized tensor metadata mismatch for " +
+                                recipe->outputName);
+                }
+                if (!recipe->checksumAvailable ||
+                    output->cpuData == nullptr ||
+                    MaterializedDataChecksum(*output) !=
+                        recipe->finalChecksum) {
+                    return fail("materialized tensor checksum mismatch for " +
+                                recipe->outputName);
+                }
+
+                materialized.emplace(recipe->id, std::move(output));
+                if (requested.find(recipe->outputName) != requested.end()) {
+                    auto target = weight.weight.find(recipe->outputName);
+                    if (target == weight.weight.end()) {
+                        return fail("model weight target is missing: " +
+                                    recipe->outputName);
+                    }
+                    Data &targetData = target->second;
+                    Data &sourceData = *materialized.at(recipe->id);
+                    if (targetData.cpuData != nullptr ||
+                        targetData.cudaData != nullptr ||
+                        targetData.dataType != sourceData.dataType ||
+                        targetData.dims != sourceData.dims ||
+                        targetData.GetBytes() != sourceData.GetBytes()) {
+                        return fail("model weight target is not empty or changed: " +
+                                    recipe->outputName);
+                    }
+                    targetData.cpuData = sourceData.cpuData;
+                    sourceData.cpuData = nullptr;
+                    targetData.dataDevice = DataDevice::CPU;
+                    MoveSpecialWeightToCudaIfNeeded(
+                        recipe->outputName, targetData);
+                    published.insert(recipe->outputName);
+                }
+
+                for (uint64_t inputId : recipe->inputIds) {
+                    auto uses = remainingUses.find(inputId);
+                    if (uses == remainingUses.end() || uses->second == 0) {
+                        return fail("invalid materialization dependency count");
+                    }
+                    --uses->second;
+                    if (uses->second == 0) {
+                        materialized.erase(inputId);
+                    }
+                }
+                if (remainingUses[recipe->id] == 0 &&
+                    published.find(recipe->outputName) != published.end()) {
+                    materialized.erase(recipe->id);
+                }
+            }
+            if (published != requested) {
+                return fail("not every requested model weight was restored");
+            }
+            return true;
+        } catch (const std::exception &ex) {
+            return fail(ex.what());
+        } catch (...) {
+            return fail("unknown GGUF partial reload failure");
+        }
+    }
+
     std::string Base64Decode(const std::string &encoded) {
         static const std::string base64_chars =
              "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -3580,6 +3898,52 @@ namespace fastllm {
             readGGUFTaskDict[readGGUFTasks[i].name] = &readGGUFTasks[i];
             totalLoadBytes += ggml_nbytes(&readGGUFTasks[i].tensor);
         }
+
+        model->weightMaterializationPlan.Clear();
+        std::map<std::string, WeightSourceIdentity> sourceIdentities;
+        std::map<std::string, WeightMaterializationRecipe> directRecipes;
+        std::map<std::string, WeightMaterializationRecipe> mergeRecipes;
+        uint64_t nextRecipeId = 1;
+        for (const auto &task : readGGUFTasks) {
+            if (IsGGUFTaskBeyondMainLayers(task.name, ggufMainLayerCount)) {
+                continue;
+            }
+            auto identity = sourceIdentities.find(task.fileName);
+            if (identity == sourceIdentities.end()) {
+                WeightSourceIdentity captured;
+                std::string sourceError;
+                const uint64_t fingerprint =
+                    GGUFTaskTableFingerprint(readGGUFTasks, task.fileName);
+                AssertInFastLLM(
+                    CaptureWeightSourceIdentity(task.fileName, fingerprint,
+                                                captured, &sourceError),
+                    sourceError);
+                identity = sourceIdentities.emplace(task.fileName,
+                                                    std::move(captured)).first;
+            }
+            WeightMaterializationRecipe recipe;
+            recipe.id = nextRecipeId++;
+            recipe.kind = WeightRecipeKind::GGUF_DIRECT;
+            recipe.outputName = task.name;
+            recipe.source = identity->second;
+            recipe.sourceTensorName = task.tensor.name;
+            recipe.sourceArch =
+                std::find(multimodalProjectorFiles.begin(),
+                          multimodalProjectorFiles.end(),
+                          task.fileName) != multimodalProjectorFiles.end()
+                    ? "qwen3_5_mmproj" : arch;
+            recipe.sourceOffset = task.offset;
+            recipe.sourceBytes = ggml_nbytes(&task.tensor);
+            recipe.ggmlType = static_cast<int>(task.tensor.type);
+            recipe.replaceType = static_cast<int>(task.replaceType);
+            recipe.untileNumKHeads = task.untileNumKHeads;
+            recipe.untileNumVHeads = task.untileNumVHeads;
+            recipe.untileVRowStart = task.untileVRowStart;
+            recipe.untileComposeNegLog = task.untileComposeNegLog;
+            AssertInFastLLM(
+                directRecipes.emplace(task.name, std::move(recipe)).second,
+                "Duplicate GGUF materialization output: " + task.name);
+        }
         for (const auto &entry : dsparkImportSources) {
             const std::string &weightName = entry.first;
             const std::string &sourceName = entry.second;
@@ -3665,6 +4029,18 @@ namespace fastllm {
                                                        task->untileNumKHeads, task->untileNumVHeads,
                                                        task->untileVRowStart, task->untileComposeNegLog);
                             }
+                            auto manifest = directRecipes.find(weightName);
+                            AssertInFastLLM(manifest != directRecipes.end(),
+                                            "Missing GGUF materialization manifest: " +
+                                            weightName);
+                            manifest->second.outputType = task->weight->dataType;
+                            manifest->second.outputDims = task->weight->dims;
+                            manifest->second.finalBytes = task->weight->GetBytes();
+                            manifest->second.finalChecksum =
+                                task->weight->cpuData == nullptr
+                                    ? 0 : MaterializedDataChecksum(*task->weight);
+                            manifest->second.checksumAvailable =
+                                task->weight->cpuData != nullptr;
                         } else if (dsparkTensors != nullptr) {
                             auto dsparkSource = dsparkImportSources.find(weightName);
                             if (dsparkSource != dsparkImportSources.end()) {
@@ -3800,6 +4176,43 @@ namespace fastllm {
                                             }
                                             mergeData.CalcWeightSum();
                                         }
+                                        WeightMaterializationRecipe manifest;
+                                        manifest.id = 0;
+                                        manifest.kind = WeightRecipeKind::MERGE;
+                                        manifest.outputName = mergeName;
+                                        manifest.outputType = mergeData.dataType;
+                                        manifest.outputDims = mergeData.dims;
+                                        manifest.mergeType = it.type;
+                                        manifest.finalBytes = mergeData.GetBytes();
+                                        manifest.finalChecksum =
+                                            mergeData.cpuData == nullptr
+                                                ? 0 : MaterializedDataChecksum(mergeData);
+                                        manifest.checksumAvailable =
+                                            mergeData.cpuData != nullptr;
+                                        workerLock.lock();
+                                        manifest.id = nextRecipeId++;
+                                        for (const auto &inputName : it.inputs) {
+                                            auto direct = directRecipes.find(inputName);
+                                            if (direct != directRecipes.end()) {
+                                                manifest.inputIds.push_back(
+                                                    direct->second.id);
+                                                continue;
+                                            }
+                                            auto merged = mergeRecipes.find(inputName);
+                                            AssertInFastLLM(
+                                                merged != mergeRecipes.end(),
+                                                "Missing materialization input: " +
+                                                inputName);
+                                            manifest.inputIds.push_back(
+                                                merged->second.id);
+                                        }
+                                        AssertInFastLLM(
+                                            mergeRecipes.emplace(
+                                                mergeName,
+                                                std::move(manifest)).second,
+                                            "Duplicate merge materialization output: " +
+                                            mergeName);
+                                        workerLock.unlock();
 #ifdef USE_TFACC
                                         try {
                                             if (model->ShouldRegisterSpecialWeightForDeviceType(mergeName, "tfacc")) {
@@ -3899,6 +4312,28 @@ namespace fastllm {
         for (auto &error : threadErrors) {
             if (error) {
                 std::rethrow_exception(error);
+            }
+        }
+        {
+            std::vector<WeightMaterializationRecipe> recipes;
+            recipes.reserve(directRecipes.size() + mergeRecipes.size());
+            for (const auto &entry : directRecipes) {
+                recipes.push_back(entry.second);
+            }
+            for (const auto &entry : mergeRecipes) {
+                recipes.push_back(entry.second);
+            }
+            std::sort(recipes.begin(), recipes.end(),
+                      [](const WeightMaterializationRecipe &left,
+                         const WeightMaterializationRecipe &right) {
+                          return left.id < right.id;
+                      });
+            for (const auto &recipe : recipes) {
+                std::string planError;
+                AssertInFastLLM(
+                    model->weightMaterializationPlan.AddRecipe(
+                        recipe, &planError),
+                    planError);
             }
         }
         model->OnModelWeightsLoaded();

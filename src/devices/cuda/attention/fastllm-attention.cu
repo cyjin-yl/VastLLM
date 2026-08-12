@@ -2050,7 +2050,8 @@ bool FastllmCudaPagedCacheCopyMultiPage(
     fastllm::DataType dstType,
     uint8_t *inputData,
     fastllm::DataType srcType,
-    int seqLen) {
+    int seqLen,
+    int dstRowLimit) {
     if (pageIdxHost == nullptr || pageCount <= 0 ||
         pageCount > FASTLLM_PAGED_CACHE_COPY_MULTI_MAX_PAGES ||
         firstPageOffset < 0 || firstPageOffset >= pageLen) {
@@ -2067,7 +2068,8 @@ bool FastllmCudaPagedCacheCopyMultiPage(
     if (fastllm::IsPackedKVCacheDataType(dstType)) {
         return FastllmCudaPackedKVCacheCopyMultiPage(
             pagedData, pageIdxHost, pageCount, firstPageOffset, pageLen,
-            numHeads, headDim, dstType, inputData, srcType, seqLen);
+            numHeads, headDim, dstType, inputData, srcType, seqLen,
+            dstRowLimit);
     }
 
     FastllmPagedCacheCopyPageList pageList = {};

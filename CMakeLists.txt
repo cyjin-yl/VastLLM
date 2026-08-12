@@ -206,7 +206,7 @@ message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
 file(GLOB GRAPH_MODEL_FILES "src/models/graph/*.cpp")
 file(GLOB BLOCK_FILES "src/blocks/*.cpp")
 file(GLOB CPU_DEVICE_FILES "src/devices/cpu/*.cpp")
-set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/prefixcache_persistence.cpp src/device.cpp src/model.cpp src/executor.cpp src/template.cpp src/graph.cpp src/tokenizer.cpp
+set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/prefixcache_persistence.cpp src/host_offload.cpp src/weight_materialization.cpp src/device.cpp src/model.cpp src/executor.cpp src/template.cpp src/graph.cpp src/tokenizer.cpp
         src/devices/disk/diskdevice.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp
         src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp
@@ -618,6 +618,18 @@ if (UNIT_TEST)
     add_executable(testTokenizer test/ops/tokenizerTest.cpp)
     target_link_libraries(testTokenizer fastllm)
 
+    add_executable(testHostCacheBudget
+        test/host_offload/hostCacheBudgetTest.cpp)
+    target_link_libraries(testHostCacheBudget fastllm)
+
+    add_executable(testMaterializationPlan
+        test/host_offload/materializationPlanTest.cpp)
+    target_link_libraries(testMaterializationPlan fastllm)
+
+    add_executable(testHostOffloadLifecycle
+        test/host_offload/hostOffloadLifecycleTest.cpp)
+    target_link_libraries(testHostOffloadLifecycle fastllm)
+
     add_executable(regressionOps test/ops/regressionOps.cpp)
     target_link_libraries(regressionOps fastllm)
     if (USE_CUDA AND NOT USE_ROCM)
@@ -679,7 +691,18 @@ if (UNIT_TEST)
     target_include_directories(testCheckpointControl PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR})
 
+    add_executable(testHostOffloadControl
+        test/apiserver/hostOffloadControlTest.cpp)
+    target_include_directories(testHostOffloadControl PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
+
     if (USE_CUDA AND NOT USE_ROCM)
+        add_executable(testDataStorageMigration
+            test/host_offload/dataStorageMigrationTest.cpp)
+        target_include_directories(testDataStorageMigration PRIVATE
+            ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_link_libraries(testDataStorageMigration fastllm)
+
         add_executable(cudaGraphPoolMissRegression test/ops/cudaGraphPoolMissRegression.cpp)
         target_include_directories(cudaGraphPoolMissRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         target_link_libraries(cudaGraphPoolMissRegression PRIVATE fastllm)

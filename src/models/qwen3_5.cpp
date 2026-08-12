@@ -8356,6 +8356,38 @@ namespace fastllm {
 #endif
     }
 
+    void Qwen3_5Model::PrepareHostWeightSuspend() {
+#ifdef USE_CUDA
+        ResetCudaServingForKvCacheResize();
+        {
+            std::lock_guard<std::mutex> guard(mtpCacheMutex);
+            mtpCaches.clear();
+        }
+        int previousDevice = FastllmCudaGetDevice();
+        for (auto &entry : mtpDraftLmHeadWeights) {
+            FastllmCudaSetDevice(entry.first);
+            delete entry.second;
+        }
+        mtpDraftLmHeadWeights.clear();
+        if (previousDevice >= 0) {
+            FastllmCudaSetDevice(previousDevice);
+        }
+        mtpMoeWeights.clear();
+        mtpMoeBiass.clear();
+        mtpWeightsPrepared = false;
+        mtpSharedWeightsPrepared = false;
+        mtpWeightsPreparedDevice = -1;
+        mtpCudaServingWarmupPrepared = false;
+        threadTpEmptyBiases.clear();
+#endif
+        ClearAllPagedCacheManagers();
+        FastllmCudaClearBigBuffer();
+    }
+
+    void Qwen3_5Model::RestoreAfterHostWeightResume() {
+        AutoWarmup();
+    }
+
     void Qwen3_5Model::OnAutoWarmupFinished() {
 #ifdef USE_CUDA
         PrepareMtpCudaServingWarmup();
@@ -21660,6 +21692,14 @@ namespace fastllm {
                    rope_yarn_beta_fast, rope_yarn_beta_slow,
                    rope_yarn_original_max_position,
                    rope_yarn_correction_low, rope_yarn_correction_high);
+            // YaRN 外推：把调度器的上下文上限同步扩展到
+            // original_max * factor（262144 -> 327680 @1.25）。否则
+            // >max_positions 的 prompt 会被主循环以 PromptTooLong 静默
+            // 截断成空响应，long-context 请求根本无法进入 prefill。
+            max_positions = std::max(
+                max_positions,
+                (int)(rope_yarn_original_max_position *
+                      rope_yarn_factor + 0.5f));
             fflush(stdout);
         }
         mrope_sections = {11, 11, 10};
