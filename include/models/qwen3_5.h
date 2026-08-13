@@ -75,6 +75,7 @@ namespace fastllm {
     bool Qwen35ResidentPlainBatchEnabled();
     bool Qwen35BatchedMtpEnabled();
     bool Qwen35Turbo3KvEnabled();
+    bool Qwen35Turbo4KvEnabled();
     DataType ResolveQwen35CudaCacheType(DataType cacheType, DataType computeType);
     size_t Qwen35PagedCachePageBytes(
             DataType type, int pageLen, int numHeads, int headDim);

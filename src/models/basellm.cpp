@@ -4826,8 +4826,11 @@ namespace fastllm {
         if (value == "turbo3" || value == "turbo3_kv") {
             return DataType::TURBO3_KV;
         }
+        if (value == "turbo4" || value == "turbo4_kv") {
+            return DataType::TURBO4_KV;
+        }
         throw std::invalid_argument(
-            "KV cache dtype should be auto, float32, float16, bfloat16, fp8_e4m3 or turbo3.");
+            "KV cache dtype should be auto, float32, float16, bfloat16, fp8_e4m3, turbo3 or turbo4.");
     }
 
     void basellm::SetTokenLimit(int tokens) {

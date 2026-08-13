@@ -24,9 +24,12 @@ constexpr int kQ8BlockValues = 32;
 constexpr int kQ8BlockBytes = 34;
 constexpr int kTurbo3BlockValues = 128;
 constexpr int kTurbo3BlockBytes = 50;
+constexpr int kTurbo4BlockValues = 128;
+constexpr int kTurbo4BlockBytes = 66;
 constexpr int kQ8RowBytes = (kHeadDim / kQ8BlockValues) * kQ8BlockBytes;
 constexpr int kTurbo3RowBytes = (kHeadDim / kTurbo3BlockValues) * kTurbo3BlockBytes;
-static_assert(kQ8RowBytes == 272 && kTurbo3RowBytes == 100,
+constexpr int kTurbo4RowBytes = (kHeadDim / kTurbo4BlockValues) * kTurbo4BlockBytes;
+static_assert(kQ8RowBytes == 272 && kTurbo3RowBytes == 100 && kTurbo4RowBytes == 132,
               "Qwen3.5 TurboQuant packed KV row bytes changed");
 
 struct Q8KvBlock {
@@ -43,6 +46,13 @@ struct Turbo3KvBlock {
 static_assert(sizeof(Turbo3KvBlock) == kTurbo3BlockBytes,
               "Turbo3 KV must remain 50 bytes per 128 values");
 
+struct Turbo4KvBlock {
+    uint16_t norm;
+    uint8_t qs[64];
+};
+static_assert(sizeof(Turbo4KvBlock) == kTurbo4BlockBytes,
+              "Turbo4 KV must remain 66 bytes per 128 values");
+
 __device__ __constant__ float kTurbo3Centroids[8] = {
     -0.190207f, -0.118786f, -0.066822f, -0.021663f,
      0.021663f,  0.066822f,  0.118786f,  0.190207f
@@ -51,6 +61,19 @@ __device__ __constant__ float kTurbo3Midpoints[7] = {
     -0.154496f, -0.092804f, -0.044243f, 0.0f,
      0.044243f,  0.092804f,  0.154496f
 };
+__device__ __constant__ float kTurbo4Centroids[16] = {
+    -0.241529f, -0.182877f, -0.143016f, -0.111036f,
+    -0.083292f, -0.058050f, -0.034299f, -0.011349f,
+     0.011349f,  0.034299f,  0.058050f,  0.083292f,
+     0.111036f,  0.143016f,  0.182877f,  0.241529f
+};
+__device__ __constant__ float kTurbo4Midpoints[15] = {
+    -0.212203f, -0.162947f, -0.127026f, -0.097164f,
+    -0.070671f, -0.046174f, -0.022824f,  0.000000f,
+     0.022824f,  0.046174f,  0.070671f,  0.097164f,
+     0.127026f,  0.162947f,  0.212203f
+};
+
 __device__ __constant__ float kWhtSigns1[128] = {
     -1,1,1,-1,-1,1,-1,1,-1,-1,1,1,1,1,1,1,
     1,-1,1,-1,1,-1,-1,1,1,1,-1,1,1,-1,-1,-1,
@@ -102,6 +125,24 @@ __device__ __forceinline__ uint8_t NearestTurbo3(float value) {
     if (value < kTurbo3Midpoints[5]) return 5;
     if (value < kTurbo3Midpoints[6]) return 6;
     return 7;
+}
+__device__ __forceinline__ uint8_t NearestTurbo4(float value) {
+    if (value < kTurbo4Midpoints[0]) return 0;
+    if (value < kTurbo4Midpoints[1]) return 1;
+    if (value < kTurbo4Midpoints[2]) return 2;
+    if (value < kTurbo4Midpoints[3]) return 3;
+    if (value < kTurbo4Midpoints[4]) return 4;
+    if (value < kTurbo4Midpoints[5]) return 5;
+    if (value < kTurbo4Midpoints[6]) return 6;
+    if (value < kTurbo4Midpoints[7]) return 7;
+    if (value < kTurbo4Midpoints[8]) return 8;
+    if (value < kTurbo4Midpoints[9]) return 9;
+    if (value < kTurbo4Midpoints[10]) return 10;
+    if (value < kTurbo4Midpoints[11]) return 11;
+    if (value < kTurbo4Midpoints[12]) return 12;
+    if (value < kTurbo4Midpoints[13]) return 13;
+    if (value < kTurbo4Midpoints[14]) return 14;
+    return 15;
 }
 
 __device__ __forceinline__ void WhtStage(float *x, int lane, int h) {
@@ -289,6 +330,86 @@ __global__ void QuantizeTurbo3RowsKernel(
     if ((warpLane & 7) == 0)
         out->high1[lane / 8] = static_cast<uint8_t>((high >> ((warpLane / 8) * 8)) & 0xff);
 }
+template <typename SrcT>
+__global__ void QuantizeTurbo4RowsKernel(
+        const SrcT *src, uint8_t *dst, const int32_t *pageIds,
+        const int32_t *pageOffsets, int rows, int sourceSeqLen,
+        int pageLen, int numHeads, int headDim, bool batchLayout,
+        int sourceTokenOffset, PackedKVMultiPageList multiPages,
+        int multiPageCount, int firstPageOffset, int dstRowLimit) {
+    int row = blockIdx.x;
+    int group = blockIdx.y;
+    int lane = threadIdx.x;
+    if (row >= rows || group >= headDim / kTurbo4BlockValues || lane >= kTurbo4BlockValues) return;
+    int copiedTokens = rows / numHeads;
+    int token = batchLayout ? row / numHeads : row % copiedTokens;
+    int head = batchLayout ? row % numHeads : row / copiedTokens;
+    int page, pageOffset;
+    if (multiPageCount > 0) {
+        MultiPageLocate(multiPages, multiPageCount, firstPageOffset,
+                        pageLen, token, page, pageOffset);
+    } else {
+        page = pageIds[batchLayout ? token : 0];
+        pageOffset = pageOffsets[batchLayout ? token : 0] +
+                     (batchLayout ? 0 : token);
+    }
+    if (pageOffset < 0 || pageOffset >= pageLen) return;
+    if (page < 0 || page >= 1024 * 1024) {
+        if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+            printf("[TurboKV] BAD page=%d pageOffset=%d token=%d seqLen=%d "
+                   "pageCount=%d firstPageOffset=%d dst=%p src=%p\n",
+                   page, pageOffset, token, sourceSeqLen,
+                   multiPageCount, firstPageOffset, dst, src);
+        }
+        return;
+    }
+    const size_t dstRow =
+        ((size_t)page * pageLen + pageOffset) * numHeads + head;
+    if (dstRowLimit > 0 && dstRow >= (size_t)dstRowLimit) {
+        if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+            printf("[TurboKV] ROW OOB dstRow=%llu limit=%d page=%d "
+                   "pageOffset=%d token=%d\n",
+                   (unsigned long long)dstRow,
+                   dstRowLimit, page, pageOffset, token);
+        }
+        return;
+    }
+    size_t sourceRow = batchLayout
+        ? (size_t)token * numHeads + head
+        : (size_t)head * sourceSeqLen + sourceTokenOffset + token;
+    __shared__ float x[kTurbo4BlockValues];
+    __shared__ float warpSums[4];
+    x[lane] = LoadSource(src, sourceRow * headDim + group * kTurbo4BlockValues + lane);
+    __syncthreads();
+    float sq = x[lane] * x[lane];
+    for (int off = 16; off > 0; off >>= 1)
+        sq += __shfl_down_sync(0xffffffff, sq, off);
+    if ((lane & 31) == 0) warpSums[lane >> 5] = sq;
+    __syncthreads();
+    float normSq = warpSums[0] + warpSums[1] + warpSums[2] + warpSums[3];
+    float norm = sqrtf(normSq);
+    x[lane] = norm > 1.0e-10f ? x[lane] / norm : 0.0f;
+    __syncthreads();
+    ForwardWht128(x, lane);
+    uint8_t index = NearestTurbo4(x[lane]);
+    float reconSq = kTurbo4Centroids[index] * kTurbo4Centroids[index];
+    for (int off = 16; off > 0; off >>= 1)
+        reconSq += __shfl_down_sync(0xffffffff, reconSq, off);
+    if ((lane & 31) == 0) warpSums[lane >> 5] = reconSq;
+    __syncthreads();
+    float totalRecon = warpSums[0] + warpSums[1] + warpSums[2] + warpSums[3];
+    float correctedNorm = totalRecon > 1.0e-10f ? norm / sqrtf(totalRecon) : norm;
+    constexpr size_t rowBytes = kTurbo4RowBytes;
+    Turbo4KvBlock *out = reinterpret_cast<Turbo4KvBlock *>(dst + dstRow * rowBytes) + group;
+    if (lane == 0) out->norm = FloatToHalfBits(correctedNorm);
+    unsigned warpMask = 0xffffffffu;
+    int warpLane = lane & 31;
+    uint8_t high = __shfl_sync(warpMask, index, (warpLane & ~1) + 1);
+    if ((lane & 1) == 0) {
+        out->qs[lane / 2] = static_cast<uint8_t>(
+            (index & 0xF) | ((high & 0xF) << 4));
+    }
+}
 
 __global__ void GatherQ8HeadRangeKernel(
         const uint8_t *src, const int32_t *pageIndices, int kvStart,
@@ -332,6 +453,30 @@ __global__ void GatherTurbo3HeadRangeKernel(
     __syncthreads();
     InverseWht128(x, lane);
     out[(size_t)tokenInChunk * headDim + group * 128 + lane] = __float2half_rn(x[lane]);
+}
+__global__ void GatherTurbo4HeadRangeKernel(
+        const uint8_t *src, const int32_t *pageIndices, int kvStart,
+        int chunkLen, int pageLen, int numHeads, int headDim, int head,
+        half *out) {
+    int tokenInChunk = blockIdx.x;
+    int group = blockIdx.y;
+    int lane = threadIdx.x;
+    if (tokenInChunk >= chunkLen || lane >= kTurbo4BlockValues) return;
+    int logicalToken = kvStart + tokenInChunk;
+    int pageList = logicalToken / pageLen;
+    int pageOffset = logicalToken % pageLen;
+    int page = pageIndices[pageList];
+    constexpr size_t rowBytes = kTurbo4RowBytes;
+    size_t row = ((size_t)page * pageLen + pageOffset) * numHeads + head;
+    const Turbo4KvBlock *block = reinterpret_cast<const Turbo4KvBlock *>(src + row * rowBytes) + group;
+    uint8_t index = static_cast<uint8_t>(
+        (block->qs[lane / 2] >> ((lane & 1) * 4)) & 0xF);
+    __shared__ float x[kTurbo4BlockValues];
+    x[lane] = kTurbo4Centroids[index] * HalfBitsToFloat(block->norm);
+    __syncthreads();
+    InverseWht128(x, lane);
+    out[(size_t)tokenInChunk * headDim + group * kTurbo4BlockValues + lane] =
+        __float2half_rn(x[lane]);
 }
 
 template <typename SrcT>
@@ -379,6 +524,12 @@ bool LaunchCopy(uint8_t *pagedData, int pageIdx, int pageLen, int numHeads,
             inputData, pagedData, meta, meta + 1, rows, seqLen, pageLen,
             numHeads, headDim, false, inputOffset, noMultiPages, 0, 0,
             -1);
+    } else if (dstType == fastllm::DataType::TURBO4_KV) {
+        dim3 grid(rows, headDim / kTurbo4BlockValues, 1);
+        QuantizeTurbo4RowsKernel<SrcT><<<grid, kTurbo4BlockValues, 0, cudaStreamPerThread>>>(
+            inputData, pagedData, meta, meta + 1, rows, seqLen, pageLen,
+            numHeads, headDim, false, inputOffset, noMultiPages, 0, 0,
+            -1);
     } else {
         printf("[TurboKV] Copy unsupported dstType=%d\n", (int)dstType);
         fflush(stdout);
@@ -421,6 +572,12 @@ bool LaunchCopyBatch(uint8_t *pagedData, int32_t *pageIds,
             inputData, pagedData, pageIds, pageOffsets, rows, 1,
             pageLen, numHeads, headDim, true, 0, noMultiPages, 0, 0,
             -1);
+    } else if (dstType == fastllm::DataType::TURBO4_KV) {
+        dim3 grid(rows, headDim / kTurbo4BlockValues, 1);
+        QuantizeTurbo4RowsKernel<SrcT><<<grid, kTurbo4BlockValues, 0, cudaStreamPerThread>>>(
+            inputData, pagedData, pageIds, pageOffsets, rows, 1,
+            pageLen, numHeads, headDim, true, 0, noMultiPages, 0, 0,
+            -1);
     } else {
         return false;
     }
@@ -458,6 +615,12 @@ bool LaunchCopyMultiPage(uint8_t *pagedData, const int *pageIdxHost,
     } else if (dstType == fastllm::DataType::TURBO3_KV) {
         dim3 grid(rows, headDim / 128, 1);
         QuantizeTurbo3RowsKernel<SrcT><<<grid, 128, 0, cudaStreamPerThread>>>(
+            inputData, pagedData, nullptr, nullptr, rows, seqLen, pageLen,
+            numHeads, headDim, false, 0, multiPages, pageCount,
+            firstPageOffset, dstRowLimit);
+    } else if (dstType == fastllm::DataType::TURBO4_KV) {
+        dim3 grid(rows, headDim / kTurbo4BlockValues, 1);
+        QuantizeTurbo4RowsKernel<SrcT><<<grid, kTurbo4BlockValues, 0, cudaStreamPerThread>>>(
             inputData, pagedData, nullptr, nullptr, rows, seqLen, pageLen,
             numHeads, headDim, false, 0, multiPages, pageCount,
             firstPageOffset, dstRowLimit);
@@ -577,6 +740,11 @@ bool FastllmCudaPackedKVCacheGatherHeadRangeToHalf(
     } else if (srcType == fastllm::DataType::TURBO3_KV) {
         dim3 grid(chunkLen, headDim / 128, 1);
         GatherTurbo3HeadRangeKernel<<<grid, 128, 0, cudaStreamPerThread>>>(
+            pagedData, pageIndices, kvStart, chunkLen, pageLen,
+            numHeads, headDim, head, reinterpret_cast<half *>(output));
+    } else if (srcType == fastllm::DataType::TURBO4_KV) {
+        dim3 grid(chunkLen, headDim / kTurbo4BlockValues, 1);
+        GatherTurbo4HeadRangeKernel<<<grid, kTurbo4BlockValues, 0, cudaStreamPerThread>>>(
             pagedData, pageIndices, kvStart, chunkLen, pageLen,
             numHeads, headDim, head, reinterpret_cast<half *>(output));
     } else {

@@ -204,6 +204,17 @@ namespace fastllm {
         return lowered == "true" || lowered == "1" ||
                lowered == "yes" || lowered == "on";
     }
+    bool Qwen35Turbo4KvEnabled() {
+        const char *env = std::getenv("FASTLLM_QWEN35_TURBO4_KV");
+        if (env == nullptr || env[0] == 0) {
+            return false;
+        }
+        std::string lowered(env);
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return lowered == "true" || lowered == "1" ||
+               lowered == "yes" || lowered == "on";
+    }
     DataType ResolveQwen35CudaCacheType(DataType cacheType, DataType computeType) {
         if (cacheType == DataType::FLOAT16 ||
             cacheType == DataType::BFLOAT16 ||
@@ -6053,9 +6064,10 @@ namespace fastllm {
                 if (packedKV) {
                     AssertInFastLLM(!externalDecodeMeta &&
                                     ((Data*)pagedCacheKManager)->dataType == DataType::Q8_0_KV &&
-                                    ((Data*)pagedCacheVManager)->dataType == DataType::TURBO3_KV &&
+                                    (((Data*)pagedCacheVManager)->dataType == DataType::TURBO3_KV ||
+                                     ((Data*)pagedCacheVManager)->dataType == DataType::TURBO4_KV) &&
                                     headDim == 256,
-                                    "Qwen3.5 packed decode requires non-graph q8_0 K + turbo3 V with head_dim=256.\n");
+                                    "Qwen3.5 packed decode requires non-graph q8_0 K + turbo3 or turbo4 V with head_dim=256.\n");
                     int qgateDim = numAttentionHeads * headDim * 2;
                     int kvDim = numKeyValueHeads * headDim;
                     Qwen3CudaSplit(runner, *merged, -1, 0, qgateDim, *qgate);
@@ -8407,20 +8419,33 @@ namespace fastllm {
     }
 
     void Qwen3_5Model::SetKVCacheDataType(DataType dataType) {
-        if (dataType != DataType::TURBO3_KV) {
+        if (dataType != DataType::TURBO3_KV && dataType != DataType::TURBO4_KV) {
             basellm::SetKVCacheDataType(dataType);
             return;
         }
-        AssertInFastLLM(Qwen35Turbo3KvEnabled(),
-                        "Qwen3.5 turbo3 KV cache requires FASTLLM_QWEN35_TURBO3_KV=1.\n");
-        AssertInFastLLM(this->head_dim == 256,
-                        "Qwen3.5 turbo3 KV cache currently requires head_dim=256.\n");
+        if (dataType == DataType::TURBO3_KV) {
+            AssertInFastLLM(Qwen35Turbo3KvEnabled(),
+                            "Qwen3.5 turbo3 KV cache requires FASTLLM_QWEN35_TURBO3_KV=1.\n");
+            AssertInFastLLM(this->head_dim == 256,
+                            "Qwen3.5 turbo3 KV cache currently requires head_dim=256.\n");
 #ifndef USE_CUDA
-        ErrorInFastLLM("Qwen3.5 turbo3 KV cache requires CUDA support.\n");
+            ErrorInFastLLM("Qwen3.5 turbo3 KV cache requires CUDA support.\n");
 #endif
-        this->kvCacheDataType = dataType;
-        this->useCustomKVCacheDataType = true;
-        printf("[Qwen3.5] Turbo3 paged KV enabled: K=q8_0, V=turbo3, head_dim=256.\n");
+            this->kvCacheDataType = dataType;
+            this->useCustomKVCacheDataType = true;
+            printf("[Qwen3.5] Turbo3 paged KV enabled: K=q8_0, V=turbo3, head_dim=256.\n");
+        } else {
+            AssertInFastLLM(Qwen35Turbo4KvEnabled(),
+                            "Qwen3.5 turbo4 KV cache requires FASTLLM_QWEN35_TURBO4_KV=1.\n");
+            AssertInFastLLM(this->head_dim == 256,
+                            "Qwen3.5 turbo4 KV cache currently requires head_dim=256.\n");
+#ifndef USE_CUDA
+            ErrorInFastLLM("Qwen3.5 turbo4 KV cache requires CUDA support.\n");
+#endif
+            this->kvCacheDataType = dataType;
+            this->useCustomKVCacheDataType = true;
+            printf("[Qwen3.5] Turbo4 paged KV enabled: K=q8_0, V=turbo4, head_dim=256.\n");
+        }
         fflush(stdout);
     }
     std::pair<DataType, DataType> Qwen3_5Model::GetKVCacheDataTypes(int layerIndex) const {
@@ -8428,8 +8453,9 @@ namespace fastllm {
             DataType cacheType = Qwen35LinearAttentionCacheDataType(this->dataType);
             return {cacheType, cacheType};
         }
-        if (this->kvCacheDataType == DataType::TURBO3_KV) {
-            return {DataType::Q8_0_KV, DataType::TURBO3_KV};
+        if (this->kvCacheDataType == DataType::TURBO3_KV ||
+            this->kvCacheDataType == DataType::TURBO4_KV) {
+            return {DataType::Q8_0_KV, this->kvCacheDataType};
         }
         return basellm::GetKVCacheDataTypes(layerIndex);
     }
@@ -9650,7 +9676,8 @@ namespace fastllm {
         return false;
 #else
         (void)ratios;
-        if (this->kvCacheDataType == DataType::TURBO3_KV) {
+        if (this->kvCacheDataType == DataType::TURBO3_KV ||
+            this->kvCacheDataType == DataType::TURBO4_KV) {
             return false;
         }
         const int maxCudaGraphDecodeBatch = Qwen35MaxCudaGraphDecodeBatch(this);

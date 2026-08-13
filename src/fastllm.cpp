@@ -576,7 +576,7 @@ namespace fastllm {
         {DataType::FLOAT16, {"float16", "fp16", "half"}}, {DataType::INT4_NOZERO, {"int4"}}, {DataType::INT4_GROUP, {"int4g"}},
         {DataType::FP8_E4M3, {"float8", "fp8", "fp8_e4m3"}}, {DataType::INT2_GROUP, {"int2g"}}, {DataType::BASE3_GROUP, {"base3g"}},
         {DataType::INT32, {"int32"}}, {DataType::NVFP4, {"nvfp4", "fp4_e2m1"}},
-        {DataType::Q8_0_KV, {"q8_0_kv"}}, {DataType::TURBO3_KV, {"turbo3", "turbo3_kv"}},
+        {DataType::Q8_0_KV, {"q8_0_kv"}}, {DataType::TURBO3_KV, {"turbo3", "turbo3_kv"}}, {DataType::TURBO4_KV, {"turbo4", "turbo4_kv"}},
         {DataType::INT32PARAM, {"int32param"}},
         {DataType::FP8_E4M3_BLOCK_128, {"fp8_e4m3_block_128"}}, {DataType::AWQ_4BIT_128, {"awq_4bit_128"}},
         {DataType::INT4_PERCHANNEL, {"int4_perchannel"}}, {DataType::FP8_E4M3_PERCHANNEL, {"fp8_e4m3_perchannel"}},
@@ -649,7 +649,7 @@ namespace fastllm {
     }
 
     bool IsPackedKVCacheDataType(DataType type) {
-        return type == DataType::Q8_0_KV || type == DataType::TURBO3_KV;
+        return type == DataType::Q8_0_KV || type == DataType::TURBO3_KV || type == DataType::TURBO4_KV;
     }
 
     size_t GetKVCacheRowBytes(DataType type, size_t columns) {
@@ -665,6 +665,12 @@ namespace fastllm {
             constexpr size_t blockValues = 128;
             constexpr size_t blockBytes = sizeof(uint16_t) + blockValues / 4 + blockValues / 8;
             static_assert(blockBytes == 50, "Turbo3 KV block must be 50 bytes per 128 values");
+            return ((columns + blockValues - 1) / blockValues) * blockBytes;
+        }
+        if (type == DataType::TURBO4_KV) {
+            constexpr size_t blockValues = 128;
+            constexpr size_t blockBytes = sizeof(uint16_t) + blockValues / 2;
+            static_assert(blockBytes == 66, "Turbo4 KV block must be 66 bytes per 128 values");
             return ((columns + blockValues - 1) / blockValues) * blockBytes;
         }
         return GetDataBytes(type, 1, columns);
