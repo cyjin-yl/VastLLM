@@ -278,27 +278,63 @@ private:
 
     static bool ParseBlock(const std::string &block,
                            OpenAIParsedToolCall &parsed) {
+        // The model is instructed to emit "<function=name>" but sometimes
+        // falls back to its native bare-name form "<name>". Accept both, plus
+        // the historical "<fuction=" typo variant.
         static const std::vector<std::string> functionOpenMarkers = {
             "<function=", "<fuction="
         };
-        const std::string functionClose = "</function>";
         size_t function = std::string::npos;
-        const std::string *functionOpen = nullptr;
+        size_t prefixLen = 0;
         for (const auto &marker : functionOpenMarkers) {
             const size_t position = block.find(marker);
             if (position != std::string::npos &&
                 (function == std::string::npos || position < function)) {
                 function = position;
-                functionOpen = &marker;
+                prefixLen = marker.size();
             }
         }
-        if (function == std::string::npos || functionOpen == nullptr) {
+        if (function == std::string::npos) {
+            // Bare-name form: the first "<tag>" without '=' that is not a
+            // parameter tag and looks like an identifier.
+            size_t cursor = 0;
+            while (true) {
+                const size_t open = block.find('<', cursor);
+                if (open == std::string::npos) {
+                    break;
+                }
+                const size_t close = block.find('>', open + 1);
+                if (close == std::string::npos) {
+                    break;
+                }
+                const std::string tag =
+                    block.substr(open + 1, close - open - 1);
+                bool plainName = !tag.empty() &&
+                    tag.find('=') == std::string::npos &&
+                    tag != "parameter" && tag != "tool_call";
+                if (plainName) {
+                    for (char c : tag) {
+                        if (!(std::isalnum(static_cast<unsigned char>(c)) ||
+                              c == '_' || c == '.' || c == '-')) {
+                            plainName = false;
+                            break;
+                        }
+                    }
+                }
+                if (plainName) {
+                    function = open + 1;
+                    prefixLen = 0;
+                    break;
+                }
+                cursor = close + 1;
+            }
+        }
+        if (function == std::string::npos) {
             return false;
         }
-        const size_t nameStart = function + functionOpen->size();
-        const size_t nameEnd = block.find('>', nameStart);
-        const size_t bodyEnd = block.find(functionClose, nameEnd);
-        if (nameEnd == std::string::npos || bodyEnd == std::string::npos) {
+        const size_t nameStart = function + prefixLen;
+        const size_t nameEnd = block.find('>', function);
+        if (nameEnd == std::string::npos) {
             return false;
         }
         parsed.name = Trim(block.substr(nameStart, nameEnd - nameStart));
@@ -306,8 +342,28 @@ private:
             return false;
         }
 
+        // Function close tag is unreliable (models emit "</function>",
+        // "</name>", mismatched pairs, or none); the block is already bounded
+        // by "</tool_call>", so the body ends at the earliest close candidate
+        // or at the block end.
         const std::string parameterOpen = "<parameter=";
         const std::string parameterClose = "</parameter>";
+        size_t bodyEnd = block.find("</function>", nameEnd);
+        const size_t typoEnd = block.find("</fuction>", nameEnd);
+        if (typoEnd != std::string::npos &&
+            (bodyEnd == std::string::npos || typoEnd < bodyEnd)) {
+            bodyEnd = typoEnd;
+        }
+        const size_t nameClose =
+            block.find("</" + parsed.name + ">", nameEnd);
+        if (nameClose != std::string::npos &&
+            (bodyEnd == std::string::npos || nameClose < bodyEnd)) {
+            bodyEnd = nameClose;
+        }
+        if (bodyEnd == std::string::npos) {
+            bodyEnd = block.size();
+        }
+
         std::map<std::string, json11::Json> arguments;
         size_t cursor = nameEnd + 1;
         while (true) {
