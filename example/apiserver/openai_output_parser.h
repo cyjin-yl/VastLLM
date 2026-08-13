@@ -330,8 +330,26 @@ private:
             }
         }
         if (function == std::string::npos) {
-            return false;
+            // Qwen native JSON form inside the block:
+            // {"name": "...", "arguments": {...}}
+            std::string error;
+            json11::Json jsonForm =
+                json11::Json::parse(Trim(block), error);
+            if (!error.empty() || !jsonForm.is_object()) {
+                return false;
+            }
+            if (!jsonForm["name"].is_string() ||
+                !jsonForm["arguments"].is_object()) {
+                return false;
+            }
+            parsed.name = jsonForm["name"].string_value();
+            if (parsed.name.empty()) {
+                return false;
+            }
+            parsed.arguments = CompactJson(jsonForm["arguments"]);
+            return true;
         }
+
         const size_t nameStart = function + prefixLen;
         const size_t nameEnd = block.find('>', function);
         if (nameEnd == std::string::npos) {
