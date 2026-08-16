@@ -551,6 +551,20 @@ struct WorkQueue {
         if (route.size() > 1 && route.back() == '/') {
             route.pop_back();
         }
+        // json11 的 dump() 在本仓库被定制为 pretty-print(\n\t 缩进,供 .tfdl
+        // 模型文件用)。SSE 客户端(OpenAI 兼容)要求每个 chunk 是单行紧凑
+        // JSON;字符串值中的 \n/\t 均已转义,剥掉裸换行/制表符是安全的。
+        auto compactJsonDump = [](const json11::Json &value) {
+            std::string pretty = value.dump();
+            std::string compact;
+            compact.reserve(pretty.size());
+            for (char ch : pretty) {
+                if (ch != '\n' && ch != '\t') {
+                    compact += ch;
+                }
+            }
+            return compact;
+        };
         auto writeJsonAndClose = [&](int status, const json11::Json &body,
                                      const std::vector<std::pair<std::string, std::string>> &headers = {}) {
             WriteFixedJsonResponse(node->client, status, body, headers);
@@ -1495,7 +1509,7 @@ struct WorkQueue {
                     }}
                 };
                 if (!WriteHttpChunk(node->client,
-                                    FormatSseData(startResult.dump()))) {
+                                    FormatSseData(compactJsonDump(startResult)))) {
                     abortDisconnectedStream();
                     return;
                 }
@@ -1543,7 +1557,7 @@ struct WorkQueue {
                         }}
                     };
                     return WriteHttpChunk(
-                        node->client, FormatSseData(partResult.dump()));
+                        node->client, FormatSseData(compactJsonDump(partResult)));
                 };
 
                 while (true) {
@@ -1589,7 +1603,7 @@ struct WorkQueue {
                             }}
                         };
                         if (!WriteHttpChunk(node->client,
-                                FormatSseData(finishResult.dump()))) {
+                                FormatSseData(compactJsonDump(finishResult)))) {
                             close(node->client);
                             return;
                         }
@@ -1883,6 +1897,15 @@ int main(int argc, char** argv) {
     workQueue.model->maxBatch = workQueue.maxActivateQueryNumber;
     PrepareServerPersistentPrefixCache(workQueue.model.get());
     workQueue.ConfigureHostOffloadManager();
+    // Warmup before accepting traffic: the load peak has passed, so the
+    // H2D weight transfer + paged-KV sizing allocations here cannot stack
+    // with it. Clients see READY only after VRAM reaches steady state.
+    // Disable with FASTLLM_SKIP_WARMUP=1.
+    if (!fastllm::GetFastllmEnv().skipWarmup) {
+        LogTs("[Load] warmup start\n");
+        workQueue.model->AutoWarmup();
+        LogTs("[Load] warmup done\n");
+    }
     workQueue.Start();
     LogTs("[Load] model loaded, workers started\n");
 
