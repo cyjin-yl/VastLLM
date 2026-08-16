@@ -312,6 +312,19 @@ namespace fastllm {
     thread_local Executor *curExecutor = &defaultExecutor;
 
     static std::mutex globalLocker;
+#ifdef USE_CUDA
+    static std::mutex pagedCacheCudaStorageMutex;
+    static std::atomic<uint64_t> pagedCacheCudaStorageVersion{0};
+
+    std::mutex &GetPagedCacheCudaStorageMutex() {
+        return pagedCacheCudaStorageMutex;
+    }
+
+    uint64_t GetPagedCacheCudaStorageVersion() {
+        return pagedCacheCudaStorageVersion.load(std::memory_order_acquire);
+    }
+#endif
+
     static std::mutex modelLoadProgressLocker;
     static ModelLoadProgressCallback modelLoadProgressCallback;
     static int threads = 4;
@@ -3636,8 +3649,6 @@ namespace fastllm {
                 }
             }
 
-            printf("Load (%d / %d) \r", (i + 1), len);
-            fflush(stdout);
             if (i + 1 == len ||
                 (i + 1) * 100 / std::max(1, len) != i * 100 / std::max(1, len)) {
                 ReportModelLoadProgress("weights_load", i + 1, len);
@@ -7165,7 +7176,7 @@ namespace fastllm {
         constexpr uint8_t PERSISTENT_TRIE_MAGIC[8] = {
             'F', 'L', 'P', 'C', 'T', 'R', 'I', '1'
         };
-        constexpr uint32_t PERSISTENT_TRIE_VERSION = 1;
+        constexpr uint32_t PERSISTENT_TRIE_VERSION = 2;
         constexpr size_t PERSISTENT_TRIE_MAX_BYTES =
             (size_t)64 << 20;
         constexpr uint32_t PERSISTENT_TRIE_MAX_NODES =
@@ -7403,18 +7414,21 @@ namespace fastllm {
             this->trieRoot->children.empty()) {
             return true;
         }
+        const int physicalPages =
+            this->dims.empty() ? 0 : this->dims[0];
         if (this->persistentId < 0 ||
             this->maxPages <= 0 ||
+            physicalPages <= 0 ||
             this->pageLen <= 0 ||
             this->GetBytes() == 0 ||
-            this->GetBytes() % (size_t)this->maxPages != 0) {
+            this->GetBytes() % (size_t)physicalPages != 0) {
             SetPagedCacheSnapshotError(
                 error,
                 "persistent paged cache manager geometry is invalid");
             return false;
         }
         const size_t pageBytes =
-            this->GetBytes() / (size_t)this->maxPages;
+            this->GetBytes() / (size_t)physicalPages;
         if (pageBytes == 0) {
             SetPagedCacheSnapshotError(
                 error, "persistent paged cache page is empty");
@@ -7610,6 +7624,8 @@ namespace fastllm {
             }
             savedDimensions.push_back((int)dimension);
         }
+        const int physicalPages =
+            this->dims.empty() ? 0 : this->dims[0];
         if (managerId != (uint32_t)this->persistentId ||
             managerType != (uint32_t)this->type ||
             savedPageLen != (uint32_t)this->pageLen ||
@@ -7617,14 +7633,15 @@ namespace fastllm {
             savedDataType != (uint32_t)this->dataType ||
             savedDimensions != this->dims ||
             this->maxPages <= 0 ||
-            this->GetBytes() % (size_t)this->maxPages != 0) {
+            physicalPages <= 0 ||
+            this->GetBytes() % (size_t)physicalPages != 0) {
             SetPagedCacheSnapshotError(
                 error,
                 "persistent paged cache geometry mismatch");
             return false;
         }
         const size_t pageBytes =
-            this->GetBytes() / (size_t)this->maxPages;
+            this->GetBytes() / (size_t)physicalPages;
         std::vector<int64_t> pageDimensions;
         for (size_t i = 1; i < this->dims.size(); i++) {
             pageDimensions.push_back(this->dims[i]);
@@ -7799,9 +7816,9 @@ namespace fastllm {
         this->triePagesSet.clear();
         this->freePages.clear();
         this->freePagesSet.clear();
-        this->freePages.reserve(this->maxPages);
-        this->freePagesSet.reserve(this->maxPages);
-        for (int page = 0; page < this->maxPages; page++) {
+        this->freePages.reserve(physicalPages);
+        this->freePagesSet.reserve(physicalPages);
+        for (int page = 0; page < physicalPages; page++) {
             this->freePages.push_back(page);
             this->freePagesSet.insert(page);
         }
@@ -7817,14 +7834,6 @@ namespace fastllm {
 
     PagedCacheManager::~PagedCacheManager() {
         std::lock_guard<std::mutex> guard(this->pageIndexLocker);
-#ifdef USE_CUDA
-        for (void *ptr : this->retiredCudaData) {
-            if (ptr != nullptr) {
-                FastllmCudaDirectFree(ptr);
-            }
-        }
-        this->retiredCudaData.clear();
-#endif
         if (this->trieRoot != nullptr) {
             for (auto &item : this->trieRoot->children) {
                 EvictTrieSubtree(item.second);
@@ -7835,18 +7844,32 @@ namespace fastllm {
         }
     }
 
+    int GetPagedCacheGrowthTarget(
+            int physicalPages, int maxPages, int additionalPages) {
+        if (physicalPages < 0 || maxPages < physicalPages) {
+            return physicalPages;
+        }
+        constexpr int growPageQuantum = 128;
+        const long long increment =
+            std::max((long long)growPageQuantum,
+                     (long long)std::max(0, additionalPages));
+        return (int)std::min(
+            (long long)maxPages,
+            (long long)physicalPages + increment);
+    }
+
     void PagedCacheManager::Grow(int newMaxPages) {
         // 全程持锁：并发 Grow 或取页时，旧池释放与内容拷贝必须串行，
-        // 否则第二个拷贝会读已释放的 cudaData（cudaErrorInvalidValue）。
+        // 否则第二个拷贝会读已释放的底层存储。
         std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        AssertInFastLLM(
+            this->dims.size() == 4 && this->pageLen > 0,
+            "PagedCacheManager::Grow: invalid paged cache geometry.");
         const int oldPhysicalPages = this->dims[0];
         if (newMaxPages <= oldPhysicalPages) {
             return;
         }
-#ifdef USE_CUDA
-        // 页池运行期增长：cudaStreamPerThread 上的在途写入先同步，保证旧页
-        // 内容完整后再拷贝；物理页号不变，已用页引用与 Trie 状态原样保留。
-        FastllmCudaSyncCurrentThreadStream();
+
         const size_t oldRows =
             (size_t)oldPhysicalPages * this->pageLen * this->dims[2];
         const size_t newRows =
@@ -7856,34 +7879,70 @@ namespace fastllm {
         const size_t newBytes =
             GetDataBytes(this->dataType, newRows, this->dims[3]);
         const size_t newElements = newRows * this->dims[3];
-        uint8_t *newData = (uint8_t*)FastllmCudaDirectMalloc(newBytes);
-        if (newData == nullptr) {
-            ErrorInFastLLM(
-                "PagedCacheManager::Grow: failed to allocate larger page pool.");
+
+#ifdef USE_CUDA
+        // Graph launches and pool relocation share this lock. A graph already
+        // enqueued before Grow is covered by ForceDeviceSync; no graph can be
+        // enqueued between that sync and the pointer/version swap.
+        std::unique_lock<std::mutex> cudaStorageGuard(
+            GetPagedCacheCudaStorageMutex(), std::defer_lock);
+        if (this->dataDevice == DataDevice::CUDA) {
+            cudaStorageGuard.lock();
         }
-        if (this->cudaData != nullptr && oldBytes > 0) {
-            int deviceId = FastllmCudaGetDevice();
-            if (FastllmCudaValidatePointerRange(
-                    this->cudaData, oldBytes, deviceId)) {
+#endif
+
+        if (this->dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+            // Helper streams can still reference the old pool. This rare
+            // capacity transition favors pointer safety over asynchronous
+            // overlap and does not retain one superseded pool per layer.
+            ForceDeviceSync();
+            uint8_t *newData = (uint8_t*)FastllmCudaDirectMalloc(newBytes);
+            if (newData == nullptr) {
+                ErrorInFastLLM(
+                    "PagedCacheManager::Grow: failed to allocate larger page pool.");
+            }
+            if (this->cudaData != nullptr && oldBytes > 0) {
+                int deviceId = FastllmCudaGetDevice();
+                if (!FastllmCudaValidatePointerRange(
+                        this->cudaData, oldBytes, deviceId)) {
+                    FastllmCudaDirectFree(newData);
+                    ErrorInFastLLM(
+                        "PagedCacheManager::Grow: current CUDA pool pointer is invalid.");
+                }
                 FastllmCudaCopyFromDeviceToDevice(
                     newData, this->cudaData, oldBytes);
-                // 退役旧池：不立即释放（并发拷贝/引用可能仍持有旧指针），
-                // 由析构统一 cudaFree。页池增长次数少，滞留量可接受。
-                this->retiredCudaData.push_back(this->cudaData);
-            } else {
-                // 旧池在运行期已被外部释放：无法拷贝旧页，新池清零避免
-                // 未初始化数据触发后续崩溃；旧指针不入 retired 列表。
+                FastllmCudaDirectFree(this->cudaData);
+            } else if (oldBytes > 0) {
                 FastllmCudaMemset0(newData, oldBytes);
             }
+            this->cudaData = newData;
+#else
+            ErrorInFastLLM(
+                "PagedCacheManager::Grow: CUDA storage is unavailable.");
+#endif
+        } else if (this->dataDevice == DataDevice::CPU) {
+            uint8_t *newData = new uint8_t[newBytes];
+            if (this->cpuData != nullptr && oldBytes > 0) {
+                memcpy(newData, this->cpuData, oldBytes);
+            } else if (oldBytes > 0) {
+                memset(newData, 0, oldBytes);
+            }
+            if (newBytes > oldBytes) {
+                memset(newData + oldBytes, 0, newBytes - oldBytes);
+            }
+            delete[] this->cpuData;
+            this->cpuData = newData;
+        } else {
+            ErrorInFastLLM(
+                "PagedCacheManager::Grow: unsupported storage device.");
         }
-        this->cudaData = newData;
+
         // Grow bypasses Data::MallocSpace, so keep Data's ownership metadata
-        // consistent with the new allocation.  Packed KV types cannot derive
-        // bytes from element count * unitSize (Q8 rows are 272 B while
-        // Turbo3 rows are 100 B for headDim=256).
+        // consistent with the new allocation. Packed KV types cannot derive
+        // bytes from element count * unitSize.
         this->expansionSize = newElements;
         this->expansionBytes = newBytes;
-#endif
         this->dims[0] = newMaxPages;
         // 逻辑预算只扩不缩；新增物理页追加到空闲池（页号连续）。
         if (newMaxPages > this->maxPages) {
@@ -7901,6 +7960,12 @@ namespace fastllm {
         if ((int)this->pageRefCount.size() < newMaxPages) {
             this->pageRefCount.resize(newMaxPages, 0);
         }
+#ifdef USE_CUDA
+        if (this->dataDevice == DataDevice::CUDA) {
+            pagedCacheCudaStorageVersion.fetch_add(
+                1, std::memory_order_release);
+        }
+#endif
     }
 
     void PagedCacheManager::SetMaxPages(int maxPages) {
@@ -7979,9 +8044,8 @@ namespace fastllm {
             // 所有调用方（decode、MTP 校验 CoW、prefix restore、swap）
             // 无需各自处理页不足。
             if (this->maxPages > this->dims[0]) {
-                int grown = std::min(
-                    this->maxPages,
-                    std::max(128, this->dims[0] * 2));
+                int grown = GetPagedCacheGrowthTarget(
+                    this->dims[0], this->maxPages, 1);
                 if (grown > this->dims[0]) {
                     fprintf(stderr,
                             "[PagedCache] Grow fallback: dims0=%d -> %d\n",
@@ -8519,10 +8583,12 @@ namespace fastllm {
             return false;
 #endif
         }
-        if (this->maxPages <= 0 ||
-            this->GetBytes() % (size_t)this->maxPages != 0 ||
+        const int physicalPages =
+            this->dims.empty() ? 0 : this->dims[0];
+        if (physicalPages <= 0 ||
+            this->GetBytes() % (size_t)physicalPages != 0 ||
             sourceBytes !=
-                this->GetBytes() / (size_t)this->maxPages) {
+                this->GetBytes() / (size_t)physicalPages) {
             return false;
         }
 

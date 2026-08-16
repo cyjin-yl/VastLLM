@@ -2719,10 +2719,12 @@ namespace fastllm {
                     // 超出逻辑预算，拒绝。
                     return true;
                 }
-                // 懒分配页池：物理页不足但需求在预算内，按需扩容。
-                int grown = std::max(
-                    it.second, std::max(128, freePages * 2));
-                grown = std::min(grown, manager->maxPages);
+                // Reserve the actual deficit plus a bounded growth quantum;
+                // allocating a geometrically doubled replacement pool can
+                // exhaust VRAM during long-prefill relocation.
+                int grown = GetPagedCacheGrowthTarget(
+                    manager->dims[0], manager->maxPages,
+                    it.second - freePages);
                 manager->Grow(grown);
             }
             return false;

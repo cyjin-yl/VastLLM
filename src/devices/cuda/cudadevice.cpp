@@ -8954,15 +8954,14 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         int totalNeededPages = (totalNeededTokens + cache.pageLen - 1) / cache.pageLen;
         int maxPages = cache.pagedKVCacheData->dims[0];
         if (totalNeededPages > maxPages) {
-            // 页池按需增长：初始池按小容量创建（避免全量预留把显存占满导致
-            // 图像 prefill 运行期 OOM），页数不足时翻倍扩容并保留旧页内容。
-            // 物理页号不变，pageIndex 无需迁移。
+            // Grow only enough to cover this append plus a bounded reserve.
+            // Geometric growth requires allocating a second full pool during
+            // relocation and can exhaust VRAM late in a long prefill.
             PagedCacheManager *pagedManager =
                 (PagedCacheManager*)cache.pagedKVCacheData;
-            int grownMaxPages = std::min(
-                pagedManager->maxPages,
-                std::max(totalNeededPages,
-                         std::max(128, maxPages * 2)));
+            int grownMaxPages = GetPagedCacheGrowthTarget(
+                maxPages, pagedManager->maxPages,
+                totalNeededPages - maxPages);
             pagedManager->Grow(grownMaxPages);
             maxPages = grownMaxPages;
         }

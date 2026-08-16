@@ -8,6 +8,22 @@
 #include <stdlib.h>
 #include <string>
 #include <mutex>
+#include <chrono>
+#include <ctime>
+#include <cstdarg>
+
+// 带时间戳的日志行：[YYYY-MM-DD HH:MM:SS] ...
+static void LogTs(const char *fmt, ...) {
+    char ts[32];
+    std::time_t t = std::time(nullptr);
+    std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+    printf("[%s] ", ts);
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+    fflush(stdout);
+}
 
 /*
  * Headers
@@ -1819,6 +1835,33 @@ int main(int argc, char** argv) {
     fastllm::AssertInFastLLM(
         !isHFDir || config.multimodalProjectorPath.empty(),
         "--mmproj currently requires a GGUF text model.");
+    // 分阶段加载进度：带时间戳打到 stdout，按 5% 桶节流避免刷屏。
+    fastllm::SetModelLoadProgressCallback([](const fastllm::ModelLoadProgress &p) {
+        static std::string lastStage;
+        static int lastBucket = -1;
+        static auto lastPrint =
+            std::chrono::steady_clock::now() - std::chrono::seconds(10);
+        const int pct = p.total > 0 ? (int)(p.current * 100 / p.total) : 100;
+        const int bucket = pct / 5;
+        const auto now = std::chrono::steady_clock::now();
+        const bool stageChanged = p.stage != lastStage;
+        const bool done = p.total > 0 && p.current >= p.total;
+        if (!stageChanged && !done && bucket == lastBucket &&
+            now - lastPrint < std::chrono::seconds(2)) {
+            return;
+        }
+        lastStage = p.stage;
+        lastBucket = bucket;
+        lastPrint = now;
+        if (p.totalBytes > 0) {
+            LogTs("[Load] %-16s %3d%% (%.2f/%.2f GiB)\n", p.stage.c_str(), pct,
+                  p.completedBytes / 1073741824.0, p.totalBytes / 1073741824.0);
+        } else {
+            LogTs("[Load] %-16s %3d%% (%llu/%llu)\n", p.stage.c_str(), pct,
+                  (unsigned long long)p.current, (unsigned long long)p.total);
+        }
+    });
+    LogTs("[Load] start model load: %s\n", config.path.c_str());
     workQueue.model = isHFDir
         ? fastllm::CreateLLMModelFromHF(
               config.path, config.dtype, config.groupCnt)
@@ -1841,13 +1884,14 @@ int main(int argc, char** argv) {
     PrepareServerPersistentPrefixCache(workQueue.model.get());
     workQueue.ConfigureHostOffloadManager();
     workQueue.Start();
+    LogTs("[Load] model loaded, workers started\n");
 
     int local_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (local_fd == -1) {
         std::cout << "socket error!" << std::endl;
         exit(-1);
     }
-    std::cout << "socket ready!" << std::endl;
+    LogTs("[Server] socket ready!\n");
 #ifndef _WIN32
     serverSocketForSignal = local_fd;
     std::signal(SIGINT, HandleShutdownSignal);
@@ -1865,9 +1909,9 @@ int main(int argc, char** argv) {
         std::cout << "bind error!" << std::endl;
         exit(-1);
     }
-    std::cout << "bind ready!" << std::endl;
+    LogTs("[Server] bind ready!\n");
     listen(local_fd, 2000);    
-    printf("start...\n");
+    LogTs("[Server] ready, listening on port %d\n", config.port);
     int queuePos = 0;
     while (true) { //循环接收客户端的请求
         //5.创建一个sockaddr_in结构体，用来存储客户机的地址

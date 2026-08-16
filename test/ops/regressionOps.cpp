@@ -705,7 +705,7 @@ namespace {
 
     void RunPersistentPagedTrieRegression() {
         constexpr int pageLen = 2;
-        constexpr int maxPages = 4;
+        constexpr int maxPages = 130;
         ScopedTempDirectory root("fastllm-prefix-persist-trie-");
         fastllm::PersistentPrefixCacheOptions options {
             true, root.Path(), "qwen36-cpu-trie-fixture"
@@ -797,7 +797,8 @@ namespace {
         auto recordManager = [](fastllm::PagedCacheManager *manager,
                                 uint8_t marker,
                                 std::vector<uint8_t> &expected) {
-            const size_t pageBytes = manager->GetBytes() / maxPages;
+            const size_t pageBytes =
+                manager->GetBytes() / (size_t)manager->dims[0];
             std::vector<int> pages = {
                 manager->GetUnusedPageIndex(true),
                 manager->GetUnusedPageIndex(true)
@@ -822,7 +823,8 @@ namespace {
             manager->Query({10, 11, 12, 13}, restored);
             Expect(restored.size() == 2,
                    name + " did not restore both prefix pages.");
-            const size_t pageBytes = manager->GetBytes() / maxPages;
+            const size_t pageBytes =
+                manager->GetBytes() / (size_t)manager->dims[0];
             for (size_t page = 0; page < restored.size(); page++) {
                 Expect(std::memcmp(
                            manager->cpuData +
@@ -866,8 +868,8 @@ namespace {
             Expect(manager->pageToTrieNode.empty(),
                    name + " materialized pages before a token match.");
             Expect(manager->freePagesSet.size() ==
-                       (size_t)manager->maxPages,
-                   name + " reserved a physical page during metadata restore.");
+                       (size_t)manager->dims[0],
+                   name + " exposed logical pages beyond its physical pool.");
             Expect(manager->trieRoot != nullptr &&
                        !manager->trieRoot->children.empty(),
                    name + " did not restore trie metadata.");
@@ -1388,6 +1390,11 @@ namespace {
             PrepareVision();
         }
 
+        void ConfigureVisionPixelLimits(int minPixels, int maxPixels) {
+            vision_image_min_pixels = minPixels;
+            vision_image_max_pixels = maxPixels;
+        }
+
         void InstallMtpCacheFixture(
                 fastllm::ResponseContext *context,
                 int tokens) {
@@ -1670,6 +1677,89 @@ namespace {
             "CPU swap quantum accepted a negative token delta.");
         std::cout << "CPU request swap policy regression: PASS\n";
     }
+#ifdef USE_CUDA
+    void RunCudaPagedCacheGrowReleaseRegression() {
+        Expect(fastllm::HasDeviceType("cuda"),
+               "paged cache grow release regression requires CUDA.");
+        const int originalDevice = FastllmCudaGetDevice();
+        FastllmCudaSetDevice(0);
+        Expect(
+            fastllm::GetPagedCacheGrowthTarget(1024, 2048, 4) == 1152,
+            "paged cache growth target doubled a large pool for a small append.");
+        Expect(
+            fastllm::GetPagedCacheGrowthTarget(1024, 2048, 200) == 1224,
+            "paged cache growth target did not cover the required page deficit.");
+        {
+            fastllm::PagedCacheManager manager;
+            manager.pageLen = 2;
+            manager.dataType = fastllm::DataType::FLOAT16;
+            manager.dataDevice = fastllm::DataDevice::CUDA;
+            manager.UpdateUnitSize();
+            manager.Resize({2, 2, 1, 16});
+            manager.Allocate();
+            manager.SetMaxPages(2);
+
+            void *oldPool = manager.cudaData;
+            const size_t oldBytes = manager.GetBytes();
+            const uint64_t storageVersion =
+                fastllm::GetPagedCacheCudaStorageVersion();
+            manager.Grow(4);
+
+            Expect(manager.dims[0] == 4 && manager.cudaData != oldPool,
+                   "paged cache grow did not install the larger pool.");
+            Expect(!FastllmCudaValidatePointerRange(oldPool, oldBytes, 0),
+                   "paged cache grow retained the superseded CUDA pool.");
+            Expect(fastllm::GetPagedCacheCudaStorageVersion() > storageVersion,
+                   "paged cache grow did not invalidate CUDA graph storage.");
+        }
+        {
+            fastllm::PagedCacheManager manager;
+            manager.pageLen = 1;
+            manager.dataType = fastllm::DataType::INT8;
+            manager.dataDevice = fastllm::DataDevice::CPU;
+            manager.UpdateUnitSize();
+            manager.Resize({2, 1, 1, 4});
+            manager.Allocate();
+            manager.SetMaxPages(2);
+
+            const size_t oldBytes = manager.GetBytes();
+            uint8_t *oldPool = manager.cpuData;
+            for (size_t i = 0; i < oldBytes; i++) {
+                oldPool[i] = (uint8_t)(i + 1);
+            }
+            manager.Grow(4);
+
+            Expect(manager.dims[0] == 4 && manager.cpuData != oldPool &&
+                       manager.expansionBytes == oldBytes * 2,
+                   "CPU paged cache grow did not install larger storage.");
+            for (size_t i = 0; i < oldBytes; i++) {
+                Expect(manager.cpuData[i] == (uint8_t)(i + 1),
+                       "CPU paged cache grow did not preserve existing pages.");
+            }
+        }
+        {
+            fastllm::PagedCacheManager manager;
+            manager.pageLen = 1;
+            manager.dataType = fastllm::DataType::INT8;
+            manager.dataDevice = fastllm::DataDevice::CUDA;
+            manager.UpdateUnitSize();
+            manager.Resize({256, 1, 1, 1});
+            manager.Allocate();
+            manager.SetMaxPages(256);
+            manager.maxPages = 1024;
+            for (int i = 0; i < 256; i++) {
+                (void)manager.GetUnusedPageIndex(true);
+            }
+            (void)manager.GetUnusedPageIndex(true);
+            Expect(manager.dims[0] == 384,
+                   "paged cache fallback doubled a large pool instead of "
+                   "growing by the bounded page quantum.");
+        }
+        FastllmCudaSetDevice(originalDevice);
+        std::cout << "paged cache grow release regression: PASS\n";
+    }
+#endif
+
     void RunPagedPrefixCachePolicyRegression() {
         {
             fastllm::PagedCacheManager manager;
@@ -2539,6 +2629,59 @@ namespace {
             }
         }
         inputs.clear();
+
+        model.ConfigureVisionPixelLimits(32 * 32, 64 * 64);
+        std::vector<fastllm::MultimodalImage> manyImages(5, image);
+        prompt.clear();
+        for (size_t i = 0; i < manyImages.size(); i++) {
+            prompt += "<|image_pad|>";
+        }
+        Expect(model.PrepareMultimodalImageInputs(
+                   prompt, manyImages, inputs, error),
+               "Qwen3.5 aggregate image preparation failed: " + error);
+        const fastllm::Data &manyGrids = *inputs["image_grid_thw"][0];
+        const int32_t *manyGridValues =
+            reinterpret_cast<const int32_t*>(manyGrids.cpuData);
+        int64_t totalResizedPixels = 0;
+        size_t expectedImageTokens = 0;
+        for (size_t i = 0; i < manyImages.size(); i++) {
+            totalResizedPixels +=
+                (int64_t)manyGridValues[i * 3 + 1] * 16 *
+                manyGridValues[i * 3 + 2] * 16;
+            expectedImageTokens +=
+                (size_t)(manyGridValues[i * 3 + 1] / 2) *
+                (manyGridValues[i * 3 + 2] / 2);
+        }
+        Expect(totalResizedPixels <= 4LL * 64 * 64,
+               "Qwen3.5 image preparation exceeded the aggregate pixel cap.");
+        size_t expandedImageTokens = 0;
+        for (size_t pos = 0;
+             (pos = prompt.find("<|image_pad|>", pos)) !=
+                 std::string::npos;
+             pos += std::string("<|image_pad|>").size()) {
+            expandedImageTokens++;
+        }
+        Expect(expandedImageTokens == expectedImageTokens,
+               "Qwen3.5 capped image grids and prompt tokens diverged.");
+        for (auto &entry : inputs) {
+            for (auto *tensor : entry.second) {
+                delete tensor;
+            }
+        }
+        inputs.clear();
+
+        std::vector<fastllm::MultimodalImage> tooManyImages(17, image);
+        prompt.clear();
+        for (size_t i = 0; i < tooManyImages.size(); i++) {
+            prompt += "<|image_pad|>";
+        }
+        Expect(!model.PrepareMultimodalImageInputs(
+                   prompt, tooManyImages, inputs, error),
+               "Qwen3.5 image preparation accepted an impossible "
+               "aggregate pixel budget.");
+        Expect(error == "image batch cannot fit the aggregate pixel budget" &&
+                   inputs.empty(),
+               "Qwen3.5 aggregate image rejection was not fail-fast.");
 
         prompt = "no placeholder";
         Expect(!model.PrepareMultimodalImageInputs(
@@ -17602,6 +17745,16 @@ int main(int argc, char **argv) {
             std::string(only) == "paged_prefix_cache_policy") {
             RunPagedPrefixCachePolicyRegression();
             return 0;
+        }
+        if (only != nullptr &&
+            std::string(only) == "paged_cache_grow") {
+#ifdef USE_CUDA
+            RunCudaPagedCacheGrowReleaseRegression();
+            return 0;
+#else
+            throw std::runtime_error(
+                "paged_cache_grow regression requires a CUDA build.");
+#endif
         }
         RunRegressionFixtureScopeRegression();
         if (only != nullptr && std::string(only) == "qwen35_gguf") {

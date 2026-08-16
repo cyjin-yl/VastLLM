@@ -3467,6 +3467,8 @@ namespace fastllm {
             bool warmed = false;
             bool captured = false;
             bool disabled = false;
+            uint64_t pagedCacheStorageVersion = 0;
+            bool pagedCacheRecaptureRequested = false;
             void *graph = nullptr;
             void *exec = nullptr;
             std::vector<int> logitsDims;
@@ -6117,17 +6119,6 @@ namespace fastllm {
                         for (int b = 0; b < batch; b++) {
                             auto updatePageMeta = [](Data *cache, PagedCacheManager *mgr) {
                                 if (cache->pageIndex.empty() || cache->lastPageLen >= cache->pageLen) {
-                                    // 懒分配页池：物理页不足时先扩容再取页。
-                                    if (mgr->FreePageCount() <= 0) {
-                                        int grown = std::min(
-                                            mgr->maxPages,
-                                            std::max(128, mgr->dims[0] * 2));
-                                        if (grown <= mgr->dims[0]) {
-                                            ErrorInFastLLM(
-                                                "Qwen3.5 decode: paged KV pool exhausted at budget.");
-                                        }
-                                        mgr->Grow(grown);
-                                    }
                                     cache->pageIndex.push_back(mgr->GetUnusedPageIndex(true));
                                     cache->lastPageLen = 1;
                                 } else {
@@ -7663,10 +7654,9 @@ namespace fastllm {
             return false;
         }
 
-        std::vector<std::array<int32_t, 3>> grids;
-        std::vector<size_t> tokenCounts;
-        grids.reserve(images.size());
-        tokenCounts.reserve(images.size());
+        std::vector<std::array<int, 2>> resizedShapes;
+        resizedShapes.reserve(images.size());
+        int64_t totalResizedPixels = 0;
         for (const auto &image : images) {
             if (image.width <= 0 || image.height <= 0 ||
                 image.rgb.size() !=
@@ -7706,8 +7696,45 @@ namespace fastllm {
                 resizedWidth =
                     (int)std::ceil(image.width * beta / factor) * factor;
             }
-            const int gridHeight = resizedHeight / vision_patch_size;
-            const int gridWidth = resizedWidth / vision_patch_size;
+            resizedShapes.push_back({resizedHeight, resizedWidth});
+            totalResizedPixels += (int64_t)resizedHeight * resizedWidth;
+        }
+
+        const int64_t maxTotalPixels =
+            (int64_t)vision_image_max_pixels * 4;
+        if (totalResizedPixels > maxTotalPixels) {
+            const int64_t originalTotalPixels = totalResizedPixels;
+            const double beta = std::sqrt(
+                (double)totalResizedPixels / maxTotalPixels);
+            totalResizedPixels = 0;
+            for (auto &shape : resizedShapes) {
+                shape[0] = std::max(
+                    factor,
+                    (int)std::floor(shape[0] / beta / factor) * factor);
+                shape[1] = std::max(
+                    factor,
+                    (int)std::floor(shape[1] / beta / factor) * factor);
+                totalResizedPixels += (int64_t)shape[0] * shape[1];
+            }
+            if (totalResizedPixels > maxTotalPixels) {
+                error = "image batch cannot fit the aggregate pixel budget";
+                return false;
+            }
+            printf(
+                "[Qwen3.5 vision] aggregate image pixels capped: "
+                "images=%zu original=%lld resized=%lld limit=%lld\n",
+                images.size(), (long long)originalTotalPixels,
+                (long long)totalResizedPixels, (long long)maxTotalPixels);
+            fflush(stdout);
+        }
+
+        std::vector<std::array<int32_t, 3>> grids;
+        std::vector<size_t> tokenCounts;
+        grids.reserve(images.size());
+        tokenCounts.reserve(images.size());
+        for (const auto &shape : resizedShapes) {
+            const int gridHeight = shape[0] / vision_patch_size;
+            const int gridWidth = shape[1] / vision_patch_size;
             if (gridHeight <= 0 || gridWidth <= 0 ||
                 gridHeight % vision_spatial_merge_size != 0 ||
                 gridWidth % vision_spatial_merge_size != 0) {
@@ -9884,7 +9911,8 @@ namespace fastllm {
         // The dedicated pass captures max batch first and is the sole owner of
         // graph creation; serving only replays those prepared shapes.
         bool allowCapture =
-            cudaGraphPreCaptureRunning.load(std::memory_order_acquire);
+            cudaGraphPreCaptureRunning.load(std::memory_order_acquire) ||
+            state.pagedCacheRecaptureRequested;
         if (!state.captured && !allowCapture) {
             return false;
         }
@@ -9893,8 +9921,6 @@ namespace fastllm {
         FastllmCudaSetDevice(gpuId);
         workspace.buffers.batchPastKeys.resize(batch);
         workspace.buffers.batchPastValues.resize(batch);
-        workspace.buffers.linearConvCaches.resize(batch);
-        workspace.buffers.recurrentStates.resize(batch);
         std::vector<int> linearSlotIdsHost;
         int linearSlotCapacity = Qwen35LinearSlotCapacity(this, batch);
         if (!Qwen35CollectExistingLinearSlotCaches(
@@ -10285,6 +10311,8 @@ namespace fastllm {
                 std::string inputRmsName = prefix + "input_layernorm.weight";
                 std::string postRmsName = prefix + "post_attention_layernorm.weight";
                 std::string swigluWeightName = prefix + "mlp.gateup_proj.weight";
+                std::string gateProjWeightName = prefix + "mlp.gate_proj.weight";
+                std::string upProjWeightName = prefix + "mlp.up_proj.weight";
                 std::string downWeightName = prefix + "mlp.down_proj.weight";
                 std::string downBiasName = prefix + "mlp.down_proj.bias";
                 bool isAttentionLayer =
@@ -10712,6 +10740,10 @@ namespace fastllm {
 
                 bool hasDenseMlp = weight.weight.find(swigluWeightName) != weight.weight.end() &&
                                    weight.weight.find(downWeightName) != weight.weight.end();
+                bool hasSplitDenseMlp =
+                    weight.weight.find(gateProjWeightName) != weight.weight.end() &&
+                    weight.weight.find(upProjWeightName) != weight.weight.end() &&
+                    weight.weight.find(downWeightName) != weight.weight.end();
                 if (hasDenseMlp) {
                     Data &gateUpWeight = *requireLocal(
                         weight[swigluWeightName], swigluWeightName);
@@ -10774,6 +10806,37 @@ namespace fastllm {
                     }
                     continue;
                 }
+                if (hasSplitDenseMlp) {
+                    Data &gateWeight = *requireLocal(
+                        weight[gateProjWeightName], gateProjWeightName);
+                    Data &gateBias = *requireLocal(
+                        GetThreadTensorParallelBias(gateProjWeightName + ".tp_bias"),
+                        gateProjWeightName + ".tp_bias");
+                    Data &upWeight = *requireLocal(
+                        weight[upProjWeightName], upProjWeightName);
+                    Data &upBias = *requireLocal(
+                        GetThreadTensorParallelBias(upProjWeightName + ".tp_bias"),
+                        upProjWeightName + ".tp_bias");
+                    Data &downWeight = *requireLocal(
+                        weight[downWeightName], downWeightName);
+                    Data &downBias = *requireLocal(
+                        GetThreadTensorParallelBias(downBiasName), downBiasName);
+                    Qwen3CudaLinear(cudaRunner, buf.attenInput,
+                                    gateWeight, gateBias, buf.gateupResult);
+                    Qwen35CudaSilu(cudaRunner, buf.gateupResult,
+                                  buf.gateupResult);
+                    Qwen3CudaLinear(cudaRunner, buf.attenInput,
+                                    upWeight, upBias, buf.swigluResult);
+                    Qwen35CudaMulTo(cudaRunner, buf.gateupResult,
+                                   buf.swigluResult);
+                    Qwen3CudaLinearResidualReduce(
+                        cudaRunner, buf.gateupResult,
+                        downWeight, downBias,
+                        buf.mlpPart, buf.hiddenStates,
+                        tensorParallel, firstTensorParallelRank, gpuId, true);
+                    continue;
+                }
+
 
                 std::string gateWeightName = prefix + "mlp.gate.weight";
                 std::string gateBiasName = prefix + "mlp.gate.e_score_correction_bias";
@@ -10979,24 +11042,47 @@ namespace fastllm {
         // metadata; the guard above only rolls it back on a false/exceptional
         // pre-execution exit so the outer eager fallback cannot append twice.
         graphPagedRollbackArmed = false;
-        if (state.captured) {
-            bool replayOk = FastllmCudaGraphLaunch(state.exec);
-            if (replayOk) {
-                if (qwen35GpuTokenHandoffControl != nullptr) {
-                    qwen35GpuTokenHandoffControl->MarkGraphReplayUsed(gpuId);
-                    if (firstTensorParallelRank) {
-                        qwen35GpuTokenHandoffControl->graphReplayUsed = true;
+        {
+            // Paged-cache pool relocation changes base pointers captured by
+            // CUDA graphs. Serialize the version check and enqueue with Grow:
+            // Grow synchronizes an already-enqueued graph before freeing the
+            // old pool, and a later replay observes the new version here.
+            std::unique_lock<std::mutex> pagedStorageLock(
+                GetPagedCacheCudaStorageMutex());
+            const uint64_t pagedStorageVersion =
+                GetPagedCacheCudaStorageVersion();
+            if (state.captured &&
+                state.pagedCacheStorageVersion != pagedStorageVersion) {
+                Qwen35DestroyCudaGraph(state);
+                printf(
+                    "[Fastllm] Qwen3.5 CUDA graph invalidated after "
+                    "paged-cache storage relocation on gpu %d.\n",
+                    gpuId);
+                fflush(stdout);
+                state.pagedCacheRecaptureRequested = true;
+                allowCapture = true;
+            }
+            state.pagedCacheStorageVersion = pagedStorageVersion;
+            if (state.captured) {
+                bool replayOk = FastllmCudaGraphLaunch(state.exec);
+                if (replayOk) {
+                    if (qwen35GpuTokenHandoffControl != nullptr) {
+                        qwen35GpuTokenHandoffControl->MarkGraphReplayUsed(gpuId);
+                        if (firstTensorParallelRank) {
+                            qwen35GpuTokenHandoffControl->graphReplayUsed = true;
+                        }
                     }
+                    finishWithLogits();
+                    return true;
                 }
-                finishWithLogits();
+                printf("Warning: Qwen3.5 CUDA graph replay failed on gpu %d: %s. Disable graph for this GPU.\n",
+                       gpuId, FastllmCudaGraphLastError());
+                Qwen35DestroyCudaGraph(state);
+                state.disabled = true;
+                pagedStorageLock.unlock();
+                runWithoutGraph();
                 return true;
             }
-            printf("Warning: Qwen3.5 CUDA graph replay failed on gpu %d: %s. Disable graph for this GPU.\n",
-                   gpuId, FastllmCudaGraphLastError());
-            Qwen35DestroyCudaGraph(state);
-            state.disabled = true;
-            runWithoutGraph();
-            return true;
         }
 
         if (!allowCapture) {
@@ -11090,6 +11176,10 @@ namespace fastllm {
             fflush(stdout);
         };
 
+        // Keep paged-cache base pointers stable throughout graph capture,
+        // instantiation, installation, and the first launch.
+        std::unique_lock<std::mutex> pagedStorageCaptureLock(
+            GetPagedCacheCudaStorageMutex());
         void *capturedGraph = nullptr;
         Qwen35GraphCaptureFailure captureFailure =
             capturePreparedGraph(true, capturedGraph);
@@ -11153,6 +11243,9 @@ namespace fastllm {
         state.graph = capturedGraph;
         state.exec = capturedExec;
         state.captured = true;
+        state.pagedCacheStorageVersion =
+            GetPagedCacheCudaStorageVersion();
+        state.pagedCacheRecaptureRequested = false;
         printf("[Fastllm] Qwen3.5 CUDA graph captured GPU %d batch %d: "
                "shared Data %.2f MB, capacity batch %d, stable pointers %zu.\n",
                gpuId, batch,
@@ -11390,6 +11483,8 @@ namespace fastllm {
             std::string inputRmsName = prefix + "input_layernorm.weight";
             std::string postRmsName = prefix + "post_attention_layernorm.weight";
             std::string swigluWeightName = prefix + "mlp.gateup_proj.weight";
+            std::string gateProjWeightName = prefix + "mlp.gate_proj.weight";
+            std::string upProjWeightName = prefix + "mlp.up_proj.weight";
             std::string downWeightName = prefix + "mlp.down_proj.weight";
             std::string downBiasName = prefix + "mlp.down_proj.bias";
             bool isAttentionLayer =
@@ -13238,6 +13333,10 @@ namespace fastllm {
             }
             bool hasDenseMlp = weight.weight.find(swigluWeightName) != weight.weight.end() &&
                                weight.weight.find(downWeightName) != weight.weight.end();
+            bool hasSplitDenseMlp =
+                weight.weight.find(gateProjWeightName) != weight.weight.end() &&
+                weight.weight.find(upProjWeightName) != weight.weight.end() &&
+                weight.weight.find(downWeightName) != weight.weight.end();
             if (hasDenseMlp) {
                 Data &gateUpWeight = *requireLocal(
                     weight[swigluWeightName], swigluWeightName);
@@ -13319,6 +13418,40 @@ namespace fastllm {
                 Qwen35DebugHiddenHash("layer", i, hiddenStates);
                 continue;
             }
+            if (hasSplitDenseMlp) {
+                Data &gateWeight = *requireLocal(
+                    weight[gateProjWeightName], gateProjWeightName);
+                Data &gateBias = *requireLocal(
+                    GetThreadTensorParallelBias(gateProjWeightName + ".tp_bias"),
+                    gateProjWeightName + ".tp_bias");
+                Data &upWeight = *requireLocal(
+                    weight[upProjWeightName], upProjWeightName);
+                Data &upBias = *requireLocal(
+                    GetThreadTensorParallelBias(upProjWeightName + ".tp_bias"),
+                    upProjWeightName + ".tp_bias");
+                Data &downWeight = *requireLocal(
+                    weight[downWeightName], downWeightName);
+                Data &downBias = *requireLocal(
+                    GetThreadTensorParallelBias(downBiasName), downBiasName);
+                Qwen3CudaLinear(cudaRunner, attenInput,
+                                gateWeight, gateBias, gateupResult);
+                Qwen35CudaSilu(cudaRunner, gateupResult, gateupResult);
+                Qwen3CudaLinear(cudaRunner, attenInput,
+                                upWeight, upBias, swigluResult);
+                Qwen35CudaMulTo(cudaRunner, gateupResult, swigluResult);
+                Qwen3CudaLinearResidualReduce(
+                    cudaRunner, gateupResult,
+                    downWeight, downBias,
+                    mlpPart, hiddenStates,
+                    tensorParallel, firstTensorParallelRank, gpuId, true);
+                if (prefillProfileEnabled) {
+                    prefillProfile.mlpUs +=
+                        Qwen35PrefillProfileSyncElapsedUs(prefillMlpLast);
+                }
+                Qwen35DebugHiddenHash("layer", i, hiddenStates);
+                continue;
+            }
+
 
             std::string gateWeightName = prefix + "mlp.gate.weight";
             std::string gateBiasName = prefix + "mlp.gate.e_score_correction_bias";
@@ -14028,6 +14161,8 @@ namespace fastllm {
                         std::string inputRmsName = prefix + "input_layernorm.weight";
                         std::string postRmsName = prefix + "post_attention_layernorm.weight";
                         std::string swigluWeightName = prefix + "mlp.gateup_proj.weight";
+                        std::string gateProjWeightName = prefix + "mlp.gate_proj.weight";
+                        std::string upProjWeightName = prefix + "mlp.up_proj.weight";
                         std::string downWeightName = prefix + "mlp.down_proj.weight";
                         std::string downBiasName = prefix + "mlp.down_proj.bias";
 
@@ -14225,6 +14360,47 @@ namespace fastllm {
                                             "Qwen3.5 ForwardGPU failed to split " + downWeightName + ".\n");
                             continue;
                         }
+                        bool hasSplitDenseMlp =
+                            weight.weight.find(gateProjWeightName) != weight.weight.end() &&
+                            weight.weight.find(upProjWeightName) != weight.weight.end() &&
+                            weight.weight.find(downWeightName) != weight.weight.end();
+                        if (hasSplitDenseMlp) {
+                            Data &gate = weight[gateProjWeightName];
+                            Data &gateBias =
+                                GetThreadTensorParallelBias(gateProjWeightName + ".tp_bias");
+                            Data &up = weight[upProjWeightName];
+                            Data &upBias =
+                                GetThreadTensorParallelBias(upProjWeightName + ".tp_bias");
+                            gate.tpLinearType = TP_LINEAR_ROW;
+                            up.tpLinearType = TP_LINEAR_ROW;
+                            std::vector<int> devCopy = devices;
+                            DivisionScheme gateScheme =
+                                BuildMultiCudaRowSplitScheme(gate, devCopy, ratios);
+                            AssertInFastLLM(
+                                SplitMultiCudaWeight(
+                                    gate, gateBias, devCopy, gateScheme, 0, true),
+                                "Qwen3.5 ForwardGPU failed to split " +
+                                    gateProjWeightName + ".\n");
+                            devCopy = devices;
+                            AssertInFastLLM(
+                                SplitMultiCudaWeight(
+                                    up, upBias, devCopy, gateScheme, 0, true),
+                                "Qwen3.5 ForwardGPU failed to split " +
+                                    upProjWeightName + ".\n");
+
+                            Data &downBias =
+                                GetThreadTensorParallelBias(downBiasName);
+                            weight[downWeightName].tpLinearType = TP_LINEAR_COLUMN;
+                            devCopy = devices;
+                            AssertInFastLLM(
+                                SplitMultiCudaWeight(
+                                    weight[downWeightName], downBias,
+                                    devCopy, gateScheme, 1, true),
+                                "Qwen3.5 ForwardGPU failed to split " +
+                                    downWeightName + ".\n");
+                            continue;
+                        }
+
 
                         std::string gateWeightName = prefix + "mlp.gate.weight";
                         std::string gateBiasName = prefix + "mlp.gate.e_score_correction_bias";
@@ -15466,15 +15642,6 @@ namespace fastllm {
                 }
                 int oldPage = dst.pageIndex.back();
                 manager = dst.pagedKVCacheData;
-                // 懒分配页池：物理页不足时先扩容再取页。
-                if (manager->FreePageCount() <= 0) {
-                    int grown = std::min(
-                        manager->maxPages,
-                        std::max(128, manager->dims[0] * 2));
-                    if (grown > manager->dims[0]) {
-                        manager->Grow(grown);
-                    }
-                }
                 newPage = manager->GetUnusedPageIndex(true);
                 copyPagedCachePage(dst, oldPage, newPage);
                 dst.pageIndex.back() = newPage;
@@ -19023,10 +19190,9 @@ namespace fastllm {
                     // （初始池小，避免全量预留把显存占满）。
                 }
                 int currentFree = manager->FreePageCount();
-                int grown = (int)std::max(
-                    (long long)required,
-                    (long long)std::max(128, currentFree * 2));
-                grown = std::min(grown, manager->maxPages);
+                int grown = GetPagedCacheGrowthTarget(
+                    manager->dims[0], manager->maxPages,
+                    (int)required - currentFree);
                 manager->Grow(grown);
             }
             return true;
@@ -19050,10 +19216,9 @@ namespace fastllm {
                     // 超出逻辑预算，拒绝。
                     return true;
                 }
-                // 懒分配页池：物理页不足但需求在预算内，按需扩容。
-                int grown = std::max(
-                    it.second, std::max(128, freePages * 2));
-                grown = std::min(grown, manager->maxPages);
+                int grown = GetPagedCacheGrowthTarget(
+                    manager->dims[0], manager->maxPages,
+                    it.second - freePages);
                 manager->Grow(grown);
             }
             return false;
@@ -23503,8 +23668,12 @@ namespace fastllm {
              weight.weight.find("mtp.layers.0.self_attn.k_proj.weight") != weight.weight.end() &&
              weight.weight.find("mtp.layers.0.self_attn.v_proj.weight") != weight.weight.end());
         bool hasMtpDenseMlp =
-            weight.weight.find("mtp.layers.0.mlp.gateup_proj.weight") !=
-                weight.weight.end() &&
+            (weight.weight.find("mtp.layers.0.mlp.gateup_proj.weight") !=
+                 weight.weight.end() ||
+             (weight.weight.find("mtp.layers.0.mlp.gate_proj.weight") !=
+                  weight.weight.end() &&
+              weight.weight.find("mtp.layers.0.mlp.up_proj.weight") !=
+                  weight.weight.end())) &&
             weight.weight.find("mtp.layers.0.mlp.down_proj.weight") !=
                 weight.weight.end();
         return weight.weight.find("mtp.fc.weight") != weight.weight.end() &&
@@ -23577,8 +23746,11 @@ namespace fastllm {
                 moveWeight(prefix + "self_attn.k_norm.weight");
                 moveWeight(prefix + "post_attention_layernorm.weight");
 
-                std::string denseGateupName = prefix + "mlp.gateup_proj.weight";
-                std::string denseDownName = prefix + "mlp.down_proj.weight";
+                std::string mlpPrefix = prefix + "mlp.";
+                std::string denseGateupName = mlpPrefix + "gateup_proj.weight";
+                std::string denseGateName = mlpPrefix + "gate_proj.weight";
+                std::string denseUpName = mlpPrefix + "up_proj.weight";
+                std::string denseDownName = mlpPrefix + "down_proj.weight";
                 if (weight.weight.find(denseGateupName) != weight.weight.end() &&
                     weight.weight.find(denseDownName) != weight.weight.end()) {
                     weight[denseGateupName].tpPackType = TP_PACK_GATEUP;
@@ -23586,8 +23758,16 @@ namespace fastllm {
                     moveWeight(denseDownName);
                     continue;
                 }
+                if (weight.weight.find(denseGateName) != weight.weight.end() &&
+                    weight.weight.find(denseUpName) != weight.weight.end() &&
+                    weight.weight.find(denseDownName) != weight.weight.end()) {
+                    moveWeight(denseGateName);
+                    moveWeight(denseUpName);
+                    moveWeight(denseDownName);
+                    continue;
+                }
 
-                std::string mlpPrefix = prefix + "mlp.";
+
                 moveWeight(mlpPrefix + "gate.weight");
                 moveWeight(mlpPrefix + "gate.e_score_correction_bias");
                 std::string sharedGateupName =
@@ -23647,6 +23827,8 @@ namespace fastllm {
                 rms_norm_eps, mlpInput);
 
         std::string denseGateupName = prefix + "gateup_proj.weight";
+        std::string denseGateName = prefix + "gate_proj.weight";
+        std::string denseUpName = prefix + "up_proj.weight";
         std::string denseDownName = prefix + "down_proj.weight";
         if (weight.weight.find(denseGateupName) != weight.weight.end() &&
             weight.weight.find(denseDownName) != weight.weight.end()) {
@@ -23655,6 +23837,20 @@ namespace fastllm {
                      &gateupResult, &swigluResult, &hiddenStates);
             return;
         }
+        if (weight.weight.find(denseGateName) != weight.weight.end() &&
+            weight.weight.find(denseUpName) != weight.weight.end() &&
+            weight.weight.find(denseDownName) != weight.weight.end()) {
+            Data gateResult, upResult, downResult;
+            Linear(mlpInput, weight[denseGateName], *GetEmptyData(), gateResult);
+            Silu(gateResult, gateResult);
+            Linear(mlpInput, weight[denseUpName], *GetEmptyData(), upResult);
+            MulTo(gateResult, upResult);
+            Linear(gateResult, weight[denseDownName],
+                   *GetEmptyData(), downResult);
+            AddTo(hiddenStates, downResult);
+            return;
+        }
+
 
         AssertInFastLLM(HasMtpMoeWeights(),
                         "Qwen3.5 MTP MoE weights are incomplete.\n");
@@ -24704,6 +24900,8 @@ namespace fastllm {
             std::string inputRmsName = language_prefix + "layers." + std::to_string(i) + ".input_layernorm.weight";
             std::string postRmsName = language_prefix + "layers." + std::to_string(i) + ".post_attention_layernorm.weight";
             std::string swigluWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
+            std::string gateProjWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.gate_proj.weight";
+            std::string upProjWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.up_proj.weight";
             std::string downWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.down_proj.weight";
 
             RMSNorm(hiddenStates, this->weight[inputRmsName], rms_norm_eps, attenInput);
@@ -25317,6 +25515,18 @@ namespace fastllm {
                 MLPBlock(&attenInput, &weight[swigluWeightName], &weight[downWeightName], &v, &q, &hiddenStates);
                 continue;
             }
+            if (weight.weight.find(gateProjWeightName) != weight.weight.end() &&
+                weight.weight.find(upProjWeightName) != weight.weight.end() &&
+                weight.weight.find(downWeightName) != weight.weight.end()) {
+                Linear(attenInput, weight[gateProjWeightName], Data(), v);
+                Silu(v, v);
+                Linear(attenInput, weight[upProjWeightName], Data(), q);
+                MulTo(v, q);
+                Linear(v, weight[downWeightName], Data(), q);
+                AddTo(hiddenStates, q);
+                continue;
+            }
+
 
             std::string gateWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.gate.weight";
             if (weight.weight.find(gateWeightName) == weight.weight.end()) {
@@ -25605,6 +25815,9 @@ namespace fastllm {
         Embedding(inputIds, this->weight[language_prefix + "embed_tokens.weight"], embeddingResult);
         ToDataType(embeddingResult, hiddenStates, this->dataType);
         MergeMultimodalFeaturesIntoText(*mmTypeIt->second[0], imageEmbeds, videoEmbeds, hiddenStates);
+        embeddingResult.FreeSpace();
+        imageFeatures.FreeSpace();
+        videoFeatures.FreeSpace();
 
         Data mropePositionIds;
         mropePositionIds.CopyFrom(*mropeIt->second[0]);
@@ -25616,10 +25829,6 @@ namespace fastllm {
             mropePositionIds.ToDevice(DataDevice::CPU);
         }
 
-        Data attentionMaskCopy(attentionMask);
-        std::vector <Data*> attentionMasks = {&attentionMaskCopy};
-        std::vector <int> seqLens = {inputIds.dims[1]};
-        std::vector <GenerationConfig> generationConfigs = {generationConfig};
         std::vector <std::pair <Data*, Data*> > pagedPastKeyValues;
         for (int i = 0; i < pastKeyValues.size(); i++) {
             pagedPastKeyValues.push_back(std::make_pair(&pastKeyValues[i].first, &pastKeyValues[i].second));
@@ -25628,6 +25837,9 @@ namespace fastllm {
         if (IsThreadTensorParallelEnabled()) {
             hiddenStates.ToDevice(DataDevice::CPU);
             std::vector <Data*> positionIds = {&mropePositionIds};
+            std::vector <Data*> attentionMasks = {nullptr};
+            std::vector <int> seqLens = {inputIds.dims[1]};
+            std::vector <GenerationConfig> generationConfigs = {generationConfig};
             return ForwardGPUWithHiddenStates(
                 1, inputIds, attentionMasks, positionIds, seqLens,
                 pagedPastKeyValues, generationConfigs, lastTokens,
@@ -25636,19 +25848,59 @@ namespace fastllm {
 #endif
 
         Data &embedWeight = this->weight[language_prefix + "embed_tokens.weight"];
-        if (embedWeight.dataDevice != DataDevice::CPU) {
-            if (!embedWeight.dataDeviceIds.empty()) {
-                hiddenStates.ToDevice(embedWeight.dataDevice, embedWeight.dataDeviceIds);
-            } else {
-                hiddenStates.ToDevice(embedWeight.dataDevice);
+        auto moveHiddenToModelDevice = [&](Data &states) {
+            if (embedWeight.dataDevice != DataDevice::CPU) {
+                if (!embedWeight.dataDeviceIds.empty()) {
+                    states.ToDevice(embedWeight.dataDevice, embedWeight.dataDeviceIds);
+                } else {
+                    states.ToDevice(embedWeight.dataDevice);
+                }
             }
+            if (states.dataType != this->dataType) {
+                ToDataType(states, this->dataType);
+            }
+        };
+
+        const int totalSeqLen = inputIds.dims[1];
+        const int prefillChunkSize = GetChunkedPrefillSize();
+        if (prefillChunkSize > 0 && totalSeqLen > prefillChunkSize) {
+            const int chunkCount =
+                (totalSeqLen + prefillChunkSize - 1) / prefillChunkSize;
+            printf(
+                "[Qwen3.5 vision] chunked multimodal prefill: "
+                "tokens=%d chunk=%d chunks=%d.\n",
+                totalSeqLen, prefillChunkSize, chunkCount);
+            fflush(stdout);
+
+            std::vector <int> ret;
+            std::vector <GenerationConfig> generationConfigs = {generationConfig};
+            for (int st = 0; st < totalSeqLen; st += prefillChunkSize) {
+                const int curLen = std::min(prefillChunkSize, totalSeqLen - st);
+                Data curInputIds, curPositionIds, curHiddenStates;
+                Split(inputIds, 1, st, st + curLen, curInputIds);
+                Split(mropePositionIds, 1, st, st + curLen, curPositionIds);
+                Split(hiddenStates, 1, st, st + curLen, curHiddenStates);
+                moveHiddenToModelDevice(curHiddenStates);
+
+                std::vector <Data*> curAttentionMasks = {nullptr};
+                std::vector <int> curSeqLens = {curLen};
+                ret = ForwardFromHiddenStates(
+                    1, curInputIds, curAttentionMasks, curPositionIds,
+                    curSeqLens, pagedPastKeyValues, generationConfigs,
+                    lastTokens, retLogits, curHiddenStates, curLen == 1);
+            }
+            return ret;
         }
-        if (hiddenStates.dataType != this->dataType) {
-            ToDataType(hiddenStates, this->dataType);
-        }
-        return ForwardFromHiddenStates(1, inputIds, attentionMasks, mropePositionIds, seqLens,
-                                       pagedPastKeyValues, generationConfigs, lastTokens,
-                                       retLogits, hiddenStates, inputIds.dims[1] == 1);
+
+        moveHiddenToModelDevice(hiddenStates);
+        Data attentionMaskCopy(attentionMask);
+        std::vector <Data*> attentionMasks = {&attentionMaskCopy};
+        std::vector <int> seqLens = {totalSeqLen};
+        std::vector <GenerationConfig> generationConfigs = {generationConfig};
+        return ForwardFromHiddenStates(
+            1, inputIds, attentionMasks, mropePositionIds, seqLens,
+            pagedPastKeyValues, generationConfigs, lastTokens,
+            retLogits, hiddenStates, totalSeqLen == 1);
     }
 
     std::vector <int> Qwen3_5Model::ForwardV2(
@@ -25872,6 +26124,8 @@ namespace fastllm {
             std::string oBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.o_proj.bias";
             std::string postRmsName = language_prefix + "layers." + std::to_string(i) + ".post_attention_layernorm.weight";
             std::string swigluWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
+            std::string gateProjWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.gate_proj.weight";
+            std::string upProjWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.up_proj.weight";
             std::string downWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.down_proj.weight";
 
             RMSNorm(hiddenStates, this->weight[inputRmsName], rms_norm_eps, attenInput);
@@ -26656,6 +26910,18 @@ namespace fastllm {
                 MLPBlock(&attenInput, &weight[swigluWeightName], &weight[downWeightName], &v, &q, &hiddenStates);
                 continue;
             }
+            if (weight.weight.find(gateProjWeightName) != weight.weight.end() &&
+                weight.weight.find(upProjWeightName) != weight.weight.end() &&
+                weight.weight.find(downWeightName) != weight.weight.end()) {
+                Linear(attenInput, weight[gateProjWeightName], Data(), v);
+                Silu(v, v);
+                Linear(attenInput, weight[upProjWeightName], Data(), q);
+                MulTo(v, q);
+                Linear(v, weight[downWeightName], Data(), q);
+                AddTo(hiddenStates, q);
+                continue;
+            }
+
 
             std::string gateWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.gate.weight";
             if (weight.weight.find(gateWeightName) == weight.weight.end()) {

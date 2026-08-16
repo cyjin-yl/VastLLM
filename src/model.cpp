@@ -1229,7 +1229,8 @@ namespace fastllm {
         }
 
         void CreateBufferWithPackedInt4Group(SafeTensorItem &scale, int groupCnt,
-                                             DataType dstType) {
+                                             DataType dstType,
+                                             SafeTensorItem *zeroPoint = nullptr) {
             AssertInFastLLM(this->dtype == "I32" && this->shape.size() >= 2 &&
                             scale.shape.size() >= 2,
                             "CreateBufferWithPackedInt4Group error: invalid weight or scale tensor.");
@@ -1310,6 +1311,45 @@ namespace fastllm {
                 for (size_t i = 0; i < (size_t)rows * groups; i++) {
                     scalesBuffer[i] = sourceScales[i];
                     minsBuffer[i] = -8.0f * sourceScales[i];
+                }
+                if (zeroPoint != nullptr) {
+                    // compressed-tensors asymmetric: w = (q - zp) * scale, so
+                    // FastLLM's per-group min becomes -zp * scale. Zero points
+                    // are int4-packed along rows (8 rows per int32, row 0 in
+                    // the low nibble), laid out [rows / 8, groups].
+                    AssertInFastLLM(zeroPoint->dtype == "I32" &&
+                                    zeroPoint->shape.size() == 2 &&
+                                    rows % 8 == 0 &&
+                                    zeroPoint->shape[0] == rows / 8 &&
+                                    zeroPoint->shape[1] == groups,
+                                    "CreateBufferWithPackedInt4Group error: invalid zero point tensor.");
+                    FILE *zpFile = fopen(zeroPoint->fileName.c_str(), "rb");
+                    AssertInFastLLM(zpFile != nullptr,
+                                    "CreateBufferWithPackedInt4Group error: cannot open zero point file.");
+#if defined(_WIN32) || defined(_WIN64)
+                    _fseeki64(zpFile, zeroPoint->data_offsets[0], 0);
+#else
+                    fseek(zpFile, zeroPoint->data_offsets[0], 0);
+#endif
+                    const size_t zpRows = (size_t)rows / 8;
+                    std::vector<int32_t> zpData(zpRows * (size_t)groups);
+                    size_t zpRead = fread(zpData.data(), sizeof(int32_t),
+                                          zpData.size(), zpFile);
+                    fclose(zpFile);
+                    AssertInFastLLM(zpRead == zpData.size(),
+                                    "CreateBufferWithPackedInt4Group error: read zero point failed.");
+                    for (size_t row = 0; row < (size_t)rows; row++) {
+                        for (size_t group = 0; group < (size_t)groups; group++) {
+                            // nibble order within a packed row of zero points
+                            // matches the weight packing: row r uses nibble
+                            // (r % 8) of the int32 at [r / 8, group].
+                            const int32_t packedValue =
+                                zpData[(row / 8) * (size_t)groups + group];
+                            const int zp = (packedValue >> ((row % 8) * 4)) & 0xF;
+                            minsBuffer[row * (size_t)groups + group] =
+                                -(float)zp * scalesBuffer[row * (size_t)groups + group];
+                        }
+                    }
                 }
             }
             fclose(file);
@@ -1524,8 +1564,16 @@ namespace fastllm {
         }
 
         std::string prefix = name.substr(0, name.size() - strlen(".weight_packed"));
-        if (safeTensors.itmeDict.find(prefix + ".weight_zero_point") != safeTensors.itmeDict.end() ||
-            safeTensors.itmeDict.find(prefix + ".weight_g_idx") != safeTensors.itmeDict.end()) {
+        if (safeTensors.itmeDict.find(prefix + ".weight_g_idx") != safeTensors.itmeDict.end()) {
+            return false;
+        }
+        // compressed-tensors asymmetric pack-quantized keeps int4 zero points
+        // packed along the row dimension (8 rows per int32) in
+        // "<prefix>.weight_zero_point". Validate its layout below once rows
+        // and groups are known.
+        auto zeroPointIt = safeTensors.itmeDict.find(prefix + ".weight_zero_point");
+        if (zeroPointIt != safeTensors.itmeDict.end() &&
+            (zeroPointIt->second.dtype != "I32" || zeroPointIt->second.shape.size() != 2)) {
             return false;
         }
         std::string scaleName = FindSafeTensorScaleTensorName(safeTensors, name);
@@ -1550,6 +1598,11 @@ namespace fastllm {
             logicalCols / groups > INT_MAX) {
             return false;
         }
+        if (zeroPointIt != safeTensors.itmeDict.end() &&
+            (rows % 8 != 0 || zeroPointIt->second.shape[0] != rows / 8 ||
+             zeroPointIt->second.shape[1] != groups)) {
+            return false;
+        }
         groupCnt = (int)(logicalCols / groups);
         return groupCnt > 0;
     }
@@ -1558,6 +1611,17 @@ namespace fastllm {
                                         const std::string &name) {
         int groupCnt = -1;
         return TryGetPackedInt4GroupCnt(safeTensors, name, groupCnt);
+    }
+
+    static SafeTensorItem *FindPackedInt4ZeroPoint(SafeTensors &safeTensors,
+                                                   const std::string &name) {
+        if (!StringEndWith(name, ".weight_packed")) {
+            return nullptr;
+        }
+        std::string zeroPointName =
+            name.substr(0, name.size() - strlen(".weight_packed")) + ".weight_zero_point";
+        auto it = safeTensors.itmeDict.find(zeroPointName);
+        return it != safeTensors.itmeDict.end() ? &it->second : nullptr;
     }
 
     static DataType GetPackedInt4GroupDataType(const SafeTensors &safeTensors,
@@ -1591,6 +1655,14 @@ namespace fastllm {
         if (StringEndWith(name, ".weight_scale")) {
             std::string prefix = name.substr(0, name.size() - strlen(".weight_scale"));
             return isQuantTensor(prefix + ".weight") || isQuantTensor(prefix + ".weight_packed");
+        }
+        if (StringEndWith(name, ".weight_zero_point")) {
+            std::string prefix = name.substr(0, name.size() - strlen(".weight_zero_point"));
+            return isQuantTensor(prefix + ".weight_packed");
+        }
+        if (StringEndWith(name, ".weight_shape")) {
+            std::string prefix = name.substr(0, name.size() - strlen(".weight_shape"));
+            return isQuantTensor(prefix + ".weight_packed");
         }
         if (StringEndWith(name, ".weight_scale_2")) {
             std::string prefix = name.substr(0, name.size() - strlen(".weight_scale_2"));
@@ -4288,8 +4360,6 @@ namespace fastllm {
                             int current = ++cnt;
                             completedLoadBytes += tensorBytes;
                             uint64_t currentBytes = completedLoadBytes;
-                            printf("Loading %d \r", current * 100 / (int)tensors.size());
-                            fflush(stdout);
                             workerLock.unlock();
                             if (current == (int)tensors.size() ||
                                 current * 100 / (int)tensors.size() !=
@@ -4641,8 +4711,6 @@ namespace fastllm {
             auto &tensor = safeTensors.itmeDict[tensorName];
             if (IsSafeTensorQuantScaleTensorName(safeTensors, tensorName)) {
                 int current = ++cur;
-                printf("Load %d \r", current * 100 / prepareTotal);
-                fflush(stdout);
                 if (current == prepareTotal ||
                     current * 100 / prepareTotal != (current - 1) * 100 / prepareTotal) {
                     ReportModelLoadProgress("weights_prepare", current, prepareTotal);
@@ -4726,8 +4794,6 @@ namespace fastllm {
 
             totalBytes += tensor.bytes;
             int current = ++cur;
-            printf("Load %d \r", current * 100 / prepareTotal);
-            fflush(stdout);
             if (current == prepareTotal ||
                 current * 100 / prepareTotal != (current - 1) * 100 / prepareTotal) {
                 ReportModelLoadProgress("weights_prepare", current, prepareTotal);
@@ -4756,9 +4822,6 @@ namespace fastllm {
             int current = ++cnt;
             completedLoadBytes += tensorBytes;
             uint64_t currentBytes = completedLoadBytes;
-            int progress = std::min(100, current * 100 / loadProgressTotal);
-            printf("Loading %d \r", progress);
-            fflush(stdout);
             locker.unlock();
             if (current == loadProgressTotal ||
                 current * 100 / loadProgressTotal != (current - 1) * 100 / loadProgressTotal) {
@@ -5008,7 +5071,8 @@ namespace fastllm {
                                     if (isPackedInt4Group) {
                                         tensor.CreateBufferWithPackedInt4Group(scaleTensor,
                                                                                packedInt4GroupCnt,
-                                                                               packedInt4DataType);
+                                                                               packedInt4DataType,
+                                                                               FindPackedInt4ZeroPoint(safeTensors, tensorName));
                                         scaleTensor.ClearBuffer();
                                     } else {
                                         tensor.CreateBufferWithScale(oriDataType, scaleTensor, scale2Tensor);
@@ -5661,7 +5725,8 @@ namespace fastllm {
                                 if (isPackedInt4Group) {
                                     tensor.CreateBufferWithPackedInt4Group(scaleTensor,
                                                                            packedInt4GroupCnt,
-                                                                           packedInt4DataType);
+                                                                           packedInt4DataType,
+                                                                           FindPackedInt4ZeroPoint(safeTensors, tensor.tensorName));
                                     scaleTensor.ClearBuffer();
                                 } else {
                                     tensor.CreateBufferWithScale(oriDataType, scaleTensor);

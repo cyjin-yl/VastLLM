@@ -738,10 +738,6 @@ namespace fastllm {
             // 每个页面的引用计数
             std::vector<int> pageRefCount;
 
-            // 页池增长时退役的旧 GPU 缓冲。运行期不立即释放（并发拷贝/引用
-            // 可能仍在使用旧指针，立即 cudaFree 会导致 use-after-free，
-            // cudaMemcpy 报 cudaErrorInvalidValue），统一在析构时释放。
-            std::vector<void*> retiredCudaData;
 
             // Trie树缓存管理
             CacheTrieNode *trieRoot = nullptr;
@@ -781,6 +777,18 @@ namespace fastllm {
                 const std::vector<PersistentPayloadRef> &refs,
                 std::string *error);
     };
+    // Return an absolute physical-page target that covers the current
+    // deficit while limiting small incremental growth to 128 pages.
+    int GetPagedCacheGrowthTarget(
+        int physicalPages, int maxPages, int additionalPages);
+
+#ifdef USE_CUDA
+    // CUDA graphs retain paged-cache base pointers. Graph launch and pool
+    // relocation share this mutex; the version changes after every relocation.
+    std::mutex &GetPagedCacheCudaStorageMutex();
+    uint64_t GetPagedCacheCudaStorageVersion();
+#endif
+
 
     bool PagedPrefixCacheCpuTierEnabled();
     bool PagedPrefixCacheDiskTierEnabled();
