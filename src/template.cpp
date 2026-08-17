@@ -178,8 +178,17 @@ namespace fastllm {
                         AssertInFastLLM(ok, "Jinja error: parse string failed: " + value.substr(st, std::min(10, (int)value.size() - st)));
                     } else if (singleCharTokens.find(now) != singleCharTokens.end()) {
                         if (singleCharTokens[now] == JinjaToken::JinjaTokenLSB && !tokens.empty()) {
-                            if (tokens.back().type == JinjaToken::JinjaTokenID)
+                            if (tokens.back().type == JinjaToken::JinjaTokenID) {
                                 tokens.back().type = JinjaToken::JinjaTokenFUNC;
+                                // `x|filter(args)` 语义 = `filter(x, args)`(Jinja2 带参过滤器)。
+                                // 词法上 ID 后随 `(` 已转成 FUNC, 这里吸收前一个 Filter token,
+                                // 使其走普通函数调用的求值路径(被过滤值天然成为栈上第一参数),
+                                // 否则残留的 Filter 操作符在求值时缺少操作数报 expression error。
+                                if (tokens.size() >= 2 &&
+                                    tokens[tokens.size() - 2].type == JinjaToken::JinjaTokenFilter) {
+                                    tokens.erase(tokens.end() - 2);
+                                }
+                            }
                         }
                         tokens.push_back(JinjaToken(singleCharTokens[now]));
                         st++;
@@ -272,6 +281,13 @@ namespace fastllm {
                 return b.dictValue.find(a.stringValue) != b.dictValue.end();
             } else if (a.type == JinjaVar::JinjaString && b.type == JinjaVar::JinjaString) {
                 return b.stringValue.find(a.stringValue) != std::string::npos;
+            } else if (b.type == JinjaVar::JinjaArray) {
+                // 元组/列表字面量的成员测试: `x in ('a', 'b')`
+                for (auto &elem : b.arrayValue) {
+                    if (JinjaBinaryOp(a, elem, JinjaToken::JinjaTokenEqual).BoolValue())
+                        return JinjaVar(1);
+                }
+                return JinjaVar(0);
             } else if (b.type == JinjaVar::JinjaNone) {
                 return a.type == JinjaVar::JinjaNone;
             }
@@ -517,6 +533,23 @@ namespace fastllm {
             return JinjaVar();
         };
         functionArgCount["raise_exception"] = 1;
+        // default 过滤器(带参形式 `x|default(fallback)` 会被词法分析成
+        // FUNC token):value 未定义(JinjaNone)时返回 fallback, 否则原值。
+        // 模型自带 chat_template 用 `reasoning_effort|default('xhigh')`,
+        // 缺失此函数时整个模板渲染失败退回 MakeInput(图像/视频占位符丢失)。
+        // 注意 FUNC 求值传入的 args 容器 type 是 JinjaNone(元素在 arrayValue),
+        // 不能按 JinjaArray 判断。
+        functionMap["default"] = [](const JinjaVar &args) {
+            if (args.arrayValue.size() >= 2) {
+                const JinjaVar &v = args.arrayValue[0];
+                return v.type == JinjaVar::JinjaNone ? args.arrayValue[1] : v;
+            }
+            return args;  // `x|default` 无参形式: 恒等
+        };
+        functionArgCount["default"] = 2;
+        // `d` 是 default 的 Jinja2 简写别名
+        functionMap["d"] = functionMap["default"];
+        functionArgCount["d"] = 2;
     }
 
     JinjaTemplate::JinjaTemplate (const std::string &temp) {
@@ -602,37 +635,101 @@ namespace fastllm {
                 tokens[i].type == JinjaToken::JinjaTokenSTRING) {
                 suffixExp.push_back(tokens[i]);
             } else if (tokens[i].type == JinjaToken::JinjaTokenLSB || tokens[i].type == JinjaToken::JinjaTokenLMB) {
-                ops.push_back(tokens[i]);
+                // 标记开括号角色, 闭合时区分语义:
+                //   "call"        函数/宏调用的参数表(LSB 前是 FUNC) —— 闭合后弹出 FUNC
+                //   "sub"         下标/切片(开括号前是值类 token)    —— 闭合生成下标指令
+                //   "grp@<n>"     分组或元组(记录进入时 suffixExp 深度, 含顶层逗号则为元组)
+                //   "list@<n>"    列表字面量(同理)
+                JinjaToken open = tokens[i];
+                bool isValueBefore = i > 0 &&
+                    (tokens[i - 1].type == JinjaToken::JinjaTokenID ||
+                     tokens[i - 1].type == JinjaToken::JinjaTokenNUM ||
+                     tokens[i - 1].type == JinjaToken::JinjaTokenSTRING ||
+                     tokens[i - 1].type == JinjaToken::JinjaTokenBOOL ||
+                     tokens[i - 1].type == JinjaToken::JinjaTokenRMB ||
+                     tokens[i - 1].type == JinjaToken::JinjaTokenRSB);
+                if (open.type == JinjaToken::JinjaTokenLSB &&
+                        i > 0 && tokens[i - 1].type == JinjaToken::JinjaTokenFUNC) {
+                    open.value = "call";
+                } else if (isValueBefore) {
+                    open.value = "sub";
+                } else {
+                    open.value = (open.type == JinjaToken::JinjaTokenLMB ? "list@" : "grp@") +
+                                 std::to_string(suffixExp.size());
+                }
+                ops.push_back(open);
             } else if (tokens[i].type == JinjaToken::JinjaTokenRSB) {
+                int elemSeps = 0;
                 while (ops.size() > 0 && ops.back().type != JinjaToken::JinjaTokenLSB) {
-                    suffixExp.push_back(ops.back());
+                    if (ops.back().type == JinjaToken::JinjaTokenNamespace &&
+                            ops.back().value == "elem") {
+                        // 元组元素分隔符: 计数后丢弃(各段表达式已陆续进入 suffixExp)
+                        elemSeps++;
+                    } else {
+                        suffixExp.push_back(ops.back());
+                    }
                     ops.pop_back();
                 }
                 AssertInFastLLM(ops.size() > 0 && ops.back().type == JinjaToken::JinjaTokenLSB, "Error: barckets doesn't match.");
+                JinjaToken open = ops.back();
                 ops.pop_back();
-                if (!ops.empty() && ops.back().type == JinjaToken::JinjaTokenFUNC) {
-                    suffixExp.push_back(ops.back());
-                    ops.pop_back();
+                if (open.value == "call" || open.value == "sub") {
+                    if (!ops.empty() && ops.back().type == JinjaToken::JinjaTokenFUNC) {
+                        suffixExp.push_back(ops.back());
+                        ops.pop_back();
+                    }
+                } else if (elemSeps > 0) {
+                    // 元组字面量 `(a, b, c)`: 元素数 = 分隔符数 + 1(末段已在 suffixExp)
+                    suffixExp.push_back(JinjaToken(JinjaToken::JinjaTokenBuildArray,
+                                                   std::to_string(elemSeps + 1)));
                 }
+                // elemSeps == 0 的分组括号不产生任何 token(原有行为)
             } else if (tokens[i].type == JinjaToken::JinjaTokenNamespace) {
-                // 目前仅支持 "变量 = 表达式" 格式
+                // 逗号两种语义: kwargs 分隔(`name = expr`, namespace(...) 等)与
+                // 位置元素分隔(元组/列表字面量、函数位置参数)
                 int index = tokens[i + 1].type == JinjaToken::JinjaTokenLSB ? 1 : 0;
-                AssertInFastLLM(
-                    tokens.size() - i >= 3 &&
-                    tokens[i + index + 1].type == JinjaToken::JinjaTokenID &&
-                    tokens[i + index + 2].type == JinjaToken::JinjaTokenAssign,
-                    "Jinja error: only support format \"(var = expression)\"."
-                );
-                ops.push_back(tokens[i]);
+                if (tokens.size() - i >= 3 &&
+                        tokens[i + index + 1].type == JinjaToken::JinjaTokenID &&
+                        tokens[i + index + 2].type == JinjaToken::JinjaTokenAssign) {
+                    ops.push_back(tokens[i]);  // kwargs 分隔(原有语义, 求值时组装 dict)
+                } else {
+                    // 位置元素分隔: 先把本段表达式残留操作符弹入 suffixExp(到括号边界
+                    // 或上一个元素分隔符), 再在 ops 压入分隔标记, 由闭合括号计数并生成 BuildArray
+                    while (ops.size() > 0 &&
+                            ops.back().type != JinjaToken::JinjaTokenLSB &&
+                            ops.back().type != JinjaToken::JinjaTokenLMB &&
+                            !(ops.back().type == JinjaToken::JinjaTokenNamespace &&
+                              ops.back().value == "elem")) {
+                        suffixExp.push_back(ops.back());
+                        ops.pop_back();
+                    }
+                    ops.push_back(JinjaToken(JinjaToken::JinjaTokenNamespace, "elem"));
+                }
             } else if (tokens[i].type == JinjaToken::JinjaTokenRMB) {
+                int elemSeps = 0;
                 while (ops.size() > 0 && ops.back().type != JinjaToken::JinjaTokenLMB) {
-                    suffixExp.push_back(ops.back());
+                    if (ops.back().type == JinjaToken::JinjaTokenNamespace &&
+                            ops.back().value == "elem") {
+                        elemSeps++;
+                    } else {
+                        suffixExp.push_back(ops.back());
+                    }
                     ops.pop_back();
                 }
                 AssertInFastLLM(ops.size() > 0 && ops.back().type == JinjaToken::JinjaTokenLMB, "Error: barckets doesn't match.");
-                if (suffixExp.back().type != JinjaToken::JinjaTokenSlice)
-                    suffixExp.push_back(tokens[i]);
+                JinjaToken open = ops.back();
                 ops.pop_back();
+                if (open.value == "sub") {
+                    if (suffixExp.back().type != JinjaToken::JinjaTokenSlice)
+                        suffixExp.push_back(tokens[i]);
+                } else {
+                    // 列表字面量 `[a, b, c]`: 元素数 = 分隔符数 + (进入后 suffixExp 是否有新增)
+                    int recorded = 0;
+                    if (open.value.rfind("list@", 0) == 0)
+                        recorded = atoi(open.value.c_str() + 5);
+                    int n = elemSeps + ((int)suffixExp.size() > recorded ? 1 : 0);
+                    suffixExp.push_back(JinjaToken(JinjaToken::JinjaTokenBuildArray, std::to_string(n)));
+                }
             } else if (tokens[i].type == JinjaToken::JinjaTokenSlice) {
                 if (!ops.empty() && ops.back().type == JinjaToken::JinjaTokenSlice)
                     ops.pop_back();
@@ -742,6 +839,13 @@ namespace fastllm {
         }
 
         // 2. 后缀表达式求值
+        static bool jinjaDebug = getenv("JINJA_DEBUG") != nullptr;
+        if (jinjaDebug) {
+            printf("[JINJA-DBG] suffixExp:");
+            for (auto &tk : suffixExp)
+                printf(" (t=%d,v=%s)", (int)tk.type, tk.value.c_str());
+            printf("\n");
+        }
         std::vector <JinjaVar> vars;
         for (auto &it : suffixExp) {
             if (it.type == JinjaToken::JinjaTokenID) {
@@ -753,7 +857,7 @@ namespace fastllm {
             } else if (it.type == JinjaToken::JinjaTokenNUM) {
                 vars.push_back(JinjaVar(atoll(it.value.c_str())));
             } else if (it.type == JinjaToken::JinjaTokenDOT) {
-                AssertInFastLLM(vars.size() > 1, "Jinja Error: expression error.");
+                AssertInFastLLM(vars.size() > 1, "Jinja Error: expression error near token [" + it.value + "] type=" + std::to_string(it.type) + " stack=" + std::to_string(vars.size()) + ".");
                 JinjaVar a = vars[vars.size() - 2], b = vars.back();
                 if (a.type == JinjaVar::JinjaNone && !a.stringValue.empty()) {
                     if (setValue != nullptr)
@@ -767,7 +871,7 @@ namespace fastllm {
                 // None 的属性访问返回 undefined(Jinja 语义), 而不是报错
                 vars.push_back(a.type == JinjaVar::JinjaNone ? JinjaVar() : a[b]);
             } else if (it.type == JinjaToken::JinjaTokenRMB) {
-                AssertInFastLLM(vars.size() > 1, "Jinja Error: expression error.");
+                AssertInFastLLM(vars.size() > 1, "Jinja Error: expression error near token [" + it.value + "] type=" + std::to_string(it.type) + " stack=" + std::to_string(vars.size()) + ".");
                 JinjaVar a = vars[vars.size() - 2], b = vars.back();
                 if (b.type == JinjaVar::JinjaNone && !b.stringValue.empty()) {
                     b = local[b];
@@ -783,7 +887,7 @@ namespace fastllm {
                 vars.pop_back();
                 vars.push_back(a.type == JinjaVar::JinjaNone ? JinjaVar() : a[b]);
             } else if (it.type == JinjaToken::JinjaTokenNamespace) {
-                AssertInFastLLM(vars.size() > 1, "Jinja Error: expression error.");
+                AssertInFastLLM(vars.size() > 1, "Jinja Error: expression error near token [" + it.value + "] type=" + std::to_string(it.type) + " stack=" + std::to_string(vars.size()) + ".");
                 JinjaVar last = vars.back();
                 int shift = (last.type == JinjaVar::JinjaDict) ? 1 : 0 ;
                 JinjaVar a = vars[vars.size() - 2 - shift], b = vars[vars.size() - 1 - shift];
@@ -799,6 +903,20 @@ namespace fastllm {
                 } else {
                     vars.push_back(JinjaVar({{a.stringValue, b}}));
                 }
+            } else if (it.type == JinjaToken::JinjaTokenBuildArray) {
+                // 元组/列表字面量: 弹出 n 个已求值元素组装成 JinjaArray
+                int n = atoi(it.value.c_str());
+                AssertInFastLLM(vars.size() >= (size_t)n, "Jinja Error: array build expression error.");
+                std::vector<JinjaVar> elems;
+                elems.reserve(n);
+                for (int k = 0; k < n; k++) {
+                    JinjaVar a = vars.back();
+                    if (a.type == JinjaVar::JinjaNone)
+                        a = local[a];
+                    elems.insert(elems.begin(), a);
+                    vars.pop_back();
+                }
+                vars.push_back(JinjaVar(elems));
             } else if (it.type == JinjaToken::JinjaTokenFUNC) {
                 if (functionMap.find(it.value) != functionMap.end()) {
                     int argCount = functionArgCount[it.value];
@@ -817,7 +935,7 @@ namespace fastllm {
                     ErrorInFastLLM("Jinja Error: unsupport function " + it.value);
                 }
             } else if (it.type == JinjaToken::JinjaTokenFilter) {
-                AssertInFastLLM(vars.size() > 1, "Jinja Error: expression error.");
+                AssertInFastLLM(vars.size() > 1, "Jinja Error: expression error near token [" + it.value + "] type=" + std::to_string(it.type) + " stack=" + std::to_string(vars.size()) + ".");
                 JinjaVar a = vars[vars.size() - 2], b = vars.back();
                 if (a.type == JinjaVar::JinjaNone) {
                     a = local[a];
@@ -878,9 +996,11 @@ namespace fastllm {
                         it.type == JinjaToken::JinjaTokenIn ||
                         it.type == JinjaToken::JinjaTokenAnd ||
                         it.type == JinjaToken::JinjaTokenOr) {
-                AssertInFastLLM(vars.size() > 1, "Jinja Error: expression error.");
+                AssertInFastLLM(vars.size() > 1, "Jinja Error: expression error near token [" + it.value + "] type=" + std::to_string(it.type) + " stack=" + std::to_string(vars.size()) + ".");
                 JinjaVar a = vars[vars.size() - 2], b = vars.back();
-                if (a.type == JinjaVar::JinjaNone && it.type != JinjaToken::JinjaTokenIn) {
+                if (a.type == JinjaVar::JinjaNone) {
+                    // In 也曾例外跳过解析(把变量名当 dict key 用), 但这违反 Jinja 语义
+                    // 且使 `var in (tuple)` 永远失配; 字面量 key('image' in item)不受影响
                     a = local[a];
                 }
                 if (b.type == JinjaVar::JinjaNone && b.stringValue != "defined" && b.stringValue != "none"
@@ -923,7 +1043,7 @@ namespace fastllm {
             }
         }
 
-        AssertInFastLLM(vars.size() == 1, "Jinja Error: expression error.");
+        AssertInFastLLM(vars.size() == 1, "Jinja Error: expression error at end (stack=" + std::to_string(vars.size()) + ").");
         if (vars[0].type == JinjaVar::JinjaNone) {
             vars[0] = local[vars[0]];
         }

@@ -58,6 +58,7 @@ namespace fastllm {
             JinjaTokenAdd, JinjaTokenSub, JinjaTokenMul, JinjaTokenDiv, JinjaTokenMod,
             JinjaTokenNot, JinjaTokenAnd, JinjaTokenOr,
             JinjaTokenFilter, JinjaTokenNamespace, JinjaTokenSlice,
+            JinjaTokenBuildArray,
             JinjaTokenMacro, JinjaTokenEndMacro, JinjaTokenConcat
         };
 
