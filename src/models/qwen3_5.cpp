@@ -19551,6 +19551,11 @@ namespace fastllm {
             if (ctx == nullptr || ctx->cacheLen != 0 || ctx->currentTokens.empty()) {
                 return 0;
             }
+            const int prefixQueryTotalTokens = (int)ctx->currentTokens.size();
+            const uint64_t cpuHitPagesBefore =
+                GetPagedPrefixCacheCpuHitPages();
+            const uint64_t diskReadBytesBefore =
+                GetPagedPrefixCacheDiskReadBytes();
             int probeLayer = model->kvCacheId;
             auto probeRefs =
                 model->GetPagedKVCacheManagers(probeLayer, true);
@@ -19590,6 +19595,8 @@ namespace fastllm {
                 }
             }
             if (probeManager == nullptr) {
+                PrefixCacheStatsObserveRequest(
+                    prefixQueryTotalTokens, 0, nullptr, "other");
                 return 0;
             }
 
@@ -19606,6 +19613,8 @@ namespace fastllm {
 
             int minCachedPages = (int)queryManager(probeManager).size();
             if (minCachedPages <= 0) {
+                PrefixCacheStatsObserveRequest(
+                    prefixQueryTotalTokens, 0, nullptr, "no-record");
                 return 0;
             }
             for (int layer = 0; layer < model->block_cnt; layer++) {
@@ -19623,6 +19632,8 @@ namespace fastllm {
                 }
             }
             if (minCachedPages <= 0) {
+                PrefixCacheStatsObserveRequest(
+                    prefixQueryTotalTokens, 0, nullptr, "no-record");
                 return 0;
             }
 
@@ -19632,6 +19643,8 @@ namespace fastllm {
                 cachedLen = minCachedPages * probeManager->pageLen;
             }
             if (minCachedPages <= 0) {
+                PrefixCacheStatsObserveRequest(
+                    prefixQueryTotalTokens, 0, nullptr, "no-record");
                 return 0;
             }
 
@@ -19639,10 +19652,14 @@ namespace fastllm {
             extraCachedLen = std::max(0, std::min(extraCachedLen, cachedLen));
             minCachedPages = extraCachedLen / probeManager->pageLen;
             if (minCachedPages <= 0) {
+                PrefixCacheStatsObserveRequest(
+                    prefixQueryTotalTokens, 0, nullptr, "no-record");
                 return 0;
             }
             cachedLen = minCachedPages * probeManager->pageLen;
             if (!model->RestorePagedPrefixCacheExtra(ctx, cachedLen)) {
+                PrefixCacheStatsObserveRequest(
+                    prefixQueryTotalTokens, 0, nullptr, "restore-failed");
                 return -1;
             }
 
@@ -19754,9 +19771,19 @@ namespace fastllm {
                 auto valueRefs = model->GetPagedKVCacheManagers(layer, false);
                 if (!restorePagedCache(ctx->pastKeyValues[layer].first, keyRefs) ||
                     !restorePagedCache(ctx->pastKeyValues[layer].second, valueRefs)) {
+                    PrefixCacheStatsObserveRequest(
+                        prefixQueryTotalTokens, 0, nullptr, "restore-failed");
                     return -1;
                 }
             }
+            const char *hitLayer = "mem-trie";
+            if (GetPagedPrefixCacheDiskReadBytes() > diskReadBytesBefore) {
+                hitLayer = "disk";
+            } else if (GetPagedPrefixCacheCpuHitPages() > cpuHitPagesBefore) {
+                hitLayer = "cpu";
+            }
+            PrefixCacheStatsObserveRequest(
+                prefixQueryTotalTokens, cachedLen, hitLayer, nullptr);
             ctx->currentTokens.erase(
                 ctx->currentTokens.begin(),
                 ctx->currentTokens.begin() + cachedLen);

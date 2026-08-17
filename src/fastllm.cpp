@@ -7101,6 +7101,203 @@ namespace fastllm {
         return pagedPrefixCacheDiskHits.load();
     }
 
+    // ---- 前缀缓存可观测性(纯测量, FASTLLM_PREFIX_CACHE_STATS 门控)----
+    namespace {
+        std::atomic<uint64_t> pcStatRequests{0};
+        std::atomic<uint64_t> pcStatHitRequests{0};
+        std::atomic<uint64_t> pcStatQueryTokens{0};
+        std::atomic<uint64_t> pcStatHitTokens{0};
+        std::atomic<uint64_t> pcStatHitTokensMemTrie{0};
+        std::atomic<uint64_t> pcStatHitTokensCpuTier{0};
+        std::atomic<uint64_t> pcStatHitTokensDisk{0};
+        std::atomic<uint64_t> pcStatMissNoRecord{0};
+        std::atomic<uint64_t> pcStatMissEvicted{0};
+        std::atomic<uint64_t> pcStatMissBelowThreshold{0};
+        std::atomic<uint64_t> pcStatMissGeneration{0};
+        std::atomic<uint64_t> pcStatMissRestoreFailed{0};
+        std::atomic<uint64_t> pcStatMissOther{0};
+        std::atomic<uint64_t> pcStatRecordAccepted{0};
+        std::atomic<uint64_t> pcStatRecordRejectedMinHitsTokens{0};
+        std::atomic<uint64_t> pcStatRecordRejectedCapacity{0};
+        std::atomic<uint64_t> pcStatRecordRejectedNoSpace{0};
+        std::atomic<uint64_t> pcStatRecordRejectedOther{0};
+        std::atomic<uint64_t> pcStatEvictTrieNodes{0};
+        std::atomic<uint64_t> pcStatEvictCpuTierCalls{0};
+        std::atomic<uint64_t> pcStatEvictCpuTierBytes{0};
+    }
+
+    bool PrefixCacheStatsEnabled() {
+        static const bool enabled = []() {
+            const char *env = std::getenv("FASTLLM_PREFIX_CACHE_STATS");
+            return env != nullptr && env[0] != '\0' &&
+                   std::strcmp(env, "0") != 0;
+        }();
+        return enabled;
+    }
+
+    void PrefixCacheStatsObserveRequest(
+            int totalTokens, int hitTokens,
+            const char *hitLayer, const char *missReason) {
+        if (!PrefixCacheStatsEnabled()) {
+            return;
+        }
+        const uint64_t reqSeq = pcStatRequests.fetch_add(1) + 1;
+        pcStatQueryTokens += totalTokens > 0 ? (uint64_t)totalTokens : 0;
+        if (hitTokens > 0) {
+            pcStatHitRequests.fetch_add(1);
+            pcStatHitTokens += (uint64_t)hitTokens;
+            if (hitLayer != nullptr) {
+                if (std::strcmp(hitLayer, "cpu") == 0) {
+                    pcStatHitTokensCpuTier += (uint64_t)hitTokens;
+                } else if (std::strcmp(hitLayer, "disk") == 0) {
+                    pcStatHitTokensDisk += (uint64_t)hitTokens;
+                } else {
+                    pcStatHitTokensMemTrie += (uint64_t)hitTokens;
+                }
+            } else {
+                pcStatHitTokensMemTrie += (uint64_t)hitTokens;
+            }
+        } else if (missReason != nullptr) {
+            if (std::strcmp(missReason, "no-record") == 0) {
+                pcStatMissNoRecord.fetch_add(1);
+            } else if (std::strcmp(missReason, "evicted") == 0) {
+                pcStatMissEvicted.fetch_add(1);
+            } else if (std::strcmp(missReason, "below-threshold") == 0) {
+                pcStatMissBelowThreshold.fetch_add(1);
+            } else if (std::strcmp(missReason, "generation") == 0) {
+                pcStatMissGeneration.fetch_add(1);
+            } else if (std::strcmp(missReason, "restore-failed") == 0) {
+                pcStatMissRestoreFailed.fetch_add(1);
+            } else {
+                pcStatMissOther.fetch_add(1);
+            }
+        } else {
+            pcStatMissOther.fetch_add(1);
+        }
+        printf("[PrefixCache] req#%llu total=%d hit=%d layer=%s miss=%s\n",
+               (unsigned long long)reqSeq, totalTokens, hitTokens,
+               hitLayer != nullptr ? hitLayer : "-",
+               missReason != nullptr ? missReason : "-");
+        if (reqSeq % 64 == 0) {
+            PrefixCacheStats s = GetPrefixCacheStatsSnapshot();
+            printf("[PrefixCache] periodic: reqs=%llu hitReqs=%llu "
+                   "hitTok=%llu/%llu (mem=%llu cpu=%llu disk=%llu) "
+                   "miss{no-record=%llu evicted=%llu below-thresh=%llu "
+                   "gen=%llu restore-fail=%llu other=%llu} "
+                   "record{ok=%llu rej-min=%llu rej-cap=%llu rej-space=%llu rej-other=%llu} "
+                   "evict{trie-nodes=%llu cpu-calls=%llu cpu-bytes=%llu} "
+                   "resident{mem=%lluMB cpu=%lluMB disk=%lluMB}\n",
+                   (unsigned long long)s.requests,
+                   (unsigned long long)s.hitRequests,
+                   (unsigned long long)s.hitTokens,
+                   (unsigned long long)s.queryTokens,
+                   (unsigned long long)s.hitTokensMemTrie,
+                   (unsigned long long)s.hitTokensCpuTier,
+                   (unsigned long long)s.hitTokensDisk,
+                   (unsigned long long)s.missNoRecord,
+                   (unsigned long long)s.missEvicted,
+                   (unsigned long long)s.missBelowThreshold,
+                   (unsigned long long)s.missGenerationMismatch,
+                   (unsigned long long)s.missRestoreFailed,
+                   (unsigned long long)s.missOther,
+                   (unsigned long long)s.recordAccepted,
+                   (unsigned long long)s.recordRejectedMinHitsTokens,
+                   (unsigned long long)s.recordRejectedCapacity,
+                   (unsigned long long)s.recordRejectedNoSpace,
+                   (unsigned long long)s.recordRejectedOther,
+                   (unsigned long long)s.evictTrieNodes,
+                   (unsigned long long)s.evictCpuTierCalls,
+                   (unsigned long long)s.evictCpuTierBytes,
+                   (unsigned long long)(s.memTrieResidentBytes >> 20),
+                   (unsigned long long)(s.cpuTierResidentBytes >> 20),
+                   (unsigned long long)(s.diskResidentBytes >> 20));
+        }
+        fflush(stdout);
+    }
+
+    void PrefixCacheStatsObserveRecord(bool accepted, const char *rejectReason) {
+        if (!PrefixCacheStatsEnabled()) {
+            return;
+        }
+        if (accepted) {
+            pcStatRecordAccepted.fetch_add(1);
+            return;
+        }
+        if (rejectReason == nullptr) {
+            pcStatRecordRejectedOther.fetch_add(1);
+        } else if (std::strcmp(rejectReason, "min-hits-tokens") == 0) {
+            pcStatRecordRejectedMinHitsTokens.fetch_add(1);
+        } else if (std::strcmp(rejectReason, "capacity") == 0) {
+            pcStatRecordRejectedCapacity.fetch_add(1);
+        } else if (std::strcmp(rejectReason, "no-space") == 0) {
+            pcStatRecordRejectedNoSpace.fetch_add(1);
+        } else {
+            pcStatRecordRejectedOther.fetch_add(1);
+        }
+    }
+
+    void PrefixCacheStatsObserveEviction(const char *kind, uint64_t nodesOrBytes) {
+        if (!PrefixCacheStatsEnabled()) {
+            return;
+        }
+        if (kind == nullptr) {
+            return;
+        }
+        if (std::strcmp(kind, "trie-node") == 0) {
+            pcStatEvictTrieNodes += nodesOrBytes;
+        } else if (std::strcmp(kind, "cpu-tier-call") == 0) {
+            pcStatEvictCpuTierCalls.fetch_add(1);
+            pcStatEvictCpuTierBytes += nodesOrBytes;
+        }
+    }
+
+    PrefixCacheStats GetPrefixCacheStatsSnapshot() {
+        PrefixCacheStats s;
+        s.requests = pcStatRequests.load();
+        s.hitRequests = pcStatHitRequests.load();
+        s.queryTokens = pcStatQueryTokens.load();
+        s.hitTokens = pcStatHitTokens.load();
+        s.hitTokensMemTrie = pcStatHitTokensMemTrie.load();
+        s.hitTokensCpuTier = pcStatHitTokensCpuTier.load();
+        s.hitTokensDisk = pcStatHitTokensDisk.load();
+        s.missNoRecord = pcStatMissNoRecord.load();
+        s.missEvicted = pcStatMissEvicted.load();
+        s.missBelowThreshold = pcStatMissBelowThreshold.load();
+        s.missGenerationMismatch = pcStatMissGeneration.load();
+        s.missRestoreFailed = pcStatMissRestoreFailed.load();
+        s.missOther = pcStatMissOther.load();
+        s.recordAccepted = pcStatRecordAccepted.load();
+        s.recordRejectedMinHitsTokens = pcStatRecordRejectedMinHitsTokens.load();
+        s.recordRejectedCapacity = pcStatRecordRejectedCapacity.load();
+        s.recordRejectedNoSpace = pcStatRecordRejectedNoSpace.load();
+        s.recordRejectedOther = pcStatRecordRejectedOther.load();
+        s.evictTrieNodes = pcStatEvictTrieNodes.load();
+        s.evictCpuTierCalls = pcStatEvictCpuTierCalls.load();
+        s.evictCpuTierBytes = pcStatEvictCpuTierBytes.load();
+        // 层占用快照: CPU/disk 用既有全局计数; mem-trie 遍历 manager 求和
+        s.cpuTierResidentBytes = pagedPrefixCacheCpuTierBytes.load();
+        s.diskResidentBytes = pagedPrefixCacheDiskLiveBytes.load();
+        uint64_t trieBytes = 0;
+        {
+            std::lock_guard<std::mutex> guard(layerPagedCacheManagersMutex);
+            for (auto &it : layerPagedCacheManagers) {
+                PagedCacheManager *manager = it.second;
+                if (manager == nullptr || manager->maxPages <= 0) {
+                    continue;
+                }
+                const uint64_t totalBytes = (uint64_t)manager->GetBytes();
+                if (totalBytes == 0) {
+                    continue;
+                }
+                const uint64_t pageBytes = totalBytes / (uint64_t)manager->maxPages;
+                std::lock_guard<std::mutex> pageGuard(manager->pageIndexLocker);
+                trieBytes += pageBytes * (uint64_t)manager->triePagesSet.size();
+            }
+        }
+        s.memTrieResidentBytes = trieBytes;
+        return s;
+    }
+
     double GetPagedPrefixCacheDiskReadMegabytesPerSecond() {
         return pagedPrefixCacheDiskReadMiBPerSecond.load();
     }
@@ -8026,6 +8223,7 @@ namespace fastllm {
             }
         }
         ReleasePagedPrefixCacheDiskReference(node->tierDisk);
+        PrefixCacheStatsObserveEviction("trie-node", 1);
         delete node;
     }
 
@@ -8198,6 +8396,7 @@ namespace fastllm {
     bool PagedCacheManager::PageOutTrieNode(
             CacheTrieNode *node) {
         if (node == nullptr || node->pageId < 0) {
+            PrefixCacheStatsObserveRecord(false, "invalid-node");
             return false;
         }
         if (node->tierPayload != nullptr ||
@@ -8206,6 +8405,7 @@ namespace fastllm {
         }
         if (!PagedPrefixCacheCpuTierEnabled() ||
             this->maxPages <= 0) {
+            PrefixCacheStatsObserveRecord(false, "tier-disabled");
             return false;
         }
         const size_t prefixTokens =
@@ -8219,11 +8419,13 @@ namespace fastllm {
             "FASTLLM_PREFIX_CACHE_MIN_TOKENS", 65536);
         if (node->accessCount < minHits &&
             prefixTokens < minTokens) {
+            PrefixCacheStatsObserveRecord(false, "min-hits-tokens");
             return false;
         }
         const size_t managerBytes = this->GetBytes();
         if (managerBytes == 0 ||
             managerBytes % (size_t)this->maxPages != 0) {
+            PrefixCacheStatsObserveRecord(false, "manager-state");
             return false;
         }
         const size_t pageBytes =
@@ -8237,6 +8439,7 @@ namespace fastllm {
         try {
             storedBytes.resize(pageBytes);
         } catch (...) {
+            PrefixCacheStatsObserveRecord(false, "no-space");
             return false;
         }
         const size_t offset =
@@ -8333,6 +8536,7 @@ namespace fastllm {
                 zstdCompressed,
                 checksum,
                 node->tierDisk)) {
+            PrefixCacheStatsObserveRecord(true, nullptr);
             return true;
         }
 
@@ -8347,6 +8551,7 @@ namespace fastllm {
                 HostCacheBudget::Global().TryReserve(
                     payloadBytes, HostCacheClass::PREFIX_KV);
             if (!reservation) {
+                PrefixCacheStatsObserveRecord(false, "capacity");
                 return false;
             }
             try {
@@ -8377,14 +8582,17 @@ namespace fastllm {
                         std::move(budgetReservation);
                     payload->accounted = true;
                     node->tierPayload = std::move(payload);
+                    PrefixCacheStatsObserveRecord(true, nullptr);
                     return true;
                 } catch (...) {
                     pagedPrefixCacheCpuTierBytes.fetch_sub(
                         payloadBytes);
+                    PrefixCacheStatsObserveRecord(false, "no-space");
                     return false;
                 }
             }
         }
+        PrefixCacheStatsObserveRecord(false, "capacity");
         return false;
     }
 
@@ -8436,6 +8644,7 @@ namespace fastllm {
                 break;
             }
         }
+        PrefixCacheStatsObserveEviction("cpu-tier-call", freed);
         return freed;
     }
 

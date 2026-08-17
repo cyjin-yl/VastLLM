@@ -3649,6 +3649,8 @@ namespace fastllm {
                                                ii.handle, cachedLen, totalTok,
                                                totalTok > 0 ? 100.0 * cachedLen / totalTok : 0.0);
                                         fflush(stdout);
+                                        PrefixCacheStatsObserveRequest(
+                                            totalTok, cachedLen, "mem-trie", nullptr);
                                         // A prefix hit is useful only when its
                                         // complete model state can be restored.
                                         // Drop any model-specific partial state

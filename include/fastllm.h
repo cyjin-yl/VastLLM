@@ -909,6 +909,50 @@ namespace fastllm {
     size_t GetPagedCacheCpuSnapshotStoredBytes(
         const PagedCacheCpuSnapshot &snapshot);
 
+    // ---- 前缀缓存可观测性(FASTLLM_PREFIX_CACHE_STATS=1 启用, 默认关)----
+    // 纯测量, 不改变任何缓存行为。请求级打印每请求命中/未命中;
+    // 每 64 次请求事件节流打印一层占用/逐出/记录被拒汇总;
+    // 累计计数器经 GetPrefixCacheStatsSnapshot() 暴露给 /props。
+    struct PrefixCacheStats {
+        // 请求级
+        uint64_t requests = 0;            // 做了前缀缓存查询的请求数
+        uint64_t hitRequests = 0;         // 有任何命中的请求数
+        uint64_t queryTokens = 0;         // 参与查询的 token 总数
+        uint64_t hitTokens = 0;           // 命中 token 总数
+        uint64_t hitTokensMemTrie = 0;    // 命中来源分层
+        uint64_t hitTokensCpuTier = 0;
+        uint64_t hitTokensDisk = 0;
+        // 未命中原因分布(请求数)
+        uint64_t missNoRecord = 0;        // trie 中无该前缀(未记录过)
+        uint64_t missEvicted = 0;         // 记录过但页/载荷已被逐出
+        uint64_t missBelowThreshold = 0;  // MIN_TOKENS/MIN_HITS 门槛不满足
+        uint64_t missGenerationMismatch = 0;  // generation/布局不匹配
+        uint64_t missRestoreFailed = 0;   // 有命中但恢复(paged/extra)失败
+        uint64_t missOther = 0;
+        // 记录被拒原因分布(PageOutTrieNode / Record 路径)
+        uint64_t recordAccepted = 0;
+        uint64_t recordRejectedMinHitsTokens = 0;  // accessCount<minHits && tokens<minTokens
+        uint64_t recordRejectedCapacity = 0;       // 层容量不足
+        uint64_t recordRejectedNoSpace = 0;        // 分配/空闲空间失败
+        uint64_t recordRejectedOther = 0;
+        // 逐出
+        uint64_t evictTrieNodes = 0;      // EvictTrieSubtree 逐出的节点数
+        uint64_t evictCpuTierCalls = 0;   // EvictCpuTierPayloads 调用次数
+        uint64_t evictCpuTierBytes = 0;   // CPU 层逐出释放字节
+        // 层占用快照(调用 Get 时采样, 非累计)
+        uint64_t memTrieResidentBytes = 0;
+        uint64_t cpuTierResidentBytes = 0;
+        uint64_t diskResidentBytes = 0;
+    };
+    bool PrefixCacheStatsEnabled();
+    void PrefixCacheStatsObserveRequest(
+        int totalTokens, int hitTokens,
+        const char *hitLayer,       // "mem-trie" | "cpu" | "disk" | nullptr(未命中)
+        const char *missReason);    // "no-record" | "evicted" | "below-threshold" | "generation" | "restore-failed" | "other" | nullptr(有命中)
+    void PrefixCacheStatsObserveRecord(bool accepted, const char *rejectReason);
+    void PrefixCacheStatsObserveEviction(const char *kind, uint64_t nodesOrBytes);
+    PrefixCacheStats GetPrefixCacheStatsSnapshot();
+
     // Atomically writes the currently stored raw or zstd stream, records a
     // checksum, and releases its resident vector. The shared disk descriptor
     // unlinks the transient file after the last snapshot owner is destroyed.
