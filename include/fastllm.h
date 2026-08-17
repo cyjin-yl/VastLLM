@@ -953,6 +953,28 @@ namespace fastllm {
     void PrefixCacheStatsObserveEviction(const char *kind, uint64_t nodesOrBytes);
     PrefixCacheStats GetPrefixCacheStatsSnapshot();
 
+    // ---- 工具调用语法约束(ROOT CAUSE #3, 完整状态机) ----
+    // 总开关: FASTLLM_TOOLCALL_GRAMMAR (默认开, =0 关 -> 退回打点式约束)
+    bool ToolCallGrammarEnabled();
+    // 逐步 trace: FASTLLM_TOOLCALL_TRACE=1 (打印状态/allowedIds 规模)
+    bool ToolCallTraceEnabled();
+    // 破损块 dump 目录: FASTLLM_TOOLCALL_TRACE_DIR (默认 EzraVastLLM/logs)
+    struct ToolCallGrammarStats {
+        // 解析器侧: 完整块 ParseBlock 尝试 / 失败(裸文本回退) / Flush 修复成功
+        uint64_t blocksTotal = 0;
+        uint64_t malformedTotal = 0;
+        uint64_t repairedTotal = 0;
+        // 引擎侧: 约束激活步数 / 被 mask 掉的候选 token 总数
+        uint64_t constraintSteps = 0;
+        uint64_t maskedTokens = 0;
+    };
+    // 解析器回调: parsedOk=false 计入 malformed; repaired=true 计入 repaired
+    void ToolCallGrammarStatsObserveParse(bool parsedOk, bool repaired);
+    void ToolCallGrammarStatsObserveConstraint(size_t allowedCount, size_t vocabSize);
+    ToolCallGrammarStats GetToolCallGrammarStatsSnapshot();
+    // 破损/修复时 dump 原始块到 trace 目录(jsonl, 追加); reason: "malformed"/"repaired"
+    void ToolCallTraceDumpBlock(const char *reason, const std::string &block);
+
     // Atomically writes the currently stored raw or zstd stream, records a
     // checksum, and releases its resident vector. The shared disk descriptor
     // unlinks the transient file after the last snapshot owner is destroyed.

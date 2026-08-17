@@ -649,6 +649,134 @@ namespace fastllm {
         }
     }
 
+
+        // ---- ROOT CAUSE #3: <tool_call> 区间完整状态机语法约束 ----
+        // 打点式约束只在函数名/参数名/必填起点三个点位 mask, 值结束/标签闭合/
+        // 块边界全是盲区, 长上下文量化塌缩会在盲区跑偏。状态机逐位置判定,
+        // 配合 "allowedIds 为空 -> 采样层不 mask" 的既有兜底, 绝无卡死路径。
+        enum ToolCallGrammarState {
+            TG_NONE = 0,             // 不在 <tool_call> 块内 / 块已完成
+            TG_FUNC_OPEN,            // S0: 期待 "<function="
+            TG_FUNC_NAME,            // S1: 函数名生成中
+            TG_PARAM_GAP,            // S2: 参数块之间
+            TG_PARAM_NAME,           // S3: 参数名生成中
+            TG_PARAM_VALUE,          // S4: 参数值生成中
+            TG_FUNC_CLOSE_TAIL,      // S5: "</function>" 之后
+        };
+
+        struct ToolCallGrammarCursor {
+            ToolCallGrammarState state = TG_NONE;
+            std::string functionName;
+            // 当前分段起点: S0=<tool_call> 之后, S2=间隙起点,
+            // S4=值起点, S5=</function> 之后
+            size_t segmentStart = std::string::npos;
+        };
+
+        static const char *ToolCallGrammarStateName(ToolCallGrammarState s) {
+            switch (s) {
+                case TG_FUNC_OPEN: return "S0-func-open";
+                case TG_FUNC_NAME: return "S1-func-name";
+                case TG_PARAM_GAP: return "S2-param-gap";
+                case TG_PARAM_NAME: return "S3-param-name";
+                case TG_PARAM_VALUE: return "S4-param-value";
+                case TG_FUNC_CLOSE_TAIL: return "S5-close-tail";
+                default: return "none";
+            }
+        }
+
+        // tail 结尾与 target 前缀的最长重合长度
+        // ("...abc<par" vs "<parameter=" -> 4)
+        static size_t ToolCallTailPrefixOverlap(const std::string &tail,
+                                                const std::string &target) {
+            const size_t maxLen = std::min(tail.size(), target.size());
+            for (size_t len = maxLen; len > 0; --len) {
+                if (tail.compare(tail.size() - len, len, target, 0, len) == 0) {
+                    return len;
+                }
+            }
+            return 0;
+        }
+
+        static ToolCallGrammarCursor LocateToolCallGrammarCursor(
+                const std::string &text,
+                const GenerationConfig &config) {
+            ToolCallGrammarCursor cur;
+            const size_t open = text.rfind("<tool_call>");
+            if (open == std::string::npos) {
+                return cur;
+            }
+            const size_t done = text.rfind("</tool_call>");
+            if (done != std::string::npos && done > open) {
+                return cur;
+            }
+            const std::string toolCallOpen = "<tool_call>";
+            std::string::size_type invokePos;
+            const std::string *invokePrefix = nullptr;
+            if (!FindLastPrefix(text, config.tool_call_invoke_name_prefixes,
+                                invokePos, &invokePrefix) ||
+                invokePos < open) {
+                cur.state = TG_FUNC_OPEN;
+                cur.segmentStart = open + toolCallOpen.size();
+                return cur;
+            }
+            const std::string terminator =
+                    config.tool_call_name_terminator.empty()
+                    ? ">" : config.tool_call_name_terminator;
+            const size_t nameStart = invokePos + invokePrefix->size();
+            const size_t nameTerm = text.find(terminator, nameStart);
+            if (nameTerm == std::string::npos) {
+                cur.state = TG_FUNC_NAME;
+                cur.segmentStart = nameStart;
+                return cur;
+            }
+            cur.functionName = text.substr(nameStart, nameTerm - nameStart);
+            const std::string funcClose = "</function>";
+            const std::string paramClose = "</parameter>";
+            size_t pos = nameTerm + terminator.size();
+            while (true) {
+                const size_t fc = text.find(funcClose, pos);
+                size_t pp = std::string::npos;
+                size_t ppLen = 0;
+                for (const auto &prefix : config.tool_call_parameter_name_prefixes) {
+                    if (prefix.empty()) {
+                        continue;
+                    }
+                    const size_t q = text.find(prefix, pos);
+                    if (q != std::string::npos &&
+                        (pp == std::string::npos || q < pp)) {
+                        pp = q;
+                        ppLen = prefix.size();
+                    }
+                }
+                if (fc != std::string::npos &&
+                    (pp == std::string::npos || fc < pp)) {
+                    cur.state = TG_FUNC_CLOSE_TAIL;
+                    cur.segmentStart = fc + funcClose.size();
+                    return cur;
+                }
+                if (pp == std::string::npos) {
+                    cur.state = TG_PARAM_GAP;
+                    cur.segmentStart = pos;
+                    return cur;
+                }
+                const size_t pNameStart = pp + ppLen;
+                const size_t pTerm = text.find(terminator, pNameStart);
+                if (pTerm == std::string::npos) {
+                    cur.state = TG_PARAM_NAME;
+                    cur.segmentStart = pNameStart;
+                    return cur;
+                }
+                const size_t valClose =
+                        text.find(paramClose, pTerm + terminator.size());
+                if (valClose == std::string::npos) {
+                    cur.state = TG_PARAM_VALUE;
+                    cur.segmentStart = pTerm + terminator.size();
+                    return cur;
+                }
+                pos = valClose + paramClose.size();
+            }
+        }
+
     void basellm::EvaluateToolCallConstraintText(const std::string &generatedText,
                                                  const GenerationConfig &generationConfig,
                                                  std::vector<int> &allowedIdsOut) {
@@ -663,7 +791,122 @@ namespace fastllm {
         std::string activeTerminator =
                 generationConfig.tool_call_name_terminator.empty()
                 ? "\"" : generationConfig.tool_call_name_terminator;
-        if (!FindActiveToolCallParameterNamePartial(
+        if (ToolCallGrammarEnabled()) {
+            // ---- 完整状态机路径(默认) ----
+            const ToolCallGrammarCursor cursor =
+                    LocateToolCallGrammarCursor(generatedText, generationConfig);
+            bool handled = false;
+            switch (cursor.state) {
+                case TG_NONE:
+                    return;
+                case TG_FUNC_OPEN: {
+                    // S0: 只允许延伸成 invoke 前缀("<function=" 含拼写容错变体)
+                    const std::string tail =
+                            generatedText.substr(cursor.segmentStart);
+                    size_t best = 0;
+                    for (const auto &prefix :
+                         generationConfig.tool_call_invoke_name_prefixes) {
+                        best = std::max(best,
+                                ToolCallTailPrefixOverlap(tail, prefix));
+                    }
+                    partial = tail.substr(tail.size() - best);
+                    allowedValues =
+                            generationConfig.tool_call_invoke_name_prefixes;
+                    activeTerminator = "\x01";
+                    handled = !allowedValues.empty();
+                    break;
+                }
+                case TG_FUNC_NAME:
+                    if (FindActiveToolCallNamePartial(
+                                generatedText, generationConfig, partial)) {
+                        allowedValues =
+                                generationConfig.tool_call_allowed_names;
+                        handled = true;
+                    }
+                    break;
+                case TG_PARAM_GAP: {
+                    // S2: 缺必填 -> 只允许 "<parameter="(required-first);
+                    //     必填齐 -> "<parameter=" 或 "</function>"
+                    if (FindForcedToolCallParameterBlockStart(
+                                generatedText, generationConfig, partial,
+                                allowedValues)) {
+                        activeTerminator = "\x01";
+                        handled = true;
+                        break;
+                    }
+                    const std::string tail =
+                            generatedText.substr(cursor.segmentStart);
+                    const std::string &paramPrefix =
+                            generationConfig.tool_call_parameter_name_prefixes
+                                    .empty()
+                            ? std::string("<parameter=")
+                            : generationConfig
+                                      .tool_call_parameter_name_prefixes.front();
+                    const size_t m1 =
+                            ToolCallTailPrefixOverlap(tail, paramPrefix);
+                    const size_t m2 =
+                            ToolCallTailPrefixOverlap(tail, "</function>");
+                    partial = tail.substr(tail.size() - std::max(m1, m2));
+                    allowedValues = {paramPrefix, "</function>"};
+                    activeTerminator = "\x01";
+                    handled = true;
+                    break;
+                }
+                case TG_PARAM_NAME:
+                    // S3: required-first 由 FindActiveToolCallParameterNamePartial
+                    // 内部处理(缺失必填名优先); terminator 保持 name_terminator(">")
+                    // 使含 ">" 的名字闭合 token 走精确匹配放行
+                    if (FindActiveToolCallParameterNamePartial(
+                                generatedText, generationConfig, partial,
+                                allowedValues)) {
+                        handled = true;
+                    }
+                    break;
+                case TG_PARAM_VALUE: {
+                    // S4: 值自由; 仅当尾部正在形成闭合标签前缀时
+                    // 收紧到 "</parameter>"(屏蔽 "</function>"/"</tool_call>")
+                    const std::string tail =
+                            generatedText.substr(cursor.segmentStart);
+                    const size_t lt = tail.rfind('<');
+                    if (lt != std::string::npos) {
+                        const std::string cand = tail.substr(lt);
+                        const std::string target = "</parameter>";
+                        if (cand.size() < target.size() &&
+                            target.compare(0, cand.size(), cand) == 0) {
+                            partial = cand;
+                            allowedValues = {target};
+                            activeTerminator = "\x01";
+                            handled = true;
+                        }
+                    }
+                    break;
+                }
+                case TG_FUNC_CLOSE_TAIL: {
+                    // S5: "</function>" 之后只允许 "</tool_call>"
+                    const std::string tail =
+                            generatedText.substr(cursor.segmentStart);
+                    const size_t m =
+                            ToolCallTailPrefixOverlap(tail, "</tool_call>");
+                    partial = tail.substr(tail.size() - m);
+                    allowedValues = {"</tool_call>"};
+                    activeTerminator = "\x01";
+                    handled = true;
+                    break;
+                }
+            }
+            if (ToolCallTraceEnabled()) {
+                printf("[ToolCallTrace] state=%s seg=%zu partial=%zuB "
+                       "handled=%d allowed=%zu\n",
+                       ToolCallGrammarStateName(cursor.state),
+                       cursor.segmentStart == std::string::npos
+                               ? (size_t)-1 : cursor.segmentStart,
+                       partial.size(), (int)handled, allowedValues.size());
+                fflush(stdout);
+            }
+            if (!handled || allowedValues.empty()) {
+                return;
+            }
+        } else if (!FindActiveToolCallParameterNamePartial(
                     generatedText,
                     generationConfig,
                     partial,
@@ -702,6 +945,17 @@ namespace fastllm {
         }
         std::sort(allowedIds.begin(), allowedIds.end());
         allowedIds.erase(std::unique(allowedIds.begin(), allowedIds.end()), allowedIds.end());
+        if (!allowedIds.empty()) {
+            ToolCallGrammarStatsObserveConstraint(
+                    allowedIds.size(),
+                    this->weight.tokenizer.tokenToStringDict.size());
+            if (ToolCallTraceEnabled()) {
+                printf("[ToolCallTrace] mask: allowed=%zu/%zu\n",
+                       allowedIds.size(),
+                       this->weight.tokenizer.tokenToStringDict.size());
+                fflush(stdout);
+            }
+        }
         allowedIdsOut = std::move(allowedIds);
     }
 

@@ -1322,6 +1322,24 @@ struct WorkQueue {
                     (double)prefixStats.cpuTierResidentBytes},
                 {"prefix_cache_stats_resident_disk_bytes",
                     (double)prefixStats.diskResidentBytes},
+                // ---- 工具调用语法约束统计(ROOT CAUSE #3) ----
+                {"toolcall_grammar_enabled",
+                    fastllm::ToolCallGrammarEnabled()},
+                {"toolcall_blocks_total",
+                    (double)fastllm::GetToolCallGrammarStatsSnapshot()
+                            .blocksTotal},
+                {"toolcall_malformed_total",
+                    (double)fastllm::GetToolCallGrammarStatsSnapshot()
+                            .malformedTotal},
+                {"toolcall_repaired_total",
+                    (double)fastllm::GetToolCallGrammarStatsSnapshot()
+                            .repairedTotal},
+                {"toolcall_constraint_steps",
+                    (double)fastllm::GetToolCallGrammarStatsSnapshot()
+                            .constraintSteps},
+                {"toolcall_constraint_masked_tokens",
+                    (double)fastllm::GetToolCallGrammarStatsSnapshot()
+                            .maskedTokens},
                 {"backend", "fastllm"}
             });
             return;

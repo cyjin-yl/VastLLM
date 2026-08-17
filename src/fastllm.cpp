@@ -22,6 +22,7 @@
 #include <fstream>
 #include <atomic>
 #include <chrono>
+#include <ctime>
 #include <filesystem>
 #include <limits>
 #include <new>
@@ -7296,6 +7297,105 @@ namespace fastllm {
         }
         s.memTrieResidentBytes = trieBytes;
         return s;
+    }
+
+    // ---- 工具调用语法约束统计/跟踪(ROOT CAUSE #3) ----
+    namespace {
+        std::atomic<uint64_t> tgBlocksTotal{0};
+        std::atomic<uint64_t> tgMalformedTotal{0};
+        std::atomic<uint64_t> tgRepairedTotal{0};
+        std::atomic<uint64_t> tgConstraintSteps{0};
+        std::atomic<uint64_t> tgMaskedTokens{0};
+        std::mutex tgTraceDumpMutex;
+    }
+
+    bool ToolCallGrammarEnabled() {
+        static const bool enabled = []() {
+            const char *env = std::getenv("FASTLLM_TOOLCALL_GRAMMAR");
+            // 默认开; =0 关闭退回打点式约束
+            return env == nullptr || env[0] == '\0' || strcmp(env, "0") != 0;
+        }();
+        return enabled;
+    }
+
+    bool ToolCallTraceEnabled() {
+        static const bool enabled = []() {
+            const char *env = std::getenv("FASTLLM_TOOLCALL_TRACE");
+            return env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0;
+        }();
+        return enabled;
+    }
+
+    void ToolCallGrammarStatsObserveParse(bool parsedOk, bool repaired) {
+        tgBlocksTotal++;
+        if (!parsedOk) {
+            tgMalformedTotal++;
+        } else if (repaired) {
+            tgRepairedTotal++;
+        }
+    }
+
+    void ToolCallGrammarStatsObserveConstraint(size_t allowedCount, size_t vocabSize) {
+        tgConstraintSteps++;
+        if (vocabSize > allowedCount) {
+            tgMaskedTokens += (uint64_t)(vocabSize - allowedCount);
+        }
+    }
+
+    ToolCallGrammarStats GetToolCallGrammarStatsSnapshot() {
+        ToolCallGrammarStats s;
+        s.blocksTotal = tgBlocksTotal.load();
+        s.malformedTotal = tgMalformedTotal.load();
+        s.repairedTotal = tgRepairedTotal.load();
+        s.constraintSteps = tgConstraintSteps.load();
+        s.maskedTokens = tgMaskedTokens.load();
+        return s;
+    }
+
+    void ToolCallTraceDumpBlock(const char *reason, const std::string &block) {
+        if (!ToolCallTraceEnabled()) {
+            return;
+        }
+        static const std::string dir = []() {
+            const char *env = std::getenv("FASTLLM_TOOLCALL_TRACE_DIR");
+            if (env != nullptr && env[0] != '\0') {
+                return std::string(env);
+            }
+            return std::string(
+                "/run/media/ezra/13D010B6FDBC1A06/projects/EzraVastLLM/logs");
+        }();
+        std::lock_guard<std::mutex> lock(tgTraceDumpMutex);
+        // 失败静默: trace 绝不影响推理
+        std::string path = dir + "/toolcall-trace-" +
+            std::to_string((long long)::getpid()) + ".jsonl";
+        FILE *fp = fopen(path.c_str(), "a");
+        if (fp == nullptr) {
+            return;
+        }
+        // 手工 JSON 转义(块内容任意字节)
+        std::string escaped;
+        escaped.reserve(block.size() + 16);
+        for (char c : block) {
+            switch (c) {
+                case '\"': escaped += "\\\""; break;
+                case '\\': escaped += "\\\\"; break;
+                case '\n': escaped += "\\n"; break;
+                case '\r': escaped += "\\r"; break;
+                case '\t': escaped += "\\t"; break;
+                default:
+                    if ((unsigned char)c < 0x20) {
+                        char buf[8];
+                        snprintf(buf, sizeof(buf), "\\u%04x", c);
+                        escaped += buf;
+                    } else {
+                        escaped += c;
+                    }
+            }
+        }
+        fprintf(fp, "{\"ts\":%lld,\"reason\":\"%s\",\"block\":\"%s\"}\n",
+                (long long)time(nullptr), reason != nullptr ? reason : "?",
+                escaped.c_str());
+        fclose(fp);
     }
 
     double GetPagedPrefixCacheDiskReadMegabytesPerSecond() {

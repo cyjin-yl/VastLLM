@@ -6,6 +6,7 @@
 #include <map>
 
 #include "json11.hpp"
+#include "fastllm.h"
 #include <vector>
 
 inline std::string ResolveOpenAIFinishReason(bool hasToolCalls,
@@ -179,8 +180,15 @@ public:
             const std::string block = toolBuffer.substr(0, blockEnd);
             OpenAIParsedToolCall parsed;
             if (ParseBlock(block, parsed)) {
+                fastllm::ToolCallGrammarStatsObserveParse(true, false);
                 delta.toolCalls.push_back(std::move(parsed));
             } else {
+                // 完整闭合块解析失败 = 结构破损(不能静默: 计数 + dump)
+                fastllm::ToolCallGrammarStatsObserveParse(false, false);
+                fastllm::ToolCallTraceDumpBlock("malformed", block);
+                printf("[ToolCall] MALFORMED block dropped to raw text (%zuB)\n",
+                       block.size());
+                fflush(stdout);
                 delta.content += block;
             }
             pending = toolBuffer.substr(blockEnd);
@@ -199,8 +207,19 @@ public:
             const std::string block = toolBuffer + pending;
             OpenAIParsedToolCall parsed;
             if (ParseBlock(block, parsed)) {
+                // Flush 修复成功: 缺 "</tool_call>" 闭合但块内结构完整
+                fastllm::ToolCallGrammarStatsObserveParse(true, true);
+                fastllm::ToolCallTraceDumpBlock("repaired", block);
+                printf("[ToolCall] REPAIRED unterminated block (%zuB)\n",
+                       block.size());
+                fflush(stdout);
                 delta.toolCalls.push_back(std::move(parsed));
             } else {
+                fastllm::ToolCallGrammarStatsObserveParse(false, true);
+                fastllm::ToolCallTraceDumpBlock("malformed-flush", block);
+                printf("[ToolCall] MALFORMED unterminated block (%zuB)\n",
+                       block.size());
+                fflush(stdout);
                 delta.content = block;
             }
         } else {
