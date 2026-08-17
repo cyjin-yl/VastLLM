@@ -1332,9 +1332,12 @@ namespace fastllm {
 
     static bool Qwen35MtpSupportsGenerationConfig(
             const GenerationConfig &config) {
+        // mask(工具调用约束)仍禁用 MTP: verify 采样的 mask 需要 GPU kernel 支持,
+        // 工具调用窗口很短, 走非投机路径更简单可靠。
+        // repeat_penalty 已支持: verify 前向携带 LastTokensManager,
+        // typical/greedy 采样 kernel 会对 verify 分布应用惩罚。
         if (config.output_logits ||
-            !config.tool_call_allowed_token_ids.empty() ||
-            Qwen35NeedRepeatPenalty(config)) {
+            !config.tool_call_allowed_token_ids.empty()) {
             return false;
         }
         if (config.IsSimpleGreedy()) {
@@ -6618,7 +6621,8 @@ namespace fastllm {
                 const std::vector<int> *typicalCandidateIds = nullptr,
                 const std::vector<int> *typicalCandidateRows = nullptr,
                 std::vector<unsigned char> *typicalAccepted = nullptr,
-                std::vector<int> *typicalRecoveredIds = nullptr) {
+                std::vector<int> *typicalRecoveredIds = nullptr,
+                const std::vector<std::vector<std::pair<int, float> > > *rowPenalties = nullptr) {
             FastllmCudaSetDevice(rootDevice);
             std::vector<int> lastRet;
             lastRet.reserve(batch);
@@ -6792,6 +6796,31 @@ namespace fastllm {
                 }
                 lastRet.resize(batch);
                 int vocabSize = fullLogits.dims.back();
+                // per-row repeat_penalty(投机 verify 的每行都属于某个 request,
+                // 惩罚集由调用侧按行展开传入)。就地作用于 logits, 保证
+                // typical acceptance 的 posterior 是惩罚后的分布。
+                std::vector<int> flatPenaltyIds;
+                std::vector<float> flatPenaltyFactors;
+                int maxRowPenaltyTokens = 0;
+                if (rowPenalties != nullptr &&
+                    (int)rowPenalties->size() >= batch) {
+                    for (int b = 0; b < batch; b++) {
+                        maxRowPenaltyTokens = std::max(
+                            maxRowPenaltyTokens, (int)(*rowPenalties)[b].size());
+                    }
+                    if (maxRowPenaltyTokens > 0) {
+                        flatPenaltyIds.resize((size_t)batch * maxRowPenaltyTokens, -1);
+                        flatPenaltyFactors.resize((size_t)batch * maxRowPenaltyTokens, 1.0f);
+                        for (int b = 0; b < batch; b++) {
+                            const auto &rp = (*rowPenalties)[b];
+                            for (int i = 0; i < (int)rp.size(); i++) {
+                                size_t off = (size_t)b * maxRowPenaltyTokens + i;
+                                flatPenaltyIds[off] = rp[i].first;
+                                flatPenaltyFactors[off] = rp[i].second;
+                            }
+                        }
+                    }
+                }
                 int typicalCount = typicalCandidateIds == nullptr ? 0 :
                     std::min(batch, (int)typicalCandidateIds->size());
                 if (typicalCandidateRows != nullptr) {
@@ -6817,7 +6846,10 @@ namespace fastllm {
                         typicalRecoveredIds->data() : nullptr,
                     typicalCount,
                     QWEN35_MTP_TYPICAL_POSTERIOR_THRESHOLD,
-                    QWEN35_MTP_TYPICAL_POSTERIOR_ALPHA);
+                    QWEN35_MTP_TYPICAL_POSTERIOR_ALPHA,
+                    flatPenaltyIds.empty() ? nullptr : flatPenaltyIds.data(),
+                    flatPenaltyIds.empty() ? nullptr : flatPenaltyFactors.data(),
+                    maxRowPenaltyTokens);
                 AssertInFastLLM(sampled,
                                 "Qwen3.5 CUDA top-k/top-p sampling failed.\n");
                 return lastRet;
@@ -15046,9 +15078,31 @@ namespace fastllm {
                             "Qwen3.5 speculative logits row mapping mismatch.\n");
             std::vector<GenerationConfig> rowConfigs;
             rowConfigs.reserve(logitRows);
-            for (int b = 0; b < batch; b++) {
-                for (int token = 0; token < seqLens[b]; token++) {
-                    rowConfigs.push_back(generationConfigs[b]);
+            std::vector<std::vector<std::pair<int, float> > > rowPenalties(logitRows);
+            {
+                int rowCursor = 0;
+                for (int b = 0; b < batch; b++) {
+                    // 每行都属于 request b; penalty 集合取该 request 的已生成历史
+                    std::vector<std::pair<int, float> > unitPenalty;
+                    if (Qwen35NeedRepeatPenalty(generationConfigs[b]) &&
+                        b < (int)lastTokens.units.size()) {
+                        std::map<int, int> penaltyCounts;
+                        for (int token : lastTokens.units[b].tokenSet) {
+                            penaltyCounts[token]++;
+                        }
+                        unitPenalty.reserve(penaltyCounts.size());
+                        for (auto &entry : penaltyCounts) {
+                            int repeats = generationConfigs[b].last_n <= 0 ? 1 : entry.second;
+                            unitPenalty.push_back(
+                                {entry.first, (float)std::pow(
+                                    generationConfigs[b].repeat_penalty, repeats)});
+                        }
+                    }
+                    for (int token = 0; token < seqLens[b]; token++) {
+                        rowConfigs.push_back(generationConfigs[b]);
+                        rowPenalties[rowCursor] = unitPenalty;
+                        rowCursor++;
+                    }
                 }
             }
             auto getCacheLenForMtpReset = [](const Data *cache) {
@@ -15228,11 +15282,12 @@ namespace fastllm {
             }
             std::vector<int> sampled = Qwen35SampleFromRootCudaLogits(
                 devices[0], *sampleLogits, logitRows, maxTopK, allSimple,
-                rowConfigs, nullptr,
+                rowConfigs, &lastTokens,
                 typicalCandidateIds.empty() ? nullptr : &typicalCandidateIds,
                 typicalCandidateIds.empty() ? nullptr : &typicalCandidateRows,
                 typicalCandidateIds.empty() ? nullptr : &typicalAccepted,
-                typicalCandidateIds.empty() ? nullptr : &typicalRecoveredIds);
+                typicalCandidateIds.empty() ? nullptr : &typicalRecoveredIds,
+                rowPenalties.empty() ? nullptr : &rowPenalties);
             if (!typicalCandidateIds.empty()) {
                 AssertInFastLLM(
                     typicalCandidateRows.size() == typicalCandidateIds.size() &&
@@ -16301,6 +16356,14 @@ namespace fastllm {
             }
         };
 
+        // repeat_penalty 支持: verify 前向必须携带真实的已生成历史,
+        // 让 GPU 采样 kernel 的 repeat-penalty 作用在 verify 分布上
+        // (否则 draft 提议无惩罚分布而 verify 无惩罚 -> 输出分布偏差)。
+        LastTokensManager mtpLastTokens;
+        if (Qwen35NeedRepeatPenalty(generationConfigs[0]) &&
+            context != nullptr) {
+            mtpLastTokens.units.push_back(context->tokens);
+        }
         auto runTargetWithPast = [&](const Data &curInputIds,
                                      const std::vector<Data*> &curAttentionMask,
                                      const std::vector<Data*> &curPositionIds,
@@ -16317,7 +16380,7 @@ namespace fastllm {
                 ret = ForwardGPU(1, curInputIds, curAttentionMask,
                                  curPositionIds, curSeqLens,
                                  curPastKeyValues, generationConfigs,
-                                 LastTokensManager(), nullptr);
+                                 mtpLastTokens, nullptr);
             } catch (...) {
                 speculativeCollectAllLogits = oldSpeculativeCollectAllLogits;
                 throw;
@@ -16344,7 +16407,7 @@ namespace fastllm {
                 ret = ForwardGPU(1, curInputIds, curAttentionMask,
                                  curPositionIds, curSeqLens,
                                  pastKeyValues, generationConfigs,
-                                 LastTokensManager(), nullptr);
+                                 mtpLastTokens, nullptr);
             } catch (...) {
                 speculativeCaptureAllHiddenStates = oldSpeculativeCaptureAllHiddenStates;
                 speculativeCollectAllLogits = oldSpeculativeCollectAllLogits;
@@ -16364,7 +16427,7 @@ namespace fastllm {
             speculativeCacheOnlyForward = true;
             try {
                 ForwardGPU(1, curInputIds, curAttentionMask, curPositionIds, curSeqLens,
-                           pastKeyValues, generationConfigs, LastTokensManager(), nullptr);
+                           pastKeyValues, generationConfigs, mtpLastTokens, nullptr);
             } catch (...) {
                 speculativeCacheOnlyForward = oldSpeculativeCacheOnlyForward;
                 speculativeCollectAllLogits = oldSpeculativeCollectAllLogits;
@@ -16397,13 +16460,44 @@ namespace fastllm {
             bool useTypicalAcceptance =
                 !generationConfigs[0].IsSimpleGreedy() &&
                 (int)speculativeTypicalAccepted.size() >= draftTokenCount;
+            // 约束感知截断: draft 提议跨越约束激活边界时, verify 用的
+            // generationConfigs[0] 仍是旧文本算出的(可能为空)mask,
+            // 典型/贪心准则会接受违反"即将激活"约束的 token。
+            // 这里逐 token 预检: 用临时文本模拟推进约束状态,
+            // 不允许则视该 draft 为拒绝(截断投机块)。
+            const bool constraintTracking =
+                generationConfigs[0].tool_call_name_constraint_enabled ||
+                generationConfigs[0].tool_call_parameter_name_constraint_enabled ||
+                generationConfigs[0].tool_call_required_parameter_constraint_enabled;
+            std::string constraintText;
+            if (constraintTracking) {
+                constraintText = context->toolCallConstraintGeneratedText;
+            }
             int accepted = 0;
             while (accepted < draftTokenCount) {
+                if (constraintTracking) {
+                    int draftToken = tokenAt(accepted + 1);
+                    std::vector<int> allowedIds;
+                    EvaluateToolCallConstraintText(
+                        constraintText, generationConfigs[0], allowedIds);
+                    if (!allowedIds.empty() &&
+                        !std::binary_search(allowedIds.begin(),
+                                            allowedIds.end(), draftToken)) {
+                        break;
+                    }
+                }
                 bool accept = useTypicalAcceptance ?
                     speculativeTypicalAccepted[accepted] != 0 :
                     targetTokens[accepted] == tokenAt(accepted + 1);
                 if (!accept) {
                     break;
+                }
+                if (constraintTracking) {
+                    constraintText += weight.tokenizer.DecodeTokens(
+                        {tokenAt(accepted + 1)});
+                    if (constraintText.size() > 8192) {
+                        constraintText.erase(0, constraintText.size() - 8192);
+                    }
                 }
                 accepted++;
             }
@@ -18373,11 +18467,22 @@ namespace fastllm {
         speculativeHiddenStates.dims.clear();
         speculativeHiddenStates.strides.clear();
         speculativeHiddenStates.expansionDims.clear();
+        // repeat_penalty 支持: batch verify 前向携带各 request 的真实历史,
+        // 让 GPU 采样 kernel 的 repeat-penalty 作用在 verify 分布上。
+        LastTokensManager mtpLastTokens;
+        for (int b = 0; b < batch; b++) {
+            if (Qwen35NeedRepeatPenalty(generationConfigs[b]) &&
+                contexts[b] != nullptr) {
+                mtpLastTokens.units.push_back(contexts[b]->tokens);
+            } else {
+                mtpLastTokens.units.push_back(LastTokensUnit());
+            }
+        }
         std::vector<int> targetRet;
         try {
             targetRet = ForwardGPU(batch, inputIds, attentionMask, positionIds,
                                    seqLens, pastKeyValues, generationConfigs,
-                                   LastTokensManager(), nullptr);
+                                   mtpLastTokens, nullptr);
         } catch (const Qwen35MtpBatchFastPathUnavailable &) {
             speculativeLinearStateCaptureSlots = oldCaptureSlots;
             speculativeCaptureFirstTokenLinearState = oldCaptureLinearState;
@@ -18427,14 +18532,41 @@ namespace fastllm {
             int proposalCount = seqLens[b] - 1;
             bool useTypicalAcceptance =
                 !generationConfigs[b].IsSimpleGreedy();
+            // 约束感知截断(与单请求路径同理): 投机块跨越约束激活边界时,
+            // verify 沿用的旧 mask 可能为空, 必须逐 token 预检即将激活的约束。
+            const bool constraintTracking =
+                contexts[b] != nullptr &&
+                (generationConfigs[b].tool_call_name_constraint_enabled ||
+                 generationConfigs[b].tool_call_parameter_name_constraint_enabled ||
+                 generationConfigs[b].tool_call_required_parameter_constraint_enabled);
+            std::string constraintText;
+            if (constraintTracking) {
+                constraintText = contexts[b]->toolCallConstraintGeneratedText;
+            }
             while (matchedDrafts[b] < proposalCount) {
                 int row = tokenOffsets[b] + matchedDrafts[b];
+                int draftToken = (int)(inputPtr[row + 1] + 1.0e-3f);
+                if (constraintTracking) {
+                    std::vector<int> allowedIds;
+                    EvaluateToolCallConstraintText(
+                        constraintText, generationConfigs[b], allowedIds);
+                    if (!allowedIds.empty() &&
+                        !std::binary_search(allowedIds.begin(),
+                                            allowedIds.end(), draftToken)) {
+                        break;
+                    }
+                }
                 bool accepted = useTypicalAcceptance ?
                     speculativeTypicalAccepted[row] != 0 :
-                    targetRet[row] ==
-                        (int)(inputPtr[row + 1] + 1.0e-3f);
+                    targetRet[row] == draftToken;
                 if (!accepted) {
                     break;
+                }
+                if (constraintTracking) {
+                    constraintText += weight.tokenizer.DecodeTokens({draftToken});
+                    if (constraintText.size() > 8192) {
+                        constraintText.erase(0, constraintText.size() - 8192);
+                    }
                 }
                 matchedDrafts[b]++;
             }

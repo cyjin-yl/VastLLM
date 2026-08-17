@@ -617,6 +617,13 @@ namespace fastllm {
 
         virtual void PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig);
 
+        // 对任意已生成文本评估工具调用约束(不依赖 ResponseContext)——
+        // 投机解码的接受循环用它做"假设性"预检, 在不推进真实状态的前提下
+        // 判断下一个候选 token 是否被当前约束允许。
+        virtual void EvaluateToolCallConstraintText(const std::string &generatedText,
+                                                    const GenerationConfig &generationConfig,
+                                                    std::vector<int> &allowedIdsOut);
+
         virtual void UpdateToolCallConstraintState(ResponseContext *context, int tokenId);
 
         virtual void OnResponseContextCreated(ResponseContext *context) {}

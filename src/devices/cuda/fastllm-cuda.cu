@@ -13728,6 +13728,13 @@ __global__ void FastllmTypicalAcceptanceKernel(
     }
 }
 
+// 前置声明: 定义在本文件后部, FastllmCudaTopKTopPSamplingWithTypicalAcceptance 要用
+template <int BLOCK_THREADS>
+__global__ void FastllmRepeatPenaltyFactorsKernel(
+        float *logits, const int *penaltyIds,
+        const float *penaltyFactors, int penaltyTokens,
+        int vocabSize);
+
 bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                                   float *logits, float *temperatures,
                                   int *topKArr, float *topPArr,
@@ -13739,7 +13746,31 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                                   int *typicalRecoveredIds,
                                   int typicalCount,
                                   float typicalPosteriorThreshold,
-                                  float typicalPosteriorAlpha) {
+                                  float typicalPosteriorAlpha,
+                                  const int *penaltyIds,
+                                  const float *penaltyFactors,
+                                  int penaltyTokens) {
+    // repeat_penalty 直接就地作用在 logits 上(softmax/typical posterior
+    // 因此都基于惩罚后的分布), 与非投机 CPU 路径 LLMSampling 语义一致。
+    if (penaltyTokens > 0 && penaltyIds != nullptr && penaltyFactors != nullptr) {
+        size_t penaltyBytes = (size_t)batch * penaltyTokens * (sizeof(int) + sizeof(float));
+        uint8_t *penaltyBuf = (uint8_t *)FastllmCudaMalloc(penaltyBytes);
+        if (penaltyBuf == nullptr) {
+            printf("FastllmCudaTopKTopPSampling: penalty buffer alloc failed.\n");
+            fflush(stdout);
+            return false;
+        }
+        int *cudaPenaltyIds = (int *)penaltyBuf;
+        float *cudaPenaltyFactors = (float *)(penaltyBuf + (size_t)batch * penaltyTokens * sizeof(int));
+        FastllmCudaCopyFromHostToDevice(cudaPenaltyIds, (void *)penaltyIds,
+                                        (size_t)batch * penaltyTokens * sizeof(int));
+        FastllmCudaCopyFromHostToDevice(cudaPenaltyFactors, (void *)penaltyFactors,
+                                        (size_t)batch * penaltyTokens * sizeof(float));
+        FastllmRepeatPenaltyFactorsKernel<64><<<batch, 64>>>(
+            logits, cudaPenaltyIds, cudaPenaltyFactors, penaltyTokens, vocabSize);
+        DeviceSync();
+        FastllmCudaFree(penaltyBuf);
+    }
     size_t probsBytes = (size_t)batch * vocabSize * sizeof(float);
     int actualTypicalCount = typicalCandidateIds != nullptr &&
                              typicalAccepted != nullptr &&

@@ -570,12 +570,13 @@ namespace fastllm {
         }
     }
 
-    void basellm::PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig) {
-        generationConfig.tool_call_allowed_token_ids.clear();
-        if (context == nullptr ||
-            (!generationConfig.tool_call_name_constraint_enabled &&
-             !generationConfig.tool_call_parameter_name_constraint_enabled &&
-             !generationConfig.tool_call_required_parameter_constraint_enabled)) {
+    void basellm::EvaluateToolCallConstraintText(const std::string &generatedText,
+                                                 const GenerationConfig &generationConfig,
+                                                 std::vector<int> &allowedIdsOut) {
+        allowedIdsOut.clear();
+        if (!generationConfig.tool_call_name_constraint_enabled &&
+            !generationConfig.tool_call_parameter_name_constraint_enabled &&
+            !generationConfig.tool_call_required_parameter_constraint_enabled) {
             return;
         }
         std::string partial;
@@ -584,16 +585,16 @@ namespace fastllm {
                 generationConfig.tool_call_name_terminator.empty()
                 ? "\"" : generationConfig.tool_call_name_terminator;
         if (!FindActiveToolCallParameterNamePartial(
-                    context->toolCallConstraintGeneratedText,
+                    generatedText,
                     generationConfig,
                     partial,
                     allowedValues)) {
             if (!FindActiveToolCallNamePartial(
-                        context->toolCallConstraintGeneratedText,
+                        generatedText,
                         generationConfig,
                         partial)) {
                 if (!FindForcedToolCallParameterBlockStart(
-                            context->toolCallConstraintGeneratedText,
+                            generatedText,
                             generationConfig,
                             partial,
                             allowedValues)) {
@@ -622,7 +623,17 @@ namespace fastllm {
         }
         std::sort(allowedIds.begin(), allowedIds.end());
         allowedIds.erase(std::unique(allowedIds.begin(), allowedIds.end()), allowedIds.end());
-        generationConfig.tool_call_allowed_token_ids = std::move(allowedIds);
+        allowedIdsOut = std::move(allowedIds);
+    }
+
+    void basellm::PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig) {
+        generationConfig.tool_call_allowed_token_ids.clear();
+        if (context == nullptr) {
+            return;
+        }
+        EvaluateToolCallConstraintText(context->toolCallConstraintGeneratedText,
+                                       generationConfig,
+                                       generationConfig.tool_call_allowed_token_ids);
     }
 
     void basellm::UpdateToolCallConstraintState(ResponseContext *context, int tokenId) {

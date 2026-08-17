@@ -1111,7 +1111,10 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                                   int *typicalRecoveredIds,
                                   int typicalCount,
                                   float typicalPosteriorThreshold,
-                                  float typicalPosteriorAlpha);
+                                  float typicalPosteriorAlpha,
+                                  const int *penaltyIds = nullptr,
+                                  const float *penaltyFactors = nullptr,
+                                  int penaltyTokens = 0);
 bool FastllmCudaTopKTopPSamplingToDevice(
                                   float *logits, float *probs,
                                   float *temperatures, int *topKArr,
