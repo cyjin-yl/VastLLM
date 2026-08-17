@@ -1575,15 +1575,15 @@ struct WorkQueue {
                             // 防止模型跳过参数块直接 </function> 出空调用
                             const auto &required = params["required"];
                             if (required.is_array()) {
-                                int requiredCount = 0;
+                                std::vector <std::string> requiredNames;
                                 for (const auto &r : required.array_items()) {
                                     if (r.is_string() && !r.string_value().empty()) {
-                                        requiredCount++;
+                                        requiredNames.push_back(r.string_value());
                                     }
                                 }
-                                if (requiredCount > 0) {
-                                    config.tool_call_required_parameter_counts[name] =
-                                        requiredCount;
+                                if (!requiredNames.empty()) {
+                                    config.tool_call_required_parameter_names[name] =
+                                        std::move(requiredNames);
                                 }
                             }
                         }
@@ -1607,7 +1607,7 @@ struct WorkQueue {
                         "<parameter=", "<paramter="
                     };
                 }
-                if (!config.tool_call_required_parameter_counts.empty() &&
+                if (!config.tool_call_required_parameter_names.empty() &&
                     config.tool_call_parameter_name_constraint_enabled) {
                     config.tool_call_required_parameter_constraint_enabled = true;
                 }

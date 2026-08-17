@@ -176,11 +176,12 @@ namespace fastllm {
         bool tool_call_parameter_name_constraint_enabled = false;
         std::map <std::string, std::vector <std::string> > tool_call_allowed_parameter_names;
         std::vector <std::string> tool_call_parameter_name_prefixes;
-        // 强制 required 参数块: <function=name> 完成后, 已闭合 parameter 块数
-        // 小于该工具 required 参数数时, 约束只允许生成 "<parameter=" 前缀链,
-        // 堵死量化损伤导致的"整块跳过参数"空调用。
+        // 强制 required 参数块: <function=name> 完成后, 该工具 schema 中
+        // 尚有未闭合的必填参数名时, 约束只允许生成 "<parameter=" 前缀链,
+        // 且参数名位置只放行缺失的必填名(强制 required-first),
+        // 堵死量化损伤导致的"整块跳过参数"/"发可选漏必填"空调用。
         bool tool_call_required_parameter_constraint_enabled = false;
-        std::map <std::string, int> tool_call_required_parameter_counts;
+        std::map <std::string, std::vector <std::string> > tool_call_required_parameter_names;
         std::vector <int> tool_call_allowed_token_ids;
         bool tool_call_content_sampling_enabled = false;
         // Set on the per-step config after Kimi-K3 has drained DSpark's

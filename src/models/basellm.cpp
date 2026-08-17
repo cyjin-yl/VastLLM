@@ -260,6 +260,61 @@ namespace fastllm {
             return count;
         }
 
+        // 收集当前 <function=...> 块内(invokePos 之后)已闭合的
+        // <parameter=name>...</parameter> 的参数名集合。未闭合块不计。
+        static std::set <std::string> CollectClosedToolCallParameterNames(
+                const std::string &text,
+                const GenerationConfig &config,
+                std::string::size_type invokePos) {
+            std::set <std::string> closedNames;
+            const std::string terminator =
+                    config.tool_call_name_terminator.empty() ? "\"" : config.tool_call_name_terminator;
+            const std::string paramClose = "</parameter>";
+            for (const auto &prefix : config.tool_call_parameter_name_prefixes) {
+                if (prefix.empty()) {
+                    continue;
+                }
+                auto pos = text.find(prefix, invokePos);
+                while (pos != std::string::npos) {
+                    auto nameStart = pos + prefix.size();
+                    auto termPos = text.find(terminator, nameStart);
+                    if (termPos == std::string::npos) {
+                        break;  // 参数名未写完(正在生成), 不算已闭合
+                    }
+                    auto closePos = text.find(paramClose, termPos);
+                    if (closePos == std::string::npos) {
+                        break;  // 块未闭合
+                    }
+                    closedNames.insert(text.substr(nameStart, termPos - nameStart));
+                    pos = text.find(prefix, closePos + paramClose.size());
+                }
+            }
+            return closedNames;
+        }
+
+        // 计算当前 function 块内缺失的必填参数名集合; 工具无必填或
+        // 必填已齐时返回空。
+        static std::vector <std::string> MissingRequiredToolCallParameters(
+                const std::string &text,
+                const GenerationConfig &config,
+                const std::string &toolName,
+                std::string::size_type invokePos) {
+            std::vector <std::string> missing;
+            auto it = config.tool_call_required_parameter_names.find(toolName);
+            if (it == config.tool_call_required_parameter_names.end() ||
+                it->second.empty()) {
+                return missing;
+            }
+            std::set <std::string> closedNames =
+                CollectClosedToolCallParameterNames(text, config, invokePos);
+            for (const auto &name : it->second) {
+                if (!closedNames.count(name)) {
+                    missing.push_back(name);
+                }
+            }
+            return missing;
+        }
+
         // "<function=name>" 已完成但 required 参数块未齐时, 强制下一段生成
         // "<parameter=" 前缀链, 禁止直接 "</function>" 闭合出空调用。
         static bool FindForcedToolCallParameterBlockStart(
@@ -268,7 +323,7 @@ namespace fastllm {
                 std::string &partial,
                 std::vector<std::string> &allowedValues) {
             if (!config.tool_call_required_parameter_constraint_enabled ||
-                config.tool_call_required_parameter_counts.empty() ||
+                config.tool_call_required_parameter_names.empty() ||
                 config.tool_call_parameter_name_prefixes.empty()) {
                 return false;
             }
@@ -277,9 +332,9 @@ namespace fastllm {
             if (!FindActiveToolCallInvokeName(text, config, toolName, invokePos)) {
                 return false;
             }
-            auto it = config.tool_call_required_parameter_counts.find(toolName);
-            if (it == config.tool_call_required_parameter_counts.end() ||
-                it->second <= 0) {
+            auto it = config.tool_call_required_parameter_names.find(toolName);
+            if (it == config.tool_call_required_parameter_names.end() ||
+                it->second.empty()) {
                 return false;
             }
             // 当前 function 块已闭合(模型在块外/下一块)则不干预
@@ -301,7 +356,10 @@ namespace fastllm {
                 // 有未闭合 parameter 块(正在生成参数名/值), 交由参数名约束或自由生成
                 return false;
             }
-            if (closed >= it->second) {
+            // 按【缺失必填名集合】判定: 只数已闭合且名字命中 required 的参数块,
+            // "发了一个可选参数"不再满足必填约束(旧实现按块数计, 会漏必填名)。
+            if (MissingRequiredToolCallParameters(text, config, toolName,
+                                                  invokePos).empty()) {
                 // required 参数已齐, 可自由闭合或追加 optional 参数
                 return false;
             }
@@ -364,6 +422,27 @@ namespace fastllm {
             }
             partial = text.substr(nameStart);
             allowedNames = allowedIt->second;
+            // required-first: 当前 function 块仍有缺失的必填参数名时,
+            // 参数名位置只放行缺失的必填名(Qwen 官方模板不要求参数顺序,
+            // 强制必填先出是安全的)。交集为空(schema 与 required 不一致)
+            // 时保持全量放行, 避免约束卡死。
+            if (config.tool_call_required_parameter_constraint_enabled) {
+                std::vector <std::string> missing =
+                    MissingRequiredToolCallParameters(text, config, toolName,
+                                                      invokePos);
+                if (!missing.empty()) {
+                    std::vector <std::string> requiredOnly;
+                    for (const auto &name : allowedNames) {
+                        if (std::find(missing.begin(), missing.end(), name) !=
+                            missing.end()) {
+                            requiredOnly.push_back(name);
+                        }
+                    }
+                    if (!requiredOnly.empty()) {
+                        allowedNames = std::move(requiredOnly);
+                    }
+                }
+            }
             return true;
         }
 
