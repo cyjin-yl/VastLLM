@@ -248,6 +248,81 @@ namespace fastllm {
             return !toolName.empty();
         }
 
+        static int CountOccurrences(const std::string &text,
+                                    const std::string &needle,
+                                    std::string::size_type from) {
+            int count = 0;
+            std::string::size_type pos = from;
+            while ((pos = text.find(needle, pos)) != std::string::npos) {
+                count++;
+                pos += needle.size();
+            }
+            return count;
+        }
+
+        // "<function=name>" 已完成但 required 参数块未齐时, 强制下一段生成
+        // "<parameter=" 前缀链, 禁止直接 "</function>" 闭合出空调用。
+        static bool FindForcedToolCallParameterBlockStart(
+                const std::string &text,
+                const GenerationConfig &config,
+                std::string &partial,
+                std::vector<std::string> &allowedValues) {
+            if (!config.tool_call_required_parameter_constraint_enabled ||
+                config.tool_call_required_parameter_counts.empty() ||
+                config.tool_call_parameter_name_prefixes.empty()) {
+                return false;
+            }
+            std::string toolName;
+            std::string::size_type invokePos = std::string::npos;
+            if (!FindActiveToolCallInvokeName(text, config, toolName, invokePos)) {
+                return false;
+            }
+            auto it = config.tool_call_required_parameter_counts.find(toolName);
+            if (it == config.tool_call_required_parameter_counts.end() ||
+                it->second <= 0) {
+                return false;
+            }
+            // 当前 function 块已闭合(模型在块外/下一块)则不干预
+            const std::string functionClose = "</function>";
+            auto closePos = text.rfind(functionClose);
+            if (closePos != std::string::npos && closePos > invokePos) {
+                return false;
+            }
+            int opened = 0;
+            int closed = 0;
+            for (const auto &prefix : config.tool_call_parameter_name_prefixes) {
+                if (prefix.empty()) {
+                    continue;
+                }
+                opened = std::max(opened, CountOccurrences(text, prefix, invokePos));
+            }
+            closed = CountOccurrences(text, "</parameter>", invokePos);
+            if (opened > closed) {
+                // 有未闭合 parameter 块(正在生成参数名/值), 交由参数名约束或自由生成
+                return false;
+            }
+            if (closed >= it->second) {
+                // required 参数已齐, 可自由闭合或追加 optional 参数
+                return false;
+            }
+            // 计算 tail 与 "<parameter=" 的最长前缀匹配后缀作为 partial;
+            // tail 中已生成字符若不是前缀的一部分, 约束窗口内无放行 token,
+            // allowedIds 为空 -> 采样层自动降级不 mask, 不会卡死。
+            const std::string &target = config.tool_call_parameter_name_prefixes.front();
+            std::string tail = text.substr(invokePos);
+            size_t maxLen = std::min(tail.size(), target.size());
+            size_t matchLen = 0;
+            for (size_t len = maxLen; len > 0; len--) {
+                if (tail.compare(tail.size() - len, len, target, 0, len) == 0) {
+                    matchLen = len;
+                    break;
+                }
+            }
+            partial = tail.substr(tail.size() - matchLen);
+            allowedValues = {target};
+            return true;
+        }
+
         static bool FindActiveToolCallParameterNamePartial(
                 const std::string &text,
                 const GenerationConfig &config,
@@ -499,11 +574,15 @@ namespace fastllm {
         generationConfig.tool_call_allowed_token_ids.clear();
         if (context == nullptr ||
             (!generationConfig.tool_call_name_constraint_enabled &&
-             !generationConfig.tool_call_parameter_name_constraint_enabled)) {
+             !generationConfig.tool_call_parameter_name_constraint_enabled &&
+             !generationConfig.tool_call_required_parameter_constraint_enabled)) {
             return;
         }
         std::string partial;
         std::vector<std::string> allowedValues;
+        std::string activeTerminator =
+                generationConfig.tool_call_name_terminator.empty()
+                ? "\"" : generationConfig.tool_call_name_terminator;
         if (!FindActiveToolCallParameterNamePartial(
                     context->toolCallConstraintGeneratedText,
                     generationConfig,
@@ -513,9 +592,18 @@ namespace fastllm {
                         context->toolCallConstraintGeneratedText,
                         generationConfig,
                         partial)) {
-                return;
+                if (!FindForcedToolCallParameterBlockStart(
+                            context->toolCallConstraintGeneratedText,
+                            generationConfig,
+                            partial,
+                            allowedValues)) {
+                    return;
+                }
+                // "<parameter=" 目标串不含 ">", 用不可能字符避免提前命中终止逻辑
+                activeTerminator = "\x01";
+            } else {
+                allowedValues = generationConfig.tool_call_allowed_names;
             }
-            allowedValues = generationConfig.tool_call_allowed_names;
         }
         if (allowedValues.empty()) {
             return;
@@ -523,9 +611,7 @@ namespace fastllm {
 
         std::vector<int> allowedIds;
         allowedIds.reserve(allowedValues.size() * 4);
-        const std::string terminator =
-                generationConfig.tool_call_name_terminator.empty()
-                ? "\"" : generationConfig.tool_call_name_terminator;
+        const std::string terminator = activeTerminator;
         for (const auto &item : this->weight.tokenizer.tokenToStringDict) {
             int tokenId = item.first;
             std::string tokenText = this->weight.tokenizer.DecodeTokens(std::vector<int>{tokenId});
@@ -542,7 +628,8 @@ namespace fastllm {
     void basellm::UpdateToolCallConstraintState(ResponseContext *context, int tokenId) {
         if (context == nullptr ||
             (!context->generationConfig.tool_call_name_constraint_enabled &&
-             !context->generationConfig.tool_call_parameter_name_constraint_enabled) ||
+             !context->generationConfig.tool_call_parameter_name_constraint_enabled &&
+             !context->generationConfig.tool_call_required_parameter_constraint_enabled) ||
             tokenId < 0) {
             return;
         }

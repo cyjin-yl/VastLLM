@@ -192,7 +192,17 @@ public:
     OpenAIToolCallDelta Flush() {
         OpenAIToolCallDelta delta;
         if (inToolCall) {
-            delta.content = toolBuffer + pending;
+            // 模型在量化损伤下偶尔漏掉 "</tool_call>" 闭合就直接结束
+            // (e.g. "<tool_call>\n<fuction=read>...</fuction><|im_end|>").
+            // ParseBlock 只依赖块内结构, 不依赖闭合标签 —— 尝试解析,
+            // 解析失败才回退为裸文本, 避免完整工具调用被丢弃成乱码文本。
+            const std::string block = toolBuffer + pending;
+            OpenAIParsedToolCall parsed;
+            if (ParseBlock(block, parsed)) {
+                delta.toolCalls.push_back(std::move(parsed));
+            } else {
+                delta.content = block;
+            }
         } else {
             delta.content = pending;
         }
@@ -395,11 +405,22 @@ private:
                 parameterNameEnd >= bodyEnd) {
                 return false;
             }
-            const size_t parameterValueEnd =
+            const size_t parameterValueEndTag =
                 block.find(parameterClose, parameterNameEnd + 1);
-            if (parameterValueEnd == std::string::npos ||
-                parameterValueEnd > bodyEnd) {
-                return false;
+            size_t parameterValueEnd = parameterValueEndTag;
+            bool usedCloseTag = parameterValueEndTag != std::string::npos &&
+                                parameterValueEndTag <= bodyEnd;
+            if (!usedCloseTag) {
+                // 模型漏掉 "</parameter>" 闭合: 值延伸到下一个参数开头或块尾,
+                // 保留参数而非整块丢弃。
+                const size_t nextParam =
+                    block.find(parameterOpen, parameterNameEnd + 1);
+                parameterValueEnd =
+                    (nextParam != std::string::npos && nextParam < bodyEnd)
+                    ? nextParam : bodyEnd;
+                if (parameterValueEnd <= parameterNameEnd + 1) {
+                    return false;
+                }
             }
             const std::string name = Trim(block.substr(
                 parameterNameStart, parameterNameEnd - parameterNameStart));
@@ -409,7 +430,8 @@ private:
             arguments[name] = ParseParameterValue(block.substr(
                 parameterNameEnd + 1,
                 parameterValueEnd - parameterNameEnd - 1));
-            cursor = parameterValueEnd + parameterClose.size();
+            cursor = usedCloseTag ? parameterValueEnd + parameterClose.size()
+                                  : parameterValueEnd;
         }
         parsed.arguments = CompactJson(json11::Json(arguments));
         return true;
