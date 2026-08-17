@@ -9,10 +9,12 @@
 struct OpenAIParsedChatInput {
     std::vector<std::pair<std::string, std::string>> messages;
     std::vector<std::string> imageUrls;
+    std::vector<std::string> videoUrls;
 };
 
 inline bool ParseOpenAIChatInput(const json11::Json &messages,
                                  const std::string &imagePlaceholder,
+                                 const std::string &videoPlaceholder,
                                  OpenAIParsedChatInput &parsed,
                                  std::string &error) {
     OpenAIParsedChatInput candidate;
@@ -63,6 +65,24 @@ inline bool ParseOpenAIChatInput(const json11::Json &messages,
                     }
                     rendered += imagePlaceholder;
                     candidate.imageUrls.push_back(imageUrl["url"].string_value());
+                } else if (type == "video_url") {
+                    if (role != "user") {
+                        error = "video_url content is only supported in user messages";
+                        return false;
+                    }
+                    if (videoPlaceholder.empty()) {
+                        error = "the selected model does not support video input";
+                        return false;
+                    }
+                    const auto &videoUrl = part["video_url"];
+                    if (!videoUrl.is_object() ||
+                        !videoUrl["url"].is_string() ||
+                        videoUrl["url"].string_value().empty()) {
+                        error = "video_url content parts require a non-empty video_url.url string";
+                        return false;
+                    }
+                    rendered += videoPlaceholder;
+                    candidate.videoUrls.push_back(videoUrl["url"].string_value());
                 } else {
                     error = "unsupported message content part type: " + type;
                     return false;

@@ -7786,7 +7786,157 @@ namespace fastllm {
         }
 
         prompt = std::move(expandedPrompt);
-        multimodalInput = std::move(candidate);
+        // 合并而非覆盖:同一请求可同时携带图像与视频输入
+        for (auto &kv : candidate) {
+            auto &vec = multimodalInput[kv.first];
+            vec.insert(vec.end(), kv.second.begin(), kv.second.end());
+        }
+        for (auto &tensor : owned) {
+            tensor.release();
+        }
+        return true;
+    }
+
+    std::string Qwen3_5Model::GetVideoPlaceholder() const {
+        return "<|vision_start|><|video_pad|><|vision_end|>";
+    }
+
+    bool Qwen3_5Model::PrepareMultimodalVideoInputs(
+            std::string &prompt,
+            const std::vector<MultimodalVideo> &videos,
+            std::map<std::string, std::vector<Data*> > &multimodalInput,
+            std::string &error) const {
+        static const std::string videoToken = "<|video_pad|>";
+        error.clear();
+        if (videos.empty()) {
+            error = "at least one decoded video is required";
+            return false;
+        }
+        if (vision_depth <= 0 || vision_hidden_size <= 0 ||
+            vision_patch_size <= 0 || vision_spatial_merge_size <= 0 ||
+            vision_temporal_patch_size <= 0) {
+            error = "the loaded Qwen3.5 model has no usable vision projector";
+            return false;
+        }
+
+        size_t placeholderCount = 0;
+        for (size_t pos = 0;
+             (pos = prompt.find(videoToken, pos)) != std::string::npos;
+             pos += videoToken.size()) {
+            placeholderCount++;
+        }
+        if (placeholderCount != videos.size()) {
+            error = "video placeholder count (" +
+                    std::to_string(placeholderCount) +
+                    ") does not match decoded video count (" +
+                    std::to_string(videos.size()) + ")";
+            return false;
+        }
+
+        const int factor = vision_patch_size * vision_spatial_merge_size;
+        if (factor <= 0 || vision_video_min_pixels <= 0 ||
+            vision_video_max_pixels < vision_video_min_pixels) {
+            error = "the loaded Qwen3.5 video processor configuration is invalid";
+            return false;
+        }
+
+        // 逐视频计算统一的帧缩放尺寸(同一段视频所有帧同尺寸),
+        // 规则与图像一致:factor 对齐 + video_preprocessor 的像素上下限。
+        std::vector<std::array<int, 2>> resizedShapes;
+        std::vector<size_t> tokenCounts;
+        resizedShapes.reserve(videos.size());
+        tokenCounts.reserve(videos.size());
+        for (const auto &video : videos) {
+            if (video.frameCount <= 0 || video.width <= 0 || video.height <= 0 ||
+                video.rgb.size() !=
+                    (size_t) video.frameCount * video.height * video.width * 3) {
+                error = "decoded video frame tensor shape is invalid";
+                return false;
+            }
+            const int64_t pixels = (int64_t) video.height * video.width;
+            int resizedHeight =
+                (int) std::round(video.height / (double) factor) * factor;
+            int resizedWidth =
+                (int) std::round(video.width / (double) factor) * factor;
+            resizedHeight = std::max(resizedHeight, factor);
+            resizedWidth = std::max(resizedWidth, factor);
+            int64_t resizedPixels = (int64_t) resizedHeight * resizedWidth;
+            if (resizedPixels > vision_video_max_pixels) {
+                const double beta = std::sqrt(
+                    (double) pixels / (double) vision_video_max_pixels);
+                resizedHeight = std::max(
+                    factor,
+                    (int) std::floor(video.height / beta / factor) * factor);
+                resizedWidth = std::max(
+                    factor,
+                    (int) std::floor(video.width / beta / factor) * factor);
+            } else if (resizedPixels < vision_video_min_pixels) {
+                const double beta = std::sqrt(
+                    (double) vision_video_min_pixels / (double) pixels);
+                resizedHeight =
+                    (int) std::ceil(video.height * beta / factor) * factor;
+                resizedWidth =
+                    (int) std::ceil(video.width * beta / factor) * factor;
+            }
+            resizedShapes.push_back({resizedHeight, resizedWidth});
+            const int gridT =
+                (video.frameCount + vision_temporal_patch_size - 1) /
+                vision_temporal_patch_size;
+            tokenCounts.push_back(
+                (size_t) gridT *
+                (resizedHeight / vision_patch_size / vision_spatial_merge_size) *
+                (resizedWidth / vision_patch_size / vision_spatial_merge_size));
+        }
+
+        std::string expandedPrompt = prompt;
+        size_t searchFrom = 0;
+        for (size_t videoIndex = 0; videoIndex < videos.size(); videoIndex++) {
+            const size_t position =
+                expandedPrompt.find(videoToken, searchFrom);
+            std::string replacement;
+            replacement.reserve(tokenCounts[videoIndex] * videoToken.size());
+            for (size_t token = 0; token < tokenCounts[videoIndex]; token++) {
+                replacement += videoToken;
+            }
+            expandedPrompt.replace(
+                position, videoToken.size(), replacement);
+            searchFrom = position + replacement.size();
+        }
+
+        std::map<std::string, std::vector<Data*> > candidate;
+        std::vector<std::unique_ptr<Data>> owned;
+        auto gridTensor = std::make_unique<Data>(
+            DataType::INT32, std::vector<int>{(int) videos.size(), 3});
+        gridTensor->Allocate(false);
+        auto *gridValues =
+            reinterpret_cast<int32_t*>(gridTensor->cpuData);
+        for (size_t i = 0; i < videos.size(); i++) {
+            gridValues[i * 3] =
+                (videos[i].frameCount + vision_temporal_patch_size - 1) /
+                vision_temporal_patch_size;
+            gridValues[i * 3 + 1] =
+                resizedShapes[i][0] / vision_patch_size;
+            gridValues[i * 3 + 2] =
+                resizedShapes[i][1] / vision_patch_size;
+        }
+        candidate["video_grid_thw"].push_back(gridTensor.get());
+        owned.push_back(std::move(gridTensor));
+        for (const auto &video : videos) {
+            auto frames = std::make_unique<Data>(
+                DataType::FLOAT32,
+                std::vector<int>{video.frameCount, video.height,
+                                 video.width, 3},
+                video.rgb);
+            candidate["video_frames"].push_back(frames.get());
+            owned.push_back(std::move(frames));
+        }
+
+        prompt = std::move(expandedPrompt);
+        // 合并而非覆盖:同一请求可同时携带图像与视频输入
+        for (auto &kv : candidate) {
+            auto &vec = multimodalInput[kv.first];
+            vec.insert(vec.end(), kv.second.begin(), kv.second.end());
+        }
         for (auto &tensor : owned) {
             tensor.release();
         }
@@ -20351,9 +20501,20 @@ namespace fastllm {
                         !isPrompt && plainResidentDecodeBatch
                             ? 1
                             : scheduledDecodeTokens(ctx);
-                    if (isPrompt && !continuedLongPrefill && ctx->cacheLen == 0 &&
-                        tryRestorePrefixCache(ctx) < 0) {
-                        releaseAndReinitRequest(ctx);
+                    if (isPrompt && !continuedLongPrefill && ctx->cacheLen == 0) {
+                        const int hitLen = tryRestorePrefixCache(ctx);
+                        if (hitLen < 0) {
+                            releaseAndReinitRequest(ctx);
+                        } else if (hitLen > 0) {
+                            const int totalTok =
+                                hitLen + (int)ctx->currentTokens.size();
+                            printf("[Handle %d] prefix-cache HIT(mem-trie): "
+                                   "%d/%d tok (%.0f%%)\n",
+                                   ii.handle, hitLen, totalTok,
+                                   totalTok > 0 ?
+                                       100.0 * hitLen / totalTok : 0.0);
+                            fflush(stdout);
+                        }
                     }
                     if (!isPrompt && !seqLens.empty() &&
                         requestedDecodeTokens != seqLens[0]) {
@@ -21436,6 +21597,26 @@ namespace fastllm {
                     } else {
                         lastLongPrefillTicket = commitContext->longPrefill.ticket;
                         lastQuantumWasLongPrefill = true;
+                        // 长 prefill 进行中进度(节流 5s):让 100K+ 的 prefill
+                        // 在日志里可见,不再像"挂死"。
+                        {
+                            static auto lastPrefillProgressLog =
+                                std::chrono::steady_clock::time_point{};
+                            const auto nowLog = std::chrono::steady_clock::now();
+                            if (nowLog - lastPrefillProgressLog >=
+                                std::chrono::seconds(5)) {
+                                lastPrefillProgressLog = nowLog;
+                                const int total = std::max(
+                                    1, commitContext->longPrefill.total);
+                                printf("[req %d] prefilling: %d/%d tok (%.0f%%)\n",
+                                       handles.empty() ? -1 : handles[0],
+                                       commitContext->longPrefill.cursor,
+                                       commitContext->longPrefill.total,
+                                       100.0 * commitContext->longPrefill.cursor /
+                                           total);
+                                fflush(stdout);
+                            }
+                        }
                         if (commitContext->longPrefill.inProgress) {
                             int remaining = commitContext->longPrefill.total -
                                 commitContext->longPrefill.cursor;
@@ -21930,6 +22111,36 @@ namespace fastllm {
         vision_spatial_merge_size = atoi(getDictValue("vision_config.spatial_merge_size", "2").c_str());
         vision_out_hidden_size = atoi(getDictValue("vision_config.out_hidden_size", std::to_string(embed_dim)).c_str());
         vision_num_position_embeddings = atoi(getDictValue("vision_config.num_position_embeddings", "0").c_str());
+        // preprocessor_config.json(HF 目录)注入的原生缩放/归一化,覆盖内建默认
+        vision_image_min_pixels = atoi(getDictValue("vision_config.image_min_pixels", "3136").c_str());
+        vision_image_max_pixels = atoi(getDictValue("vision_config.image_max_pixels", "1003520").c_str());
+        {
+            auto parseTriple = [&](const char *key, std::vector<float> &target) {
+                std::string raw = getDictValue(key, "");
+                if (raw.empty()) {
+                    return;
+                }
+                std::string parseError;
+                auto arr = json11::Json::parse(raw, parseError);
+                if (!parseError.empty() || !arr.is_array() || arr.array_items().empty()) {
+                    return;
+                }
+                std::vector<float> values;
+                for (auto &item : arr.array_items()) {
+                    if (item.is_number()) {
+                        values.push_back((float)item.number_value());
+                    }
+                }
+                if (values.size() == 3) {
+                    target = values;
+                }
+            };
+            parseTriple("vision_config.image_mean", vision_image_mean);
+            parseTriple("vision_config.image_std", vision_image_std);
+        }
+        // video_preprocessor_config.json 的帧像素预算(独立键,不覆盖图像)
+        vision_video_min_pixels = atoi(getDictValue("vision_config.video_min_pixels", "4096").c_str());
+        vision_video_max_pixels = atoi(getDictValue("vision_config.video_max_pixels", "25165824").c_str());
         vision_num_grid_per_side = (vision_num_position_embeddings > 0) ? (int) (sqrt((double) vision_num_position_embeddings) + 0.5) : 0;
         vision_head_dim = (vision_num_heads > 0) ? (vision_hidden_size / vision_num_heads) : 0;
         image_token_id = atoi(getDictValue("image_token_id", "-1").c_str());
@@ -25723,6 +25934,38 @@ namespace fastllm {
                 AdjustPositionIdsWithDelta(positionIds, *deltaIt->second[0], adjustedPositionIds);
             } else {
                 adjustedPositionIds.CopyFrom(positionIds);
+            }
+            // 续 prefill(典型为前缀缓存 HIT 之后)也可能有几万~十几万 token。
+            // 全序列一次 Forward 会让 GDN Repeat 等算子按全序列申请显存
+            // ([1, seq, 16, 3, 128] 级别),在显存紧张时直接 OOM 杀死进程。
+            // 与首次 multimodal prefill 一样按 prefillChunkSize 分块推进,
+            // 中间块不需要 logits。
+            const int totalSeqLen = inputIds.dims[1];
+            const int prefillChunkSize = GetChunkedPrefillSize();
+            const bool positionIdsMatchSeq =
+                adjustedPositionIds.dims.size() >= 2 &&
+                adjustedPositionIds.dims.back() == totalSeqLen;
+            if (prefillChunkSize > 0 && totalSeqLen > prefillChunkSize &&
+                positionIdsMatchSeq) {
+                printf("[Qwen3.5] chunked continued prefill: tokens=%d chunk=%d chunks=%d.\n",
+                       totalSeqLen, prefillChunkSize,
+                       (totalSeqLen + prefillChunkSize - 1) / prefillChunkSize);
+                fflush(stdout);
+                const int posAxis = (int)adjustedPositionIds.dims.size() - 1;
+                for (int st = 0; st < totalSeqLen; st += prefillChunkSize) {
+                    const int curLen = std::min(prefillChunkSize, totalSeqLen - st);
+                    const bool lastChunk = (st + curLen >= totalSeqLen);
+                    Data curInputIds, curPositionIds;
+                    Split(inputIds, 1, st, st + curLen, curInputIds);
+                    Split(adjustedPositionIds, posAxis, st, st + curLen, curPositionIds);
+                    int nextToken = Forward(curInputIds, attentionMask, curPositionIds,
+                                            pastKeyValues, generationConfig, lastTokens,
+                                            lastChunk ? logits : nullptr);
+                    if (lastChunk) {
+                        ret.push_back(nextToken);
+                    }
+                }
+                return ret;
             }
             ret.push_back(Forward(inputIds, attentionMask, adjustedPositionIds, pastKeyValues, generationConfig, lastTokens, logits));
             return ret;

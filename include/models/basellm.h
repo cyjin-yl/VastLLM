@@ -31,6 +31,15 @@ namespace fastllm {
         std::vector<float> rgb;
     };
 
+    // 一段抽好帧的视频:所有帧同尺寸,rgb 按帧连续存放
+    // (帧0的 H*W*3, 接着帧1...),帧率/抽帧策略由调用方(apiserver)决定。
+    struct MultimodalVideo {
+        int width = 0;
+        int height = 0;
+        int frameCount = 0;
+        std::vector<float> rgb;  // frameCount * height * width * 3
+    };
+
     enum ResponseContextError {
         ResponseContextErrorNone = 0, ResponseContextErrorPromptTooLong
     };
@@ -387,6 +396,14 @@ namespace fastllm {
                 std::map<std::string, std::vector<Data*> > &multimodalInput,
                 std::string &error) const;
 
+        virtual std::string GetVideoPlaceholder() const;
+
+        virtual bool PrepareMultimodalVideoInputs(
+                std::string &prompt,
+                const std::vector<MultimodalVideo> &videos,
+                std::map<std::string, std::vector<Data*> > &multimodalInput,
+                std::string &error) const;
+
         // 是否需要生成AttentionMask
         virtual bool NeedAttentionMask(int qlen, int klen);
 
@@ -516,6 +533,10 @@ namespace fastllm {
 
         virtual PagedCacheManager* GetPagedKVCacheManager(int layerIndex, bool isKey) const;
         virtual std::vector<std::pair<int, PagedCacheManager*> > GetPagedKVCacheManagers(int layerIndex, bool isKey) const;
+        // 汇总所有层的分页 KV 池占用(按 manager 指针去重):
+        // totalPages=池容量, usedPages=已分配(含 trie 引用), triePages=前缀缓存驻留页。
+        void GetPagedCachePoolStats(uint64_t &totalPages, uint64_t &usedPages,
+                                    uint64_t &triePages, int &pageLenOut);
         virtual std::pair<DataType, DataType> GetKVCacheDataTypes(int layerIndex) const {
             (void)layerIndex;
             return {this->kvCacheDataType, this->kvCacheDataType};

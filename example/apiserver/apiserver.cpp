@@ -145,6 +145,7 @@ using socket_t = int;
 #include "output_token_limit.h"
 #include "stop_parser.h"
 #include "image_loader.h"
+#include "video_loader.h"
 #include "openai_multimodal_request.h"
 #include "checkpoint_control.h"
 #include "utils/stop_string_matcher.h"
@@ -224,6 +225,21 @@ struct APIConfig {
     std::map <std::string, int> devices;
 };
 APIConfig config;
+
+// vLLM 风格的滚动窗口吞吐统计:prefill 在首 token 时入账,decode 每 token
+// 实时入账(长请求不遮罩),metrics 线程每 15s 读清。
+// decode tok/s 口径 = 窗口 tokens / 窗口墙钟秒(同 vLLM Avg throughput)。
+std::atomic<uint64_t> gWinPrefillTokens{0};
+std::atomic<uint64_t> gWinDecodeTokens{0};
+std::atomic<uint64_t> gWinPrefillUs{0};
+std::atomic<uint64_t> gWinFinishedReqs{0};
+
+static inline void NotePrefillDone(int promptTokens, double prefillMs) {
+    gWinPrefillTokens.fetch_add((uint64_t) std::max(0, promptTokens),
+                                std::memory_order_relaxed);
+    gWinPrefillUs.fetch_add((uint64_t) std::max(0.0, prefillMs) * 1000,
+                            std::memory_order_relaxed);
+}
 
 
 bool PrepareServerPersistentPrefixCache(
@@ -468,6 +484,74 @@ struct WorkQueue {
             std::lock_guard<std::mutex> lock(locker);
             stopping = false;
         }
+        // vLLM 风格周期指标:每 15s 打印一次窗口吞吐 + 当前队列状态,
+        // 完全静默期(无活动无队列)不刷屏。
+        std::thread([this]() {
+            while (true) {
+                std::this_thread::sleep_for(std::chrono::seconds(15));
+                if (this->stopping) {
+                    return;
+                }
+                const uint64_t pt = gWinPrefillTokens.exchange(0);
+                const uint64_t dt = gWinDecodeTokens.exchange(0);
+                const uint64_t pus = gWinPrefillUs.exchange(0);
+                const uint64_t fin = gWinFinishedReqs.exchange(0);
+                int active, queued, total;
+                {
+                    std::lock_guard<std::mutex> lock(this->locker);
+                    active = this->activateQueryNumber;
+                    queued = (int) this->q.size();
+                    total = this->totalQueryNumber;
+                }
+                if (fin == 0 && active == 0 && queued == 0) {
+                    continue;
+                }
+                // 缓存占用:L1=内存 trie 前缀页,L2=磁盘持久缓存;kv_pool=页池水位
+                std::string cacheDesc;
+                if (!suspended.load(std::memory_order_acquire) &&
+                    !suspendInProgress.load(std::memory_order_acquire) &&
+                    model != nullptr) {
+                    uint64_t totalPages = 0, usedPages = 0, triePages = 0;
+                    int pageLen = 0;
+                    model->GetPagedCachePoolStats(
+                        totalPages, usedPages, triePages, pageLen);
+                    char buf[256];
+                    std::snprintf(buf, sizeof(buf),
+                        " | kv_pool=%llu/%llu pg (%.0f%%) "
+                        "L1trie=%llu pg (~%llu tok)",
+                        (unsigned long long) usedPages,
+                        (unsigned long long) totalPages,
+                        totalPages > 0 ?
+                            100.0 * (double) usedPages / (double) totalPages :
+                            0.0,
+                        (unsigned long long) triePages,
+                        (unsigned long long) (triePages *
+                            (uint64_t) std::max(0, pageLen)));
+                    cacheDesc = buf;
+                    const auto disk =
+                        fastllm::GetPersistentPrefixCacheStatus();
+                    if (disk.enabled) {
+                        std::snprintf(buf, sizeof(buf),
+                            " L2disk=%.1fMB gen=%llu ckpt=%llu hits=%llu",
+                            (double) disk.payloadBytes / 1048576.0,
+                            (unsigned long long) disk.loadedGeneration,
+                            (unsigned long long) disk.checkpointCount,
+                            (unsigned long long) disk.restoreHitCount);
+                        cacheDesc += buf;
+                    }
+                }
+                printf("[metrics] running=%d pending=%d (total=%d) | "
+                       "prefill %llu tok (%.1f tok/s) | "
+                       "decode %llu tok (%.1f tok/s) | done %llu req%s\n",
+                       active, queued, total,
+                       (unsigned long long) pt,
+                       pus > 0 ? (double) pt * 1e6 / (double) pus : 0.0,
+                       (unsigned long long) dt,
+                       (double) dt / 15.0,  // 窗口墙钟口径(同 vLLM)
+                       (unsigned long long) fin, cacheDesc.c_str());
+                fflush(stdout);
+            }
+        }).detach();
         loop = new std::thread ([] (WorkQueue *ts) {
             while (true) {
                 std::unique_lock<std::mutex> lock(ts->locker);
@@ -1277,6 +1361,7 @@ struct WorkQueue {
                 if (!ParseOpenAIChatInput(
                         node->config["messages"],
                         model->GetImagePlaceholder(),
+                        model->GetVideoPlaceholder(),
                         parsedChatInput, node->error)) {
                     writeJsonAndClose(
                         400, OpenAIHttpError(node->error,
@@ -1346,6 +1431,35 @@ struct WorkQueue {
                 }
                 if (!model->PrepareMultimodalImageInputs(
                         prompt, images, multimodalGuard.inputs,
+                        node->error)) {
+                    writeJsonAndClose(
+                        400, OpenAIHttpError(
+                            node->error, "invalid_request_error",
+                            "invalid_multimodal_input"));
+                    return;
+                }
+            }
+            if (!parsedChatInput.videoUrls.empty()) {
+                std::vector<fastllm::MultimodalVideo> videos;
+                videos.reserve(parsedChatInput.videoUrls.size());
+                for (const auto &url : parsedChatInput.videoUrls) {
+                    OpenAIDecodedVideo decoded;
+                    if (!LoadOpenAIVideoUrl(url, decoded, node->error)) {
+                        writeJsonAndClose(
+                            400, OpenAIHttpError(
+                                node->error, "invalid_request_error",
+                                "invalid_video_url"));
+                        return;
+                    }
+                    fastllm::MultimodalVideo video;
+                    video.width = decoded.width;
+                    video.height = decoded.height;
+                    video.frameCount = decoded.frameCount;
+                    video.rgb = std::move(decoded.rgb);
+                    videos.push_back(std::move(video));
+                }
+                if (!model->PrepareMultimodalVideoInputs(
+                        prompt, videos, multimodalGuard.inputs,
                         node->error)) {
                     writeJsonAndClose(
                         400, OpenAIHttpError(
@@ -1449,6 +1563,40 @@ struct WorkQueue {
             int handleId = model->LaunchResponseTokens(
                 tokens, config, multimodalGuard.inputs);
             multimodalGuard.Release();
+            const auto genStart = std::chrono::steady_clock::now();
+            bool firstTokenSeen = false;
+            double firstTokenMs = 0.0;
+            printf("[req %d] start: prefill %d tok\n",
+                   handleId, (int) tokens.size());
+            fflush(stdout);
+            auto noteFirstToken = [&]() {
+                if (!firstTokenSeen) {
+                    firstTokenSeen = true;
+                    firstTokenMs = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - genStart).count();
+                    // prefill 完成即入窗口(不等整个请求结束,长 decode 不遮罩)
+                    NotePrefillDone((int) tokens.size(), firstTokenMs);
+                    printf("[req %d] prefill done: %d tok in %.2fs (%.1f tok/s)\n",
+                           handleId, (int) tokens.size(), firstTokenMs / 1000.0,
+                           firstTokenMs > 0
+                               ? tokens.size() * 1000.0 / firstTokenMs : 0.0);
+                    fflush(stdout);
+                }
+            };
+            auto recordMetrics = [&](int outputCount) {
+                const double totalMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - genStart).count();
+                const double decodeMs =
+                    firstTokenSeen ? totalMs - firstTokenMs : 0.0;
+                printf("[req %d] done: prefill %d tok %.2fs | decode %d tok in %.2fs (%.1f tok/s)\n",
+                       handleId, (int) tokens.size(),
+                       (firstTokenSeen ? firstTokenMs : totalMs) / 1000.0,
+                       outputCount,
+                       decodeMs / 1000.0,
+                       decodeMs > 0 ? outputCount * 1000.0 / decodeMs : 0.0);
+                fflush(stdout);
+                gWinFinishedReqs.fetch_add(1, std::memory_order_relaxed);
+            };
             const bool isStream = node->config["stream"].is_bool() &&
                                   node->config["stream"].bool_value();
             const std::string curId = "fastllm-" + GenerateRandomID();
@@ -1570,6 +1718,7 @@ struct WorkQueue {
                     }
                     int result = model->FetchResponseTokens(handleId);
                     if (result == -1) {
+                        recordMetrics(outputTokens);
                         std::string trailingText;
                         FlushPendingStopText(pendingStopText, trailingText);
                         if (!sendParsedDelta(outputParser.Push(trailingText)) ||
@@ -1611,6 +1760,21 @@ struct WorkQueue {
                     }
 
                     outputTokens++;
+                    noteFirstToken();
+                    // decode 实时入窗口(每 token,长生成也能反映到 tok/s)
+                    gWinDecodeTokens.fetch_add(1, std::memory_order_relaxed);
+                    if (outputTokens % 256 == 0) {
+                        const double nowMs =
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - genStart)
+                                .count();
+                        const double decMs = nowMs - firstTokenMs;
+                        printf("[req %d] decode %d tok (%.1f tok/s)\n",
+                               handleId, outputTokens,
+                               decMs > 0 ? (outputTokens - 1) * 1000.0 / decMs
+                                         : 0.0);
+                        fflush(stdout);
+                    }
                     results.assign(1, static_cast<float>(result));
                     std::string now = model->weight.tokenizer.Decode(
                         fastllm::Data(fastllm::DataType::FLOAT32,
@@ -1652,9 +1816,13 @@ struct WorkQueue {
                 while (true) {
                     int result = model->FetchResponseTokens(handleId);
                     if (result == -1) {
+                        recordMetrics(outputTokens);
                         break;
                     }
                     outputTokens++;
+                    noteFirstToken();
+                    // decode 实时入窗口(每 token,长生成也能反映到 tok/s)
+                    gWinDecodeTokens.fetch_add(1, std::memory_order_relaxed);
                     results.assign(1, static_cast<float>(result));
                     std::string now = model->weight.tokenizer.Decode(
                         fastllm::Data(fastllm::DataType::FLOAT32,

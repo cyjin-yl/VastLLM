@@ -4909,6 +4909,13 @@ void * FastllmCudaMalloc(size_t size) {
                    "gpuFree: %lu MB / %lu MB.\n",
                    size >> 20, id, freeMem >> 20, totalMem >> 20);
             fflush(stdout);
+            {   // OOM 诊断:打印 native 调用栈,定位是哪个算子在申请大块显存。
+                void *btFrames[32];
+                int btCount = backtrace(btFrames, 32);
+                printf("OOM backtrace (%d frames):\n", btCount);
+                backtrace_symbols_fd(btFrames, btCount, fileno(stdout));
+                fflush(stdout);
+            }
             checkCudaErrors("", state);
             return nullptr;
         }

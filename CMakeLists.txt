@@ -727,10 +727,13 @@ target_link_libraries(benchmark fastllm)
 
 add_executable(apiserver
     example/apiserver/apiserver.cpp
-    example/apiserver/image_loader.cpp)
+    example/apiserver/image_loader.cpp
+    example/apiserver/video_loader.cpp)
 target_compile_definitions(apiserver PRIVATE
     ${FASTLLM_APISERVER_IMAGE_DEFINITIONS})
 target_link_libraries(apiserver fastllm ${FASTLLM_APISERVER_IMAGE_LIBS})
+# 让 OOM/fatal 路径的 backtrace_symbols_fd 能解析出符号名
+set_target_properties(apiserver PROPERTIES ENABLE_EXPORTS ON)
 
 if (BUILD_CLI)
     add_executable(FastllmStudio_cli example/FastllmStudio/cli/cli.cpp example/FastllmStudio/cli/ui.cpp)

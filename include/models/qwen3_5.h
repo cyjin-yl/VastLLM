@@ -212,6 +212,14 @@ namespace fastllm {
                 const std::vector<MultimodalImage> &images,
                 std::map<std::string, std::vector<Data*> > &multimodalInput,
                 std::string &error) const override;
+
+        virtual std::string GetVideoPlaceholder() const override;
+
+        virtual bool PrepareMultimodalVideoInputs(
+                std::string &prompt,
+                const std::vector<MultimodalVideo> &videos,
+                std::map<std::string, std::vector<Data*> > &multimodalInput,
+                std::string &error) const override;
         
         // 是否需要生成AttentionMask
         virtual bool NeedAttentionMask(int qlen, int klen);
@@ -482,6 +490,10 @@ namespace fastllm {
         std::vector<float> vision_image_std = {0.5f, 0.5f, 0.5f};
         int vision_image_min_pixels = 56 * 56;
         int vision_image_max_pixels = 28 * 28 * 1280;
+        // 视频帧的像素预算(video_preprocessor_config.json 的 size),
+        // 默认与 Qwen3-VL 官方一致:64*64 ~ 4096*2160 量级
+        int vision_video_min_pixels = 64 * 64;
+        int vision_video_max_pixels = 24576 * 1024;
         Data visionSinData;
         Data visionCosData;
 

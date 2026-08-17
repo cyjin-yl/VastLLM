@@ -693,6 +693,32 @@ namespace fastllm {
         return false;
     }
 
+    void basellm::GetPagedCachePoolStats(uint64_t &totalPages, uint64_t &usedPages,
+                                         uint64_t &triePages, int &pageLenOut) {
+        totalPages = usedPages = triePages = 0;
+        pageLenOut = 0;
+        std::unordered_set<PagedCacheManager*> seen;
+        for (int li = 0; li < this->block_cnt; li++) {
+            for (int keyFlag = 0; keyFlag < 2; keyFlag++) {
+                for (auto &ref : this->GetPagedKVCacheManagers(li, keyFlag == 0)) {
+                    PagedCacheManager *manager = ref.second;
+                    if (manager == nullptr || !seen.insert(manager).second) {
+                        continue;
+                    }
+                    std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
+                    totalPages += (uint64_t)manager->maxPages;
+                    uint64_t freePages = (uint64_t)manager->FreePageCount();
+                    usedPages += (uint64_t)manager->maxPages -
+                                 std::min((uint64_t)manager->maxPages, freePages);
+                    triePages += (uint64_t)manager->triePages.size();
+                    if (pageLenOut == 0) {
+                        pageLenOut = manager->pageLen;
+                    }
+                }
+            }
+        }
+    }
+
     int basellm::QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const {
         (void)context;
         return maxCachedLen;
@@ -2518,6 +2544,22 @@ namespace fastllm {
         return false;
     }
 
+    std::string basellm::GetVideoPlaceholder() const {
+        return "";
+    }
+
+    bool basellm::PrepareMultimodalVideoInputs(
+            std::string &prompt,
+            const std::vector<MultimodalVideo> &videos,
+            std::map<std::string, std::vector<Data*> > &multimodalInput,
+            std::string &error) const {
+        (void)prompt;
+        (void)videos;
+        multimodalInput.clear();
+        error = "the loaded model does not support native video inputs";
+        return false;
+    }
+
     void basellm::NewMainLoop() {
         RunNewMainLoop(false);
     }
@@ -3425,7 +3467,11 @@ namespace fastllm {
                                             ctx->currentTokens.begin(),
                                             ctx->currentTokens.begin() + cachedLen);
                                         ctx->cacheLen = cachedLen;
-                                    } else {
+                                        int totalTok = cachedLen + (int)ctx->currentTokens.size();
+                                        printf("[Handle %d] prefix-cache HIT(mem-trie): %d/%d tok (%.0f%%)\n",
+                                               ii.handle, cachedLen, totalTok,
+                                               totalTok > 0 ? 100.0 * cachedLen / totalTok : 0.0);
+                                        fflush(stdout);
                                         // A prefix hit is useful only when its
                                         // complete model state can be restored.
                                         // Drop any model-specific partial state

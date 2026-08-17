@@ -4565,6 +4565,65 @@ namespace fastllm {
             ((GraphLLMModel*)model)->graphLLMModelConfig->Init(modelConfig);
         }
         AddDictRecursion(model, "", config);
+        // 原生图像/视频预处理配置:Qwen3-VL 系的 preprocessor_config.json /
+        // video_preprocessor_config.json 是处理器权威来源,映射为
+        // vision_config.* 字典项供模型 InitParams 消费;文件缺失时保留默认。
+        // 两者的 size 预算不同(图像 65536~16777216 / 视频 4096~25165824 像素),
+        // 分别写入 image_min/max_pixels 与 video_min/max_pixels。
+        for (const char *preprocName :
+             {"preprocessor_config.json", "video_preprocessor_config.json"}) {
+            const bool isVideoPreproc =
+                std::string(preprocName).find("video") != std::string::npos;
+            const char *minPixelsKey = isVideoPreproc
+                ? "vision_config.video_min_pixels"
+                : "vision_config.image_min_pixels";
+            const char *maxPixelsKey = isVideoPreproc
+                ? "vision_config.video_max_pixels"
+                : "vision_config.image_max_pixels";
+            std::string preprocError;
+            std::string preprocFile = path + preprocName;
+            if (!FileExists(preprocFile)) {
+                continue;
+            }
+            auto preproc = json11::Json::parse(
+                ReadAllFile(preprocFile), preprocError);
+            if (!preprocError.empty()) {
+                continue;
+            }
+            auto putInt = [&](const char *key, const char *dictKey) {
+                if (preproc[key].is_number()) {
+                    model->weight.AddDict(
+                        dictKey,
+                        std::to_string((int)preproc[key].number_value()));
+                }
+            };
+            auto putFloatArray = [&](const char *key, const char *dictKey) {
+                if (preproc[key].is_array()) {
+                    model->weight.AddDict(dictKey, preproc[key].dump());
+                }
+            };
+            if (!preproc["size"].is_null()) {
+                auto size = preproc["size"];
+                if (size["shortest_edge"].is_number()) {
+                    model->weight.AddDict(
+                        minPixelsKey,
+                        std::to_string(
+                            (int)size["shortest_edge"].number_value()));
+                }
+                if (size["longest_edge"].is_number()) {
+                    model->weight.AddDict(
+                        maxPixelsKey,
+                        std::to_string(
+                            (int)size["longest_edge"].number_value()));
+                }
+            }
+            putInt("patch_size", "vision_config.patch_size");
+            putInt("temporal_patch_size",
+                   "vision_config.temporal_patch_size");
+            putInt("merge_size", "vision_config.spatial_merge_size");
+            putFloatArray("image_mean", "vision_config.image_mean");
+            putFloatArray("image_std", "vision_config.image_std");
+        }
         if (!dsparkPath.empty()) {
             AssertInFastLLM(
                 model->model_type == "kimi_k3" || modelType == "kimi_k3",

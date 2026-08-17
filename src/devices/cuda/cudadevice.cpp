@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -9034,36 +9035,39 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             // 可能与其它分配器状态冲突（CUDA 700 非法地址）。
             pagedData = (uint8_t*)pagedKVCache->cudaData;
             {
-                // 诊断：定位 CUDA 700 非法地址是页号越界还是源/目标指针失效
-                int minPg = appendPages[0], maxPg = appendPages[0];
-                for (int p : appendPages) {
-                    minPg = std::min(minPg, p);
-                    maxPg = std::max(maxPg, p);
+                // 诊断(采样):KV>262K 崩溃定位期保留,生产每 512 次打一次,
+                // 避免 ValidatePointerRange 与日志成为热路径开销
+                static std::atomic<uint64_t> multiPageLogCounter{0};
+                if ((multiPageLogCounter.fetch_add(
+                         1, std::memory_order_relaxed) % 512) == 0) {
+                    int minPg = appendPages[0], maxPg = appendPages[0];
+                    for (int p : appendPages) {
+                        minPg = std::min(minPg, p);
+                        maxPg = std::max(maxPg, p);
+                    }
+                    size_t poolBytes = (size_t)maxPages * pageLen *
+                        numHeads * headDim * pagedKVCache->unitSize;
+                    size_t inputBytes = (size_t)seqLen * numHeads *
+                        headDim * input.unitSize;
+                    printf("[PagedCache] multi-page launch(sampled): pages=%zu [%d,%d] "
+                           "maxPages=%d dims0=%d pagedValid=%d inputValid=%d "
+                           "pagedData=%p inputData=%p seqLen=%d numHeads=%d "
+                           "headDim=%d pageLen=%d unitSize=%d inputUnit=%d "
+                           "mgr=%p cachePages=%zu lastPageLen=%d "
+                           "poolKbytes=%zu\n",
+                           appendPages.size(), minPg, maxPg, maxPages,
+                           pagedKVCache->dims[0],
+                           (int)FastllmCudaValidatePointerRange(
+                               pagedData, poolBytes, 0),
+                           (int)FastllmCudaValidatePointerRange(
+                               inputData, inputBytes, 0),
+                           pagedData, inputData, seqLen, numHeads, headDim,
+                           pageLen, pagedKVCache->unitSize, input.unitSize,
+                           (void*)pagedKVCache, cache.pageIndex.size(),
+                           cache.lastPageLen,
+                           pagedKVCache->GetBytes() / 1024);
+                    fflush(stdout);
                 }
-                size_t poolBytes = (size_t)maxPages * pageLen *
-                    numHeads * headDim * pagedKVCache->unitSize;
-                size_t inputBytes = (size_t)seqLen * numHeads *
-                    headDim * input.unitSize;
-                printf("[PagedCache] multi-page launch: pages=%zu [%d,%d] "
-                       "maxPages=%d dims0=%d pagedValid=%d inputValid=%d "
-                       "pagedData=%p inputData=%p seqLen=%d numHeads=%d "
-                       "headDim=%d pageLen=%d unitSize=%d inputUnit=%d "
-                       "mgr=%p cachePages=%zu lastPageLen=%d\n",
-                       appendPages.size(), minPg, maxPg, maxPages,
-                       pagedKVCache->dims[0],
-                       (int)FastllmCudaValidatePointerRange(
-                           pagedData, poolBytes, 0),
-                       (int)FastllmCudaValidatePointerRange(
-                           inputData, inputBytes, 0),
-                       pagedData, inputData, seqLen, numHeads, headDim,
-                       pageLen, pagedKVCache->unitSize, input.unitSize,
-                       (void*)pagedKVCache, cache.pageIndex.size(),
-                       cache.lastPageLen);
-                printf("[PagedCache] pool dims=[%d,%d,%d,%d] kbytes=%zu\n",
-                       pagedKVCache->dims[0], pagedKVCache->dims[1],
-                       pagedKVCache->dims[2], pagedKVCache->dims[3],
-                       pagedKVCache->GetBytes());
-                fflush(stdout);
             }
             bool launched = FastllmCudaPagedCacheCopyMultiPage(
                 pagedData, appendPages.data(), (int)appendPages.size(),
