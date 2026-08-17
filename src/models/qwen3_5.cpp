@@ -20689,9 +20689,11 @@ namespace fastllm {
                     tokenContexts.push_back(ctx);
                     handles.push_back(ii.handle);
                     generationConfigs.push_back(ctx->generationConfig);
+                    model->PrepareToolCallConstraint(ctx, generationConfigs.back());
                     logits.push_back(createPendingResultLogits(ctx->generationConfig));
                     selectedNeedLastTokens |= Qwen35NeedRepeatPenalty(ctx->generationConfig) ||
-                                              ctx->generationConfig.output_logits;
+                                              ctx->generationConfig.output_logits ||
+                                              !generationConfigs.back().tool_call_allowed_token_ids.empty();
                     selectedIsPrompt = isPrompt != 0;
                     selectedMultimodal = isMultimodal;
                     if (isPrompt) {
@@ -21765,6 +21767,11 @@ namespace fastllm {
                         int matchedStopLength = PushStopToken(
                             ctx->generationConfig.stop_token_sequences,
                             ctx->pendingStopTokens, curRet, readyTokens);
+                        // 约束状态必须随每个被接受的投机 token 推进——
+                        // 缺了这一步, toolCallConstraintGeneratedText 永远为空,
+                        // PrepareToolCallConstraint 的所有分支静默失效,
+                        // 且 allowedIds 恒空导致 MTP 禁用检查永不触发。
+                        model->UpdateToolCallConstraintState(ctx, curRet);
                         for (int readyIndex = 0;
                              readyIndex < (int)readyTokens.size();
                              readyIndex++) {
