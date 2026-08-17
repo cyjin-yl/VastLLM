@@ -156,13 +156,17 @@ namespace {
             return false;
         }
         if (pid == 0) {
+            // 子进程跑系统 ffmpeg/ffprobe;apiserver 继承的
+            // LD_LIBRARY_PATH(如 conda env lib)会让它们加载到
+            // 不兼容的系统库(libpangoft2/libfontconfig 符号缺失)。
+            // 仅清子进程环境,不影响 apiserver 自身。
+            unsetenv("LD_LIBRARY_PATH");
             dup2(pipeFd[1], STDOUT_FILENO);
+            // stderr 并入同一管道:ffprobe/ffmpeg 失败原因必须可见,
+            // 之前丢进 /dev/null 导致线上只能看到 "exited abnormally"。
+            dup2(pipeFd[1], STDERR_FILENO);
             close(pipeFd[0]);
             close(pipeFd[1]);
-            int devNull = open("/dev/null", O_WRONLY);
-            if (devNull >= 0) {
-                dup2(devNull, STDERR_FILENO);
-            }
             std::vector<char*> args;
             for (const auto &s : argv) {
                 args.push_back(const_cast<char*>(s.c_str()));
@@ -196,6 +200,13 @@ namespace {
         }
         if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
             error = argv[0] + " exited abnormally";
+            if (!out.empty()) {
+                // 附带子进程 stdout/stderr 尾部,便于定位失败原因
+                size_t tailStart = out.size() > 384 ? out.size() - 384 : 0;
+                error += ": ";
+                error.append(reinterpret_cast<const char*>(out.data() + tailStart),
+                             out.size() - tailStart);
+            }
             return false;
         }
         return true;

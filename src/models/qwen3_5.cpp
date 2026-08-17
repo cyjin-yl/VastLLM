@@ -7893,10 +7893,26 @@ namespace fastllm {
         for (size_t videoIndex = 0; videoIndex < videos.size(); videoIndex++) {
             const size_t position =
                 expandedPrompt.find(videoToken, searchFrom);
+            // 引擎 mrope 侧按"每帧一段"校验和编码(时间维靠段间 currentPos
+            // 推进表达):一个视频展开为 gridT 段,每段 perFrame 个占位符,
+            // 段间插入 <|vision_end|><|vision_start|> 对打断连续段,
+            // 否则 mmTypes 扫描会把整段并成一段,与 repeated grid_thw
+            // 列表逐项消耗对不上而 assert 崩溃。
+            const int gridT = (videos[videoIndex].frameCount +
+                               vision_temporal_patch_size - 1) /
+                              vision_temporal_patch_size;
+            const size_t perFrame = tokenCounts[videoIndex] /
+                                    (size_t) std::max(1, gridT);
             std::string replacement;
-            replacement.reserve(tokenCounts[videoIndex] * videoToken.size());
-            for (size_t token = 0; token < tokenCounts[videoIndex]; token++) {
-                replacement += videoToken;
+            replacement.reserve(tokenCounts[videoIndex] * videoToken.size() +
+                                (size_t) gridT * 40);
+            for (int t = 0; t < gridT; t++) {
+                if (t > 0) {
+                    replacement += "<|vision_end|><|vision_start|>";
+                }
+                for (size_t token = 0; token < perFrame; token++) {
+                    replacement += videoToken;
+                }
             }
             expandedPrompt.replace(
                 position, videoToken.size(), replacement);

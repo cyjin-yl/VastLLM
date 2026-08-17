@@ -1444,6 +1444,8 @@ struct WorkQueue {
                 videos.reserve(parsedChatInput.videoUrls.size());
                 for (const auto &url : parsedChatInput.videoUrls) {
                     OpenAIDecodedVideo decoded;
+                    printf("[video] LoadOpenAIVideoUrl begin (url len=%zu)\n", url.size());
+                    fflush(stdout);
                     if (!LoadOpenAIVideoUrl(url, decoded, node->error)) {
                         writeJsonAndClose(
                             400, OpenAIHttpError(
@@ -1451,6 +1453,10 @@ struct WorkQueue {
                                 "invalid_video_url"));
                         return;
                     }
+                    printf("[video] decoded: %dx%d frames=%d rgb=%zu bytes\n",
+                           decoded.width, decoded.height, decoded.frameCount,
+                           decoded.rgb.size());
+                    fflush(stdout);
                     fastllm::MultimodalVideo video;
                     video.width = decoded.width;
                     video.height = decoded.height;
@@ -1467,6 +1473,9 @@ struct WorkQueue {
                             "invalid_multimodal_input"));
                     return;
                 }
+                printf("[video] PrepareMultimodalVideoInputs ok, prompt len=%zu\n",
+                       prompt.size());
+                fflush(stdout);
             }
             fastllm::Data inputs = model->weight.tokenizer.Encode(prompt);
             std::vector<int> tokens;
