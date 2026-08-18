@@ -3321,7 +3321,14 @@ namespace fastllm {
                 int grown = GetPagedCacheGrowthTarget(
                     manager->dims[0], manager->maxPages,
                     it.second - freePages);
-                manager->Grow(grown);
+                // 与 qwen3_5 调度器一致：扩容失败 -> 下沉冷前缀 -> 重试 ->
+                // 仍不够就报短缺(调度器排队),不抛错。
+                if (!manager->TryGrow(grown)) {
+                    manager->DemoteColdTriePages(it.second - freePages);
+                    if (!manager->TryGrow(grown)) {
+                        return true;
+                    }
+                }
             }
             return false;
         };

@@ -1977,6 +1977,10 @@ namespace {
                 "FASTLLM_PREFIX_CACHE_DISK_MIN_FREE_BYTES", "0");
             ScopedEnvVar diskLimit(
                 "FASTLLM_PREFIX_CACHE_DISK_MAX_BYTES", "1048576");
+            // 降级链是 VRAM -> RAM -> disk：disk 只在 RAM 层放不下时接手。
+            // 把 CPU 层预算压到 1 字节来构造"RAM 满"的情形。
+            ScopedEnvVar cpuFull(
+                "FASTLLM_PREFIX_CACHE_CPU_MAX_BYTES", "1");
             ScopedEnvVar diskRate(
                 "FASTLLM_PREFIX_CACHE_DISK_READ_MBPS", "300");
             ScopedEnvVar recomputeRate(
@@ -2075,6 +2079,115 @@ namespace {
                 fastllm::GetPagedPrefixCacheDiskLiveBytes() ==
                     liveBytesBefore,
                 "paged prefix disk tier did not release dead extents.");
+        }
+#endif
+#ifndef _WIN32
+        {
+            // RAM 优先：CPU 层有余量时不应该先写盘。
+            ScopedTempDirectory diskDirectory(
+                "fastllm-prefix-cache-ramfirst-");
+            const std::string diskPath =
+                diskDirectory.Path().string();
+            ScopedEnvVar tierEnabled(
+                "FASTLLM_PREFIX_CACHE_CPU_TIER", "1");
+            ScopedEnvVar diskTier(
+                "FASTLLM_PREFIX_CACHE_DISK_DIR", diskPath.c_str());
+            ScopedEnvVar minHits(
+                "FASTLLM_PREFIX_CACHE_MIN_HITS", "0");
+            ScopedEnvVar minTokens(
+                "FASTLLM_PREFIX_CACHE_MIN_TOKENS", "0");
+            ScopedEnvVar diskMinHits(
+                "FASTLLM_PREFIX_CACHE_DISK_MIN_HITS", "0");
+            ScopedEnvVar diskMinTokens(
+                "FASTLLM_PREFIX_CACHE_DISK_MIN_TOKENS", "0");
+            ScopedEnvVar diskFree(
+                "FASTLLM_PREFIX_CACHE_DISK_MIN_FREE_BYTES", "0");
+            ScopedEnvVar cpuLimit(
+                "FASTLLM_PREFIX_CACHE_CPU_MAX_BYTES", "1048576");
+            ScopedEnvVar zstd(
+                "FASTLLM_PREFIX_CACHE_ZSTD", "0");
+            const uint64_t diskWritesBefore =
+                fastllm::GetPagedPrefixCacheDiskWriteBytes();
+            const uint64_t cpuBytesBefore =
+                fastllm::GetPagedPrefixCacheCpuTierBytes();
+            {
+                fastllm::PagedCacheManager manager;
+                manager.pageLen = 2;
+                manager.dataType = fastllm::DataType::INT8;
+                manager.dataDevice = fastllm::DataDevice::CPU;
+                manager.UpdateUnitSize();
+                manager.Resize({1, 2, 1, 1});
+                manager.Allocate();
+                manager.SetMaxPages(1);
+                const int first = manager.GetUnusedPageIndex(true);
+                manager.cpuData[0] = 7;
+                manager.cpuData[1] = 8;
+                manager.Record({81, 82}, {first});
+                manager.ReleasePageIndex(first);
+                auto rootIt = manager.trieRoot->children.find(
+                    fastllm::PagedCacheManager::HashTokenPage(
+                        std::vector<int>({81, 82}).data(), 2));
+                Expect(
+                    rootIt != manager.trieRoot->children.end() &&
+                        manager.PageOutTrieNode(rootIt->second),
+                    "paged prefix tier demote failed with RAM headroom.");
+                Expect(
+                    rootIt->second->tierPayload != nullptr &&
+                        rootIt->second->tierDisk == nullptr,
+                    "paged prefix demote skipped the RAM tier and went "
+                    "straight to disk.");
+            }
+            Expect(
+                fastllm::GetPagedPrefixCacheDiskWriteBytes() ==
+                    diskWritesBefore,
+                "paged prefix demote wrote to disk while RAM had room.");
+            Expect(
+                fastllm::GetPagedPrefixCacheCpuTierBytes() ==
+                    cpuBytesBefore,
+                "paged prefix RAM tier leaked accounted bytes.");
+        }
+        {
+            // 主动下沉：DemoteColdTriePages 把最冷的 Trie 页搬到 L2,
+            // 物理页归还 freePages,Trie 命中仍然成立(回捞)。
+            ScopedEnvVar tierEnabled(
+                "FASTLLM_PREFIX_CACHE_CPU_TIER", "1");
+            ScopedEnvVar minHits(
+                "FASTLLM_PREFIX_CACHE_MIN_HITS", "0");
+            ScopedEnvVar minTokens(
+                "FASTLLM_PREFIX_CACHE_MIN_TOKENS", "0");
+            ScopedEnvVar zstd(
+                "FASTLLM_PREFIX_CACHE_ZSTD", "0");
+            ScopedEnvVar cpuLimit(
+                "FASTLLM_PREFIX_CACHE_CPU_MAX_BYTES", "1048576");
+            fastllm::PagedCacheManager manager;
+            manager.pageLen = 2;
+            manager.dataType = fastllm::DataType::INT8;
+            manager.dataDevice = fastllm::DataDevice::CPU;
+            manager.UpdateUnitSize();
+            manager.Resize({2, 2, 1, 1});
+            manager.Allocate();
+            manager.SetMaxPages(2);
+            const int a = manager.GetUnusedPageIndex(true);
+            manager.cpuData[a * 2] = 91;
+            manager.cpuData[a * 2 + 1] = 92;
+            manager.Record({11, 12}, {a});
+            manager.ReleasePageIndex(a);
+            const int freeBefore = (int)manager.freePages.size();
+            const int demoted = manager.DemoteColdTriePages(1);
+            Expect(
+                demoted == 1,
+                "DemoteColdTriePages did not sink a cold trie page.");
+            Expect(
+                (int)manager.freePages.size() == freeBefore + 1,
+                "DemoteColdTriePages did not return the physical page.");
+            std::memset(manager.cpuData, 0, manager.GetBytes());
+            std::vector<int> restored;
+            manager.Query({11, 12}, restored);
+            Expect(
+                restored.size() == 1 &&
+                    manager.cpuData[restored[0] * 2] == 91 &&
+                    manager.cpuData[restored[0] * 2 + 1] == 92,
+                "DemoteColdTriePages lost the demoted page content.");
         }
 #endif
         fastllm::ObservePagedPrefixCacheRecompute(1600, 2.0);

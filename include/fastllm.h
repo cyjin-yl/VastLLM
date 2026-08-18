@@ -758,6 +758,15 @@ namespace fastllm {
             // 物理页号保持不变（pageIndex 无需迁移），新页加入空闲池。
             // 与 SetMaxPages 不同，Grow 保留已用页的引用/Trie 状态。
             void Grow(int newMaxPages);
+            // 非抛出版扩容。返回 false 表示"现在长不了"(显存瞬时不足 /
+            // 触到 FASTLLM_PAGED_POOL_MAX_MB 预算),调用方应当让该请求
+            // 排队等待下一轮调度,而不是抛错 -> 500。
+            bool TryGrow(int newMaxPages, std::string *error = nullptr);
+            // 把最冷的、未被引用的 Trie 页下沉到 CPU/disk 层,
+            // 物理页归还 freePages。返回实际下沉成功的页数。
+            // wantPages<=0 时按 freePages 缺口自适应。
+            int DemoteColdTriePages(int wantPages);
+            int DemoteColdTriePagesLocked(int wantPages);
             int GetUnusedPageIndex(bool pick);
             void EvictTrieSubtree(CacheTrieNode *node);
             int GetUnusedPageIndexLocked(
@@ -943,6 +952,8 @@ namespace fastllm {
         uint64_t evictTrieNodes = 0;      // EvictTrieSubtree 逐出的节点数
         uint64_t evictCpuTierCalls = 0;   // EvictCpuTierPayloads 调用次数
         uint64_t evictCpuTierBytes = 0;   // CPU 层逐出释放字节
+        uint64_t evictDemotePages = 0;    // 主动下沉到 L2/L3 的页数
+        uint64_t evictHardDropNodes = 0;  // 下沉失败被直接销毁的 Trie 节点
         // 层占用快照(调用 Get 时采样, 非累计)
         uint64_t memTrieResidentBytes = 0;
         uint64_t cpuTierResidentBytes = 0;

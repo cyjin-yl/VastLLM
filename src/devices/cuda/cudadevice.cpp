@@ -8963,7 +8963,16 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             int grownMaxPages = GetPagedCacheGrowthTarget(
                 maxPages, pagedManager->maxPages,
                 totalNeededPages - maxPages);
-            pagedManager->Grow(grownMaxPages);
+            // 前向途中已经无法排队了，但仍先试着把冷前缀下沉换页；
+            // 真失败才抛（由 MTPLoop/mainLoop 顶层 catch 兜住这一批）。
+            std::string growError;
+            if (!pagedManager->TryGrow(grownMaxPages, &growError)) {
+                pagedManager->DemoteColdTriePages(
+                    totalNeededPages - maxPages);
+                if (!pagedManager->TryGrow(grownMaxPages, &growError)) {
+                    ErrorInFastLLM(growError);
+                }
+            }
             maxPages = grownMaxPages;
         }
 
