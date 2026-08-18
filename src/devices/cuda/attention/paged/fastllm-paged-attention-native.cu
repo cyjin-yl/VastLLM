@@ -1470,7 +1470,8 @@ __device__ __forceinline__ void FastllmPagedGqaAttnKvRange(
 __global__ void __launch_bounds__(128, 2) FastllmSm70PagedXqaSplitKernel(
     const half *qd, const half *pagedK, const half *pagedV, float *scratch,
     const int32_t *qSizes, const int32_t *pageSizes, const int32_t *pageIndexs,
-    const int32_t *lastPageLens, int qStrideH, int qStrideN, float scale, int splits) {
+    const int32_t *lastPageLens, int qStrideH, int qStrideN, float scale, int splits,
+    int totalPageSlots, int maxPages) {
     constexpr int kH = 24;
     constexpr int kGroup = 6;
     constexpr int kNumKvHeads = 4;
@@ -1488,8 +1489,17 @@ __global__ void __launch_bounds__(128, 2) FastllmSm70PagedXqaSplitKernel(
     int tokenStart = qSizes[batch];
     int qoLen = qSizes[batch + 1] - tokenStart;
     int pageStart = pageSizes[batch];
-    int numPages = pageSizes[batch + 1] - pageStart;
-    int kvLen = numPages > 0 ? (numPages - 1) * kPageLen + lastPageLens[batch] : 0;
+    int pageEnd = pageSizes[batch + 1];
+    int numPages = pageEnd - pageStart;
+    // This entry point performs no host-side validation of the paged metadata, and the
+    // metadata itself may have been produced on the device (fillLastPageLensOnDevice).
+    // Clamp lastPageLen to [0, kPageLen] so kvLen <= numPages * kPageLen, which is what
+    // keeps every page-table lookup below inside this request's slice.
+    int lastLen = min(max(lastPageLens[batch], 0), kPageLen);
+    if (pageStart < 0 || pageEnd > totalPageSlots) {
+        numPages = 0;
+    }
+    int kvLen = numPages > 0 ? (numPages - 1) * kPageLen + lastLen : 0;
     int chunk = kvLen > 0 ? (kvLen + splits - 1) / splits : 0;
     int kvStart = split * chunk;
     int kvEnd = min(kvStart + chunk, kvLen);
@@ -1542,10 +1552,18 @@ __global__ void __launch_bounds__(128, 2) FastllmSm70PagedXqaSplitKernel(
     const float scaleLog2 = scale * 1.4426950408889634f;
 
     for (int j = kvStart + warp; j < kvEnd; j += kWarps) {
-        size_t base = linearKv
-            ? (size_t)j * tokenStride + kvHeadOffset
-            : FastllmPagedKvTokenBase(j, pageStart, kPageLen, numPages, pageIndexs,
-                                      pageStride, tokenStride, kvHeadOffset);
+        size_t base;
+        if (linearKv) {
+            base = (size_t)j * tokenStride + kvHeadOffset;
+        } else {
+            int pageListIdx = j / kPageLen;
+            int physicalPage = pageIndexs[pageStart + pageListIdx];
+            if (physicalPage < 0 || physicalPage >= maxPages) {
+                continue;
+            }
+            base = (size_t)physicalPage * pageStride
+                 + (size_t)(j - pageListIdx * kPageLen) * tokenStride + kvHeadOffset;
+        }
         float kreg[kDimsPerLane], vreg[kDimsPerLane];
         FastllmKvLoad4Contig<half>(pagedK + base, d0, kHeadDim, kreg);
         FastllmKvLoad4Contig<half>(pagedK + base, d0 + 4, kHeadDim, kreg + 4);
@@ -2066,7 +2084,8 @@ bool FastllmCudaTrySm70PagedAttentionDecode(
         (const half*)pagedV->cudaData, scratch,
         (const int32_t*)qSizes.cudaData, (const int32_t*)pageSizes.cudaData,
         (const int32_t*)pageIndexs.cudaData, (const int32_t*)lastPageLens.cudaData,
-        (int)q.strides[0], (int)q.strides[1], scale, splits);
+        (int)q.strides[0], (int)q.strides[1], scale, splits,
+        (int)pageIndexs.dims[0], (int)pagedK->dims[0]);
     if (cudaGetLastError() != cudaSuccess) {
         return false;
     }
