@@ -713,6 +713,10 @@ if (UNIT_TEST)
         add_executable(customAllReduceRegression test/ops/customAllReduceRegression.cpp)
         target_link_libraries(customAllReduceRegression fastllm)
         target_include_directories(customAllReduceRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+
+        add_executable(sm70FlashAttentionPagedRegression test/ops/sm70FlashAttentionPagedRegression.cpp)
+        target_link_libraries(sm70FlashAttentionPagedRegression fastllm)
+        target_include_directories(sm70FlashAttentionPagedRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     endif()
 endif()
 

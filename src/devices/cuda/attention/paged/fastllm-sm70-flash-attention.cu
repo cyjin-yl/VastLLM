@@ -338,6 +338,37 @@ bool MetaWithinKernelLimits(const std::vector<int32_t> &qSizesHost,
     return true;
 }
 
+// Diagnostic only: report when Data::cpuIntDatas disagrees with the device buffers the
+// kernel reads.  This is the divergence that used to walk the prefill kernel off the page
+// table; keep it observable so a regression is noticed instead of crashing the process.
+void ReportMirrorSkew(const fastllm::Data &qSizes, const fastllm::Data &pageSizes,
+                      const fastllm::Data &lastPageLens, int batch,
+                      const Sm70PagedMeta &deviceMeta) {
+    const char *value = std::getenv("FASTLLM_CUDA_SM70_FLASH_ATTN_DEBUG");
+    if (value == nullptr || std::strcmp(value, "0") == 0) {
+        return;
+    }
+    static thread_local long long reported = 0;
+    for (int i = 0; i <= batch; ++i) {
+        const bool qBad = i < (int)qSizes.cpuIntDatas.size()
+            && qSizes.cpuIntDatas[i] != deviceMeta.qSizes[i];
+        const bool pBad = i < (int)pageSizes.cpuIntDatas.size()
+            && pageSizes.cpuIntDatas[i] != deviceMeta.pageSizes[i];
+        const bool lBad = i < batch && i < (int)lastPageLens.cpuIntDatas.size()
+            && lastPageLens.cpuIntDatas[i] != deviceMeta.lastPageLens[i];
+        if ((qBad || pBad || lBad) && reported < 64) {
+            ++reported;
+            std::printf("[FastLLM] SM70 prefill metadata mirror skew at index %d: "
+                        "qSizes host=%d dev=%d | pageSizes host=%d dev=%d | "
+                        "lastPageLens host=%d dev=%d\n",
+                        i, qSizes.cpuIntDatas[i], deviceMeta.qSizes[i],
+                        pageSizes.cpuIntDatas[i], deviceMeta.pageSizes[i],
+                        i < batch ? lastPageLens.cpuIntDatas[i] : -1,
+                        i < batch ? deviceMeta.lastPageLens[i] : -1);
+        }
+    }
+}
+
 bool IsCudaInt32Vector(const fastllm::Data &data) {
     return data.dataType == fastllm::DataType::INT32
         && data.dataDevice == fastllm::DataDevice::CUDA
@@ -447,10 +478,13 @@ bool FastllmCudaTrySm70FlashAttentionPrefill(
     // shape from reaching a kernel that the mirror said was short.
     if (StrictDeviceCheckEnabled()) {
         Sm70PagedMeta deviceMeta;
-        if (!FetchDeviceMeta(qSizes, pageSizes, lastPageLens, batch, deviceMeta)
-            || !MetaWithinKernelLimits(deviceMeta.qSizes, deviceMeta.pageSizes,
-                                       deviceMeta.lastPageLens, batch, (int)q.dims[1],
-                                       (int)pageIndexs.dims[0], maxKvTokens)) {
+        if (!FetchDeviceMeta(qSizes, pageSizes, lastPageLens, batch, deviceMeta)) {
+            return false;
+        }
+        ReportMirrorSkew(qSizes, pageSizes, lastPageLens, batch, deviceMeta);
+        if (!MetaWithinKernelLimits(deviceMeta.qSizes, deviceMeta.pageSizes,
+                                    deviceMeta.lastPageLens, batch, (int)q.dims[1],
+                                    (int)pageIndexs.dims[0], maxKvTokens)) {
             return false;
         }
     }
