@@ -406,6 +406,15 @@ struct WorkNode {
     }
 };
 
+// close 后置 -1：请求线程异常退出路径需要知道 socket 是否已关闭,
+// 避免对已复用的 fd 二次 close。
+static void CloseNodeClient(WorkNode *node) {
+    if (node != nullptr && node->client >= 0) {
+        CloseNodeClient(node);
+        node->client = -1;
+    }
+}
+
 struct WorkQueue {
     std::unique_ptr<fastllm::basellm> model;
     int maxActivateQueryNumber = 256;
@@ -588,18 +597,45 @@ struct WorkQueue {
                     printf("totalQueryNumber = %d\n",
                            ts->totalQueryNumber);
                     std::thread([ts](WorkNode *now) {
-                        std::string route = now->request.route;
-                        if (route.size() > 1 && route.back() == '/') {
-                            route.pop_back();
-                        }
-                        const bool mayMutatePrefixCache =
-                            now->request.method == "POST" &&
-                            (route == "/generate" ||
-                             route == "/v1/chat/completions");
-                        ts->Deal(now);
-                        if (mayMutatePrefixCache) {
-                            ts->cacheMutationEpoch.fetch_add(
-                                1, std::memory_order_relaxed);
+                        // 请求线程兜底:Deal 内任何异常(如 KV 页池 Grow OOM)
+                        // 不得逃逸——detached 线程异常 = std::terminate 全进程自杀。
+                        // 记 500 + 关闭连接,调度簿记照常,进程继续服务。
+                        try {
+                            std::string route = now->request.route;
+                            if (route.size() > 1 && route.back() == '/') {
+                                route.pop_back();
+                            }
+                            const bool mayMutatePrefixCache =
+                                now->request.method == "POST" &&
+                                (route == "/generate" ||
+                                 route == "/v1/chat/completions");
+                            ts->Deal(now);
+                            if (mayMutatePrefixCache) {
+                                ts->cacheMutationEpoch.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            }
+                        } catch (const std::exception &exc) {
+                            fprintf(stderr,
+                                    "[WorkQueue] request thread exception: %s\n",
+                                    exc.what());
+                            if (now->client >= 0) {
+                                WriteFixedJsonResponse(
+                                    now->client, 500,
+                                    OpenAIHttpError(
+                                        std::string("internal error: ") +
+                                            exc.what(),
+                                        "server_error", "internal_error"));
+                            }
+                        } catch (...) {
+                            fprintf(stderr,
+                                    "[WorkQueue] request thread unknown exception\n");
+                            if (now->client >= 0) {
+                                WriteFixedJsonResponse(
+                                    now->client, 500,
+                                    OpenAIHttpError(
+                                        "internal error", "server_error",
+                                        "internal_error"));
+                            }
                         }
                         printf("Response client %d finish\n",
                                now->client);
@@ -652,7 +688,7 @@ struct WorkQueue {
         auto writeJsonAndClose = [&](int status, const json11::Json &body,
                                      const std::vector<std::pair<std::string, std::string>> &headers = {}) {
             WriteFixedJsonResponse(node->client, status, body, headers);
-            close(node->client);
+            CloseNodeClient(node);
         };
         auto writeMethodNotAllowed = [&](const std::string &allowed) {
             writeJsonAndClose(
@@ -1422,7 +1458,7 @@ struct WorkQueue {
                 node->client,
                 BuildFixedHttpResponse(
                     200, output, "text/plain; charset=utf-8"));
-            close(node->client);
+            CloseNodeClient(node);
         } else if (chatRoute) {
             std::string message;
 
@@ -1756,7 +1792,7 @@ struct WorkQueue {
 
                 auto abortDisconnectedStream = [&]() {
                     model->AbortResponse(handleId);
-                    close(node->client);
+                    CloseNodeClient(node);
                 };
                 if (!WriteAllToSocket(node->client, message)) {
                     abortDisconnectedStream();
@@ -1847,7 +1883,7 @@ struct WorkQueue {
                         FlushPendingStopText(pendingStopText, trailingText);
                         if (!sendParsedDelta(outputParser.Push(trailingText)) ||
                             !sendParsedDelta(outputParser.Flush())) {
-                            close(node->client);
+                            CloseNodeClient(node);
                             return;
                         }
                         json11::Json finishResult = json11::Json::object {
@@ -1877,7 +1913,7 @@ struct WorkQueue {
                         };
                         if (!WriteHttpChunk(node->client,
                                 FormatSseData(compactJsonDump(finishResult)))) {
-                            close(node->client);
+                            CloseNodeClient(node);
                             return;
                         }
                         break;
@@ -1918,10 +1954,10 @@ struct WorkQueue {
 
                 if (!WriteHttpChunk(node->client, FormatSseData("[DONE]")) ||
                     !WriteAllToSocket(node->client, "0\r\n\r\n", 5)) {
-                    close(node->client);
+                    CloseNodeClient(node);
                     return;
                 }
-                close(node->client);
+                CloseNodeClient(node);
             } else {
                 int outputTokens = 0;
                 std::vector<float> results;
@@ -2006,7 +2042,7 @@ struct WorkQueue {
             }
             return;
         } else {
-            close(node->client);
+            CloseNodeClient(node);
             return;
         }
     }
@@ -2188,6 +2224,25 @@ int main(int argc, char** argv) {
     workQueue.maxActivateQueryNumber = std::max(1, std::min(256, config.batch));
     workQueue.model->maxBatch = workQueue.maxActivateQueryNumber;
     PrepareServerPersistentPrefixCache(workQueue.model.get());
+    // Eagerly precreate paged-KV managers even on a cold start.  Prefix
+    // queries run BEFORE the first prefill, but managers used to be created
+    // lazily during that first prefill — so every generation's first
+    // request found zero managers and reported miss=other, and under the
+    // crash loop (1-2 requests per generation) the L1 trie could never
+    // serve a single hit.  Lazy page growth keeps this cheap (~128 physical
+    // pages per manager); the "~5 GB stacks with load peak" concern in the
+    // comment above predates the on-demand page pool.
+    {
+        std::string pagedPrepareError;
+        if (!workQueue.model->PreparePersistentPrefixCacheManagers(
+                &pagedPrepareError)) {
+            std::fprintf(
+                stderr,
+                "[Prefix-persist] eager paged manager precreate failed: %s\n",
+                pagedPrepareError.empty() ? "unknown error"
+                                          : pagedPrepareError.c_str());
+        }
+    }
     workQueue.ConfigureHostOffloadManager();
     // Warmup before accepting traffic: the load peak has passed, so the
     // H2D weight transfer + paged-KV sizing allocations here cannot stack
