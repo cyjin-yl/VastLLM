@@ -1050,6 +1050,16 @@ namespace fastllm {
                        this->weight.tokenizer.tokenToStringDict.size());
                 fflush(stdout);
             }
+        } else if (!allowedValues.empty()) {
+            // mask 激活但候选全灭 -> LLMSamplingBlock 按"空即不 mask"
+            // 静默降级为自由采样(409412d6 事故的隐性放大器之一)。
+            // 这里打 trace 让静默失效可观测。
+            printf("[ToolCallTrace] mask EXHAUSTED (state active, partial='%s', "
+                   "allowedValues=%zu) -> silent fallback to free sampling\n",
+                   partial.size() > 32 ? partial.substr(0, 32).c_str()
+                                       : partial.c_str(),
+                   allowedValues.size());
+            fflush(stdout);
         }
         allowedIdsOut = std::move(allowedIds);
     }

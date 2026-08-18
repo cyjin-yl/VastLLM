@@ -609,6 +609,9 @@ add_executable(quant tools/src/quant.cpp)
 target_link_libraries(quant fastllm)
 
 if (UNIT_TEST)
+    add_executable(testToolCallGrammar test/toolcallGrammarTest.cpp)
+    target_link_libraries(testToolCallGrammar fastllm)
+
     add_executable(optest test/ops/cppOps.cpp)
     target_link_libraries(optest fastllm)
     set_target_properties(optest PROPERTIES
