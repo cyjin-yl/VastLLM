@@ -8841,9 +8841,15 @@ namespace fastllm {
             return false;
         }
         int pageLen = fastllm::GetPageLen();
-        int currentLen = Qwen35CurrentTokenGrowingCacheLen(this, this->block_cnt, context->pastKeyValues);
-        if (currentLen <= 0 || currentLen > (int)context->allTokens.size() ||
-            currentLen % pageLen != 0) {
+        int currentLenRaw = Qwen35CurrentTokenGrowingCacheLen(this, this->block_cnt, context->pastKeyValues);
+        // Record the page-aligned prefix instead of rejecting unaligned tails:
+        // generation-end calls include generated tokens, so requiring
+        // currentLen % pageLen == 0 meant hybrid-agent requests never recorded
+        // anything (the whole record path is gated on this extra returning
+        // true, leaving the L1 trie permanently empty).
+        int currentLen = pageLen > 0 ? currentLenRaw - currentLenRaw % pageLen
+                                     : currentLenRaw;
+        if (currentLen <= 0 || currentLen > (int)context->allTokens.size()) {
             PrefixCacheStatsObserveRecordPath("extra-skip-len");
             return false;
         }
@@ -8891,19 +8897,27 @@ namespace fastllm {
 #ifdef USE_CUDA
             std::lock_guard<std::mutex> guard(mtpCacheMutex);
             auto mtpIt = mtpCaches.find(context);
-            if (mtpIt == mtpCaches.end() ||
-                mtpIt->second->tokens != currentLen ||
-                mtpIt->second->key.dims.size() < 2 ||
-                mtpIt->second->value.dims.size() < 2 ||
-                mtpIt->second->key.dims[1] != currentLen ||
-                mtpIt->second->value.dims[1] != currentLen ||
-                !Qwen35SnapshotCopyTensor(mtpIt->second->key, snapshot->mtpKey) ||
-                !Qwen35SnapshotCopyTensor(mtpIt->second->value, snapshot->mtpValue)) {
-                PrefixCacheStatsObserveRecordPath("extra-skip-mtp");
-                return false;
+            bool mtpSnapshotOk =
+                mtpIt != mtpCaches.end() &&
+                mtpIt->second->tokens == currentLen &&
+                mtpIt->second->key.dims.size() >= 2 &&
+                mtpIt->second->value.dims.size() >= 2 &&
+                mtpIt->second->key.dims[1] == currentLen &&
+                mtpIt->second->value.dims[1] == currentLen &&
+                Qwen35SnapshotCopyTensor(mtpIt->second->key, snapshot->mtpKey) &&
+                Qwen35SnapshotCopyTensor(mtpIt->second->value, snapshot->mtpValue);
+            if (mtpSnapshotOk) {
+                snapshot->mtpValid = true;
+                snapshot->mtpTokens = currentLen;
+            } else {
+                // Degrade instead of dropping the whole record: the MTP cache
+                // only exists once drafting starts and its length tracks
+                // unaligned generated tokens, so prefill-time and
+                // generation-end records almost never have a matching MTP
+                // snapshot. Record linear/full-attention layers anyway;
+                // restore will re-seed the MTP cache on the next draft step.
+                PrefixCacheStatsObserveRecordPath("extra-mtp-degraded");
             }
-            snapshot->mtpValid = true;
-            snapshot->mtpTokens = currentLen;
 #else
             return false;
 #endif
@@ -9103,6 +9117,13 @@ namespace fastllm {
         const Qwen35LinearPrefixSnapshot *snapshot =
             Qwen35FindLinearPrefixSnapshotLocked(
                 this, context->currentTokens, maxCachedLen, -1, requireMtp);
+        if (snapshot == nullptr && requireMtp) {
+            // Fall back to snapshots recorded without an MTP payload: the
+            // linear/full-attention prefix is still reusable, and the MTP
+            // cache is re-seeded during the first draft step after restore.
+            snapshot = Qwen35FindLinearPrefixSnapshotLocked(
+                this, context->currentTokens, maxCachedLen, -1, false);
+        }
         return snapshot == nullptr ? 0 : snapshot->cachedLen;
     }
 
@@ -9117,6 +9138,10 @@ namespace fastllm {
             std::lock_guard<std::mutex> guard(Qwen35LinearPrefixSnapshotsMutex());
             snapshot = Qwen35FindLinearPrefixSnapshotLocked(
                 this, context->currentTokens, cachedLen, cachedLen, requireMtp);
+            if (snapshot == nullptr && requireMtp) {
+                snapshot = Qwen35FindLinearPrefixSnapshotLocked(
+                    this, context->currentTokens, cachedLen, cachedLen, false);
+            }
             if (snapshot == nullptr || (int)snapshot->layers.size() < this->block_cnt) {
                 return false;
             }
@@ -9146,22 +9171,27 @@ namespace fastllm {
 #ifdef USE_CUDA
                 std::vector<int> devices;
                 std::map<int, int> ratios;
-                if (!snapshot->mtpValid || snapshot->mtpTokens != cachedLen ||
-                    !GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) ||
-                    devices.empty()) {
-                    return false;
-                }
+                bool canRestoreMtp =
+                    snapshot->mtpValid && snapshot->mtpTokens == cachedLen &&
+                    GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) &&
+                    !devices.empty();
                 std::lock_guard<std::mutex> mtpGuard(mtpCacheMutex);
                 mtpCaches.erase(context);
-                MtpKvCache &mtpCache = GetMtpCache(context);
-                if (!Qwen35RestoreMtpSnapshotTensor(
-                        snapshot->mtpKey, mtpCache.key, devices[0]) ||
-                    !Qwen35RestoreMtpSnapshotTensor(
-                        snapshot->mtpValue, mtpCache.value, devices[0])) {
-                    mtpCaches.erase(context);
-                    return false;
+                if (canRestoreMtp) {
+                    MtpKvCache &mtpCache = GetMtpCache(context);
+                    if (!Qwen35RestoreMtpSnapshotTensor(
+                            snapshot->mtpKey, mtpCache.key, devices[0]) ||
+                        !Qwen35RestoreMtpSnapshotTensor(
+                            snapshot->mtpValue, mtpCache.value, devices[0])) {
+                        mtpCaches.erase(context);
+                        return false;
+                    }
+                    mtpCache.tokens = cachedLen;
                 }
-                mtpCache.tokens = cachedLen;
+                // else: snapshot recorded without an MTP payload — the linear
+                // and full-attention layers above are already restored; the
+                // MTP cache stays empty and is re-seeded on the first draft
+                // step (decode falls back to non-draft for that step).
 #else
                 return false;
 #endif

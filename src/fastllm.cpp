@@ -7204,7 +7204,7 @@ namespace fastllm {
                (unsigned long long)reqSeq, totalTokens, hitTokens,
                hitLayer != nullptr ? hitLayer : "-",
                missReason != nullptr ? missReason : "-");
-        if (reqSeq % 64 == 0) {
+        if (reqSeq % 8 == 0) {
             PrefixCacheStats s = GetPrefixCacheStatsSnapshot();
             printf("[PrefixCache] periodic: reqs=%llu hitReqs=%llu "
                    "hitTok=%llu/%llu (mem=%llu cpu=%llu disk=%llu) "
@@ -7319,6 +7319,7 @@ namespace fastllm {
         else if (!std::strcmp(event, "extra-skip-interval")) pcExtraSkipInterval++;
         else if (!std::strcmp(event, "extra-skip-copy")) pcExtraSkipSnapshotCopy++;
         else if (!std::strcmp(event, "extra-skip-mtp")) pcExtraSkipMtp++;
+        else if (!std::strcmp(event, "extra-mtp-degraded")) pcExtraSkipMtp++;
     }
 
     PrefixCacheStats GetPrefixCacheStatsSnapshot() {
@@ -8214,6 +8215,32 @@ namespace fastllm {
         return true;
     }
 
+    // 全局 CUDA 页池物理字节账本:Grow 净增/析构扣减。
+    // FASTLLM_PAGED_POOL_MAX_MB(默认 0=不限)给所有分页 KV 池一个总预算,
+    // 防止高并发把物理池 Grow 到撞满显存(超预算 → Grow 抛错 → 该请求 500,
+    // 进程存活)。
+    static std::atomic<long long> g_pagedPoolCudaBytes{0};
+
+    void PagedCacheCudaPoolBytesAdd(long long delta) {
+        g_pagedPoolCudaBytes.fetch_add(delta, std::memory_order_relaxed);
+    }
+
+    static uint64_t PagedPoolBudgetBytes() {
+        static uint64_t cached = []() -> uint64_t {
+            const char *env = std::getenv("FASTLLM_PAGED_POOL_MAX_MB");
+            if (env == nullptr || env[0] == 0) {
+                return 0;
+            }
+            char *end = nullptr;
+            double mb = std::strtod(env, &end);
+            if (end == env || mb <= 0) {
+                return 0;
+            }
+            return (uint64_t)(mb * 1048576.0);
+        }();
+        return cached;
+    }
+
     PagedCacheManager::~PagedCacheManager() {
         std::lock_guard<std::mutex> guard(this->pageIndexLocker);
         if (this->trieRoot != nullptr) {
@@ -8223,6 +8250,10 @@ namespace fastllm {
             this->trieRoot->children.clear();
             delete this->trieRoot;
             this->trieRoot = nullptr;
+        }
+        // 物理池字节账本扣减(Grow 里累加);cudaData 由 Data 基类释放。
+        if (this->dataDevice == DataDevice::CUDA && this->cudaData != nullptr) {
+            PagedCacheCudaPoolBytesAdd(-(long long)this->GetBytes());
         }
     }
 
@@ -8279,6 +8310,36 @@ namespace fastllm {
             // capacity transition favors pointer safety over asynchronous
             // overlap and does not retain one superseded pool per layer.
             ForceDeviceSync();
+            // 预检:Grow 需要 新池+旧池 瞬时并存;显存剩余不足时早抛,
+            // 异常信息带上 free/need,便于与 nvidia-smi 对账。
+            // (失败路径由请求线程顶层 catch 兜底,进程不再 terminate。)
+            {
+                long long freeBytesLL = FastllmCudaGetFreeSize();
+                if (freeBytesLL > 0 &&
+                    (uint64_t)freeBytesLL < newBytes + oldBytes) {
+                    ErrorInFastLLM(
+                        "PagedCacheManager::Grow: insufficient free VRAM "
+                        "for pool growth (free=" +
+                        std::to_string(freeBytesLL / 1048576) +
+                        "MB, need=" +
+                        std::to_string((newBytes + oldBytes) / 1048576) +
+                        "MB).");
+                }
+                // 全局页池预算:高并发把物理池 Grow 到撞满显存前硬顶。
+                uint64_t budget = PagedPoolBudgetBytes();
+                if (budget > 0) {
+                    long long cur =
+                        g_pagedPoolCudaBytes.load(std::memory_order_relaxed);
+                    if (cur + (long long)(newBytes - oldBytes) >
+                        (long long)budget) {
+                        ErrorInFastLLM(
+                            "PagedCacheManager::Grow: paged pool budget "
+                            "exceeded (pool=" +
+                            std::to_string(cur / 1048576) + "MB, budget=" +
+                            std::to_string(budget / 1048576) + "MB).");
+                    }
+                }
+            }
             uint8_t *newData = (uint8_t*)FastllmCudaDirectMalloc(newBytes);
             if (newData == nullptr) {
                 ErrorInFastLLM(
@@ -8299,6 +8360,7 @@ namespace fastllm {
                 FastllmCudaMemset0(newData, oldBytes);
             }
             this->cudaData = newData;
+            PagedCacheCudaPoolBytesAdd((long long)(newBytes - oldBytes));
 #else
             ErrorInFastLLM(
                 "PagedCacheManager::Grow: CUDA storage is unavailable.");
