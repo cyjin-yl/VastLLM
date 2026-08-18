@@ -20203,6 +20203,13 @@ namespace fastllm {
             return gpuTokenHandoffPendingCanChain;
         };
         while (true) {
+        // NOTE: try shares the loop's indentation to keep the diff small —
+        // an exception escaping the MTP batch forward (e.g.
+        // PagedCacheManager::Grow OOM pre-check) used to cross the
+        // std::thread boundary and std::terminate the whole server, killing
+        // every in-flight agent request.  Catch here, fail the batch, keep
+        // serving.
+        try {
             if (model->isFree) {
                 clearGpuTokenHandoffPending(true);
                 break;
@@ -22135,6 +22142,34 @@ namespace fastllm {
                     model->dictCV.wait(dictLocker);
                 }
             }
+        } catch (const std::exception &batchError) {
+            fprintf(stderr,
+                    "[MTPLoop] batch forward failed: %s — aborting "
+                    "in-flight requests; process survives.\n",
+                    batchError.what());
+            try {
+                std::lock_guard<std::mutex> abortGuard(model->dictLocker);
+                for (auto &abortIt : model->responseContextDict.dicts) {
+                    if (abortIt.second != nullptr && !abortIt.second->isEnding) {
+                        abortIt.second->isAbort = true;
+                    }
+                }
+            } catch (...) {
+            }
+        } catch (...) {
+            fprintf(stderr,
+                    "[MTPLoop] batch forward failed with unknown error — "
+                    "aborting in-flight requests; process survives.\n");
+            try {
+                std::lock_guard<std::mutex> abortGuard(model->dictLocker);
+                for (auto &abortIt : model->responseContextDict.dicts) {
+                    if (abortIt.second != nullptr && !abortIt.second->isEnding) {
+                        abortIt.second->isAbort = true;
+                    }
+                }
+            } catch (...) {
+            }
+        }
         }
 #endif
     }

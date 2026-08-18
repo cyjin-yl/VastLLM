@@ -1440,6 +1440,22 @@ struct WorkQueue {
                                          "invalid_max_tokens"));
                 return;
             }
+            // Admission control: a prompt beyond the configured token pool
+            // can never be served — reject fast with a client-visible error
+            // instead of letting it prefill into pool exhaustion and take
+            // down concurrent requests.
+            if (::config.tokens > 0 &&
+                (long long)tokens.size() >= (long long)::config.tokens) {
+                writeJsonAndClose(
+                    400, OpenAIHttpError(
+                             "prompt is " + std::to_string(tokens.size()) +
+                                 " tokens, exceeds the server's " +
+                                 std::to_string(::config.tokens) +
+                                 "-token capacity",
+                             "invalid_request_error",
+                             "context_length_exceeded"));
+                return;
+            }
             int handleId = model->LaunchResponseTokens(tokens, config);
             std::vector<float> results;
             while (true) {
@@ -1720,6 +1736,20 @@ struct WorkQueue {
                 }
             }
 
+            // Admission control: reject prompts beyond the configured token
+            // pool up front (see the /v1/completions path for rationale).
+            if (::config.tokens > 0 &&
+                (long long)tokens.size() >= (long long)::config.tokens) {
+                writeJsonAndClose(
+                    400, OpenAIHttpError(
+                             "prompt is " + std::to_string(tokens.size()) +
+                                 " tokens, exceeds the server's " +
+                                 std::to_string(::config.tokens) +
+                                 "-token capacity",
+                             "invalid_request_error",
+                             "context_length_exceeded"));
+                return;
+            }
             int handleId = model->LaunchResponseTokens(
                 tokens, config, multimodalGuard.inputs);
             multimodalGuard.Release();
