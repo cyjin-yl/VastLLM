@@ -255,16 +255,20 @@ bool EnvEnabled(const char *name) {
     return value != nullptr && std::strcmp(value, "0") != 0;
 }
 
+// Not a safety bound -- the kernel is in-bounds for any KV length -- but a performance
+// one: this specialisation streams the whole KV range from a (batch x 24) grid, so its
+// cost is linear in kvLen and it is far slower than the chunked-cublas path past a few
+// hundred keys.  See reports/sm70-fa-longctx-fix.md for the measured curve.
 int MaxKvTokens() {
     const char *value = std::getenv("FASTLLM_CUDA_SM70_FLASH_ATTN_MAX_KV");
     if (value == nullptr) {
-        return 512;
+        return kDefaultMaxKv;
     }
     char *end = nullptr;
     const long parsed = std::strtol(value, &end, 10);
     return end != value && *end == '\0' && parsed > 0 && parsed <= INT_MAX
         ? static_cast<int>(parsed)
-        : 512;
+        : kDefaultMaxKv;
 }
 
 bool StrictDeviceCheckEnabled() {
@@ -355,12 +359,13 @@ bool FastllmCudaTrySm70FlashAttentionPrefill(
         || output.dataDevice != fastllm::DataDevice::CUDA
         || q.cudaData == nullptr || output.cudaData == nullptr
         || q.dims.size() != 3 || output.dims != q.dims
-        || q.dims[0] != kQHeads || q.dims[1] < 2 || q.dims[1] > 50
+        || q.dims[0] != kQHeads || q.dims[1] < 2
+        || q.dims[1] > kMaxBatch * kMaxQLen
         || q.dims[2] != kHeadDim
         || q.strides.size() != 3 || output.strides.size() != 3
         || q.strides[2] != 1 || output.strides != q.strides
         || qSizes.dims.size() != 1 || qSizes.dims[0] < 2
-        || qSizes.dims[0] > 6
+        || qSizes.dims[0] > kMaxBatch + 1
         || pageSizes.dims.size() != 1
         || pageSizes.dims[0] != qSizes.dims[0]
         || lastPageLens.dims.size() != 1
