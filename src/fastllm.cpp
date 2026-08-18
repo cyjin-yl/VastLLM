@@ -5332,6 +5332,63 @@ namespace fastllm {
         // 初始化 pageLen 和 unusedPageIndex（物理页 = initialPages）
         manager->pageLen = pageLen;
         manager->SetMaxPages(initialPages);
+
+#ifdef USE_CUDA
+        // KV budget guard: the logical pool (manager count × maxPages × page
+        // bytes) can wildly exceed physical VRAM because --tokens is a logical
+        // limit, not a physical promise (262144 × ~65KB/tok turbo3 = ~17GiB
+        // on a card that only has ~9GiB left after weights).  Growing into
+        // that wall thrashes at kv_pool≈100% with 0 tok/s or aborts outright.
+        // Clamp every manager's maxPages so the total planned pool fits into
+        // 85% of the free VRAM measured after model weights are resident.
+        if (cacheData.dataDevice == DataDevice::CUDA && !metadataOnlyMultiCudaRoot) {
+            static long long kvBudgetBytes = -1;
+            if (kvBudgetBytes < 0) {
+                const long long freeB = FastllmCudaGetFreeSize();
+                kvBudgetBytes = freeB > 0 ? (long long)(freeB * 0.85) : 0;
+            }
+            if (kvBudgetBytes > 0) {
+                const long long unitSize = std::max(1, ((Data *)manager)->unitSize);
+                const long long pageBytes =
+                    (long long)pageLen * numHeads * headDim * unitSize;
+                long long plannedBytes = (long long)maxPages * pageBytes;
+                {
+                    std::lock_guard<std::mutex> guard(layerPagedCacheManagersMutex);
+                    for (auto &kv : layerPagedCacheManagers) {
+                        PagedCacheManager *m = kv.second;
+                        if (m != nullptr && m->cudaData != nullptr && m->maxPages > 0 &&
+                            (int)m->dims.size() >= 4) {
+                            plannedBytes += (long long)m->maxPages * m->dims[1] *
+                                            m->dims[2] * m->dims.back() *
+                                            std::max(1, m->unitSize);
+                        }
+                    }
+                }
+                if (plannedBytes > kvBudgetBytes) {
+                    const double scale = (double)kvBudgetBytes / (double)plannedBytes;
+                    const int clamped = std::max(64, (int)(maxPages * scale));
+                    {
+                        std::lock_guard<std::mutex> guard(layerPagedCacheManagersMutex);
+                        for (auto &kv : layerPagedCacheManagers) {
+                            PagedCacheManager *m = kv.second;
+                            if (m != nullptr && m->maxPages > clamped) {
+                                m->maxPages = clamped;
+                            }
+                        }
+                    }
+                    printf("[PagedCache] budget guard: planned KV pool %.2f GiB exceeds "
+                           "budget %.2f GiB (85%% of free VRAM after weights); clamping "
+                           "maxPages %d → %d per manager (~%lldK tokens). Lower --tokens "
+                           "or use a smaller --kv_cache_dtype to silence this.\n",
+                           plannedBytes / 1073741824.0, kvBudgetBytes / 1073741824.0,
+                           maxPages, clamped,
+                           (long long)clamped * pageLen / 1000);
+                    maxPages = clamped;
+                }
+            }
+        }
+#endif
+
         // 逻辑预算（预留检查/增长上限）保持全量；物理页由 Grow 按需扩容。
         manager->maxPages = maxPages;
 
