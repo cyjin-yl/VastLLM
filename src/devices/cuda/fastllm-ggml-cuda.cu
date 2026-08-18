@@ -1804,11 +1804,203 @@ static void dequantize_row_q2_K_r4_cuda(const void * vx, dst_t * y, const int64_
     dequantize_block_q2_K_r4<<<nblocks, 128, 0, stream>>>(vx, y, n_per_row);
 }
 
+// ---------------------------------------------------------------------------
+// SM70 long-prefill weight-expansion fast path.
+//
+// During prefill fastllm takes the "exact dense" route: for M > MMVQ_MAX_BATCH
+// _SIZE it expands the WHOLE GGUF projection weight to fp16 into a shared
+// scratch buffer and then runs one cuBLAS fp16 GEMM (see
+// FastllmCudaHalfMatMulGGUF).  That expansion is a fixed cost per chunk, paid
+// once per weight per chunk regardless of the chunk's token count, so on this
+// V100 deployment it is ~146 ms of every 512-token prefill chunk.
+//
+// Measured on a Tesla V100-PCIE-32GB (tools/prefill_dequant_bench):
+//   Q5_K 17408x5120 : stock 0.549 ms (436 GB/s) -> 0.327 ms (733 GB/s)  1.68x
+//   Q8_0 12288x5120 : stock 0.347 ms (555 GB/s) -> 0.251 ms (768 GB/s)  1.38x
+//   Q6_K  5120x6144 : stock 0.197 ms (451 GB/s) -> 0.125 ms (710 GB/s)  1.57x
+//
+// Two changes versus the stock llama.cpp kernels:
+//   1. each lane produces 8 CONSECUTIVE outputs and issues one 16-byte store
+//      instead of two/four scattered 2-byte stores;
+//   2. the store is a streaming store (__stcs / st.global.cs).  The expanded
+//      weight is 100-350 MB and is read back exactly once by cuBLAS, so it has
+//      no reuse in the 6 MB L2; the default write-back policy simply thrashes
+//      L2.  A roofline kernel with the same traffic and no arithmetic measures
+//      412 GB/s with a normal store and 740 GB/s with a streaming store, i.e.
+//      the L2 write policy - not the arithmetic - was the whole bottleneck.
+//
+// The arithmetic, operand order and __float2half_rn rounding are unchanged, so
+// the expanded weights are BITWISE IDENTICAL to the stock kernels (verified for
+// every projection shape of Qwen3.8-27B by tools/prefill_dequant_bench).
+// Rollback: FASTLLM_GGUF_VEC_DEQUANT=0.
+// ---------------------------------------------------------------------------
+static bool FastllmGGUFVecDequantEnabled() {
+    static const bool enabled = []{
+        const char *env = std::getenv("FASTLLM_GGUF_VEC_DEQUANT");
+        if (env == nullptr || env[0] == '\0') return true;
+        const char c = (char)std::tolower((unsigned char)env[0]);
+        return !(c == '0' || c == 'f' || c == 'n');
+    }();
+    return enabled;
+}
+
+static __device__ __forceinline__ unsigned FastllmPackHalf2(half lo, half hi) {
+    return (unsigned)__half_as_ushort(lo) | ((unsigned)__half_as_ushort(hi) << 16);
+}
+
+static __device__ __forceinline__ void FastllmStore16Streaming(
+        half *dst, unsigned a, unsigned b, unsigned c, unsigned d) {
+    __stcs(reinterpret_cast<uint4 *>(dst), make_uint4(a, b, c, d));
+}
+
+// 32 lanes cover one QK_K=256 super-block; lane -> 8 consecutive outputs.
+static __global__ void dequantize_block_q5_K_vec_half(const void * __restrict__ vx,
+                                                      half * __restrict__ yy,
+                                                      const int64_t nblocks) {
+    const block_q5_K * __restrict__ x = (const block_q5_K *) vx;
+    const int64_t gt = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t ib = gt >> 5;
+    if (ib >= nblocks) {
+        return;
+    }
+    const int lane = (int)(gt & 31);
+    const int il   = lane >> 3;        // 0..3   which 64-element group
+    const int o    = (lane & 7) << 3;  // 0,8,..,56 offset inside the group
+    const int hi   = o >> 5;           // 0 -> low nibble, 1 -> high nibble
+    const int j    = o & 31;           // 0,8,16,24
+
+    const float dall = __low2half(x[ib].dm);
+    const float dmin = __high2half(x[ib].dm);
+    uint8_t sc, mn;
+    get_scale_min_k4(2 * il + hi, x[ib].scales, sc, mn);
+    const float dd = dall * sc;
+    const float mm = dmin * mn;
+    const uint8_t hbit = (uint8_t)(1u << (2 * il + hi));
+
+    // block_q5_K is 176 B (a multiple of 16), qs is at offset 48 and qh at 16,
+    // so both of these 8-byte loads are naturally aligned.
+    const uint2 qsv = *(const uint2 *)(x[ib].qs + 32 * il + j);
+    const uint2 qhv = *(const uint2 *)(x[ib].qh + j);
+    const uint8_t * qs8 = (const uint8_t *)&qsv;
+    const uint8_t * qh8 = (const uint8_t *)&qhv;
+
+    half v[8];
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        const int q = hi ? (qs8[t] >> 4) : (qs8[t] & 0xF);
+        v[t] = DequantizeCast<half>::cast(dd * (q + ((qh8[t] & hbit) ? 16 : 0)) - mm);
+    }
+    FastllmStore16Streaming(yy + ib * QK_K + 64 * il + 32 * hi + j,
+                            FastllmPackHalf2(v[0], v[1]), FastllmPackHalf2(v[2], v[3]),
+                            FastllmPackHalf2(v[4], v[5]), FastllmPackHalf2(v[6], v[7]));
+}
+
+// 4 lanes cover one QK8_0=32 block; lane -> 8 consecutive outputs.
+// block_q8_0 is 34 B so the quantised loads must stay byte-wise.
+static __global__ void dequantize_block_q8_0_vec_half(const void * __restrict__ vx,
+                                                      half * __restrict__ yy,
+                                                      const int64_t nblocks) {
+    const block_q8_0 * __restrict__ x = (const block_q8_0 *) vx;
+    const int64_t gt = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t ib = gt >> 2;
+    if (ib >= nblocks) {
+        return;
+    }
+    const int j = (int)(gt & 3) << 3;   // 0,8,16,24
+    const half d = x[ib].d;
+    const int8_t * q = x[ib].qs + j;
+    half v[8];
+#pragma unroll
+    for (int t = 0; t < 8; t += 2) {
+        half2 h = __halves2half2(__int2half_rn(q[t]), __int2half_rn(q[t + 1]));
+        h = __hmul2(h, __halves2half2(d, d));
+        v[t]     = __low2half(h);
+        v[t + 1] = __high2half(h);
+    }
+    FastllmStore16Streaming(yy + ib * QK8_0 + j,
+                            FastllmPackHalf2(v[0], v[1]), FastllmPackHalf2(v[2], v[3]),
+                            FastllmPackHalf2(v[4], v[5]), FastllmPackHalf2(v[6], v[7]));
+}
+
+// 32 lanes cover one QK_K=256 super-block.  block_q6_K is 210 B so the
+// quantised loads must stay byte-wise.
+static __global__ void dequantize_block_q6_K_vec_half(const void * __restrict__ vx,
+                                                      half * __restrict__ yy,
+                                                      const int64_t nblocks) {
+    const block_q6_K * __restrict__ x = (const block_q6_K *) vx;
+    const int64_t gt = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t ib = gt >> 5;
+    if (ib >= nblocks) {
+        return;
+    }
+    const int lane = (int)(gt & 31);
+    const int n0 = lane << 3;          // first output element, multiple of 8
+    const int ip = n0 >> 7;            // 0 or 1
+    const int r  = n0 & 127;
+    const int g  = r >> 5;             // 0..3, selects nibble half + qh shift
+    const int il = r & 31;             // 0,8,16,24
+
+    const float d = __half2float(x[ib].d);
+    const int8_t sc = x[ib].scales[8 * ip + (il >> 4) + 2 * g];
+    const uint8_t * ql = x[ib].ql + 64 * ip + 32 * (g & 1) + il;
+    const uint8_t * qh = x[ib].qh + 32 * ip + il;
+    const int shift = 2 * g;
+
+    half v[8];
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        const int q = (g < 2) ? (ql[t] & 0xF) : (ql[t] >> 4);
+        const int h = (qh[t] >> shift) & 3;
+        v[t] = DequantizeCast<half>::cast(d * sc * ((int8_t)(q | (h << 4)) - 32));
+    }
+    FastllmStore16Streaming(yy + ib * QK_K + n0,
+                            FastllmPackHalf2(v[0], v[1]), FastllmPackHalf2(v[2], v[3]),
+                            FastllmPackHalf2(v[4], v[5]), FastllmPackHalf2(v[6], v[7]));
+}
+
+// Shared launch guard: fp16 destination, 16-byte aligned, whole blocks only.
+static inline bool FastllmGGUFCanVecDequant(const void *y, int64_t k, int blockLen) {
+    return FastllmGGUFVecDequantEnabled() && (((uintptr_t)y & 15) == 0) && (k % blockLen) == 0;
+}
+
 template<typename dst_t>
 static void dequantize_row_q5_K_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
     const int64_t k = nrows * n_per_row;
     const int nb = k / QK_K;
     dequantize_block_q5_K<<<nb, 64, 0, stream>>>(vx, y);
+}
+
+template<>
+void dequantize_row_q5_K_cuda<half>(const void * vx, half * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
+    const int64_t k = nrows * n_per_row;
+    const int64_t nb = k / QK_K;
+    if (FastllmGGUFCanVecDequant(y, k, QK_K)) {
+        const int threads = 256;
+        const int64_t grid = (nb * 32 + threads - 1) / threads;
+        dequantize_block_q5_K_vec_half<<<grid, threads, 0, stream>>>(vx, y, nb);
+        return;
+    }
+    dequantize_block_q5_K<<<(int)nb, 64, 0, stream>>>(vx, y);
+}
+
+// Q8_0 has no dedicated row wrapper upstream (it goes through the generic
+// dequantize_block_cuda), so introduce one that can carry the fp16 fast path.
+template<typename dst_t>
+static void dequantize_row_q8_0_dispatch_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
+    dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>(vx, y, nrows, n_per_row, stream);
+}
+
+template<>
+void dequantize_row_q8_0_dispatch_cuda<half>(const void * vx, half * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
+    const int64_t k = nrows * n_per_row;
+    if (FastllmGGUFCanVecDequant(y, k, QK8_0)) {
+        const int64_t nb = k / QK8_0;
+        const int threads = 256;
+        const int64_t grid = (nb * 4 + threads - 1) / threads;
+        dequantize_block_q8_0_vec_half<<<grid, threads, 0, stream>>>(vx, y, nb);
+        return;
+    }
+    dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>(vx, y, nrows, n_per_row, stream);
 }
 
 // Dequantize q5_K_r4 (4-row interleaved) format back to float/half
@@ -1896,6 +2088,19 @@ static void dequantize_row_q6_K_cuda(const void * vx, dst_t * y, const int64_t n
     const int64_t k = nrows * n_per_row;
     const int nb = k / QK_K;
     dequantize_block_q6_K<<<nb, 64, 0, stream>>>(vx, y);
+}
+
+template<>
+void dequantize_row_q6_K_cuda<half>(const void * vx, half * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
+    const int64_t k = nrows * n_per_row;
+    const int64_t nb = k / QK_K;
+    if (FastllmGGUFCanVecDequant(y, k, QK_K)) {
+        const int threads = 256;
+        const int64_t grid = (nb * 32 + threads - 1) / threads;
+        dequantize_block_q6_K_vec_half<<<grid, threads, 0, stream>>>(vx, y, nb);
+        return;
+    }
+    dequantize_block_q6_K<<<(int)nb, 64, 0, stream>>>(vx, y);
 }
 
 // Dequantize q6_K_r4 (4-row interleaved) format back to float/half
@@ -2427,7 +2632,7 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             // if (ggml_cuda_info().devices[ggml_cuda_get_device()].cc >= CC_PASCAL) {
                // return dequantize_block_q8_0_f16_cuda;
             //}
-            return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+            return dequantize_row_q8_0_dispatch_cuda;
         case GGML_TYPE_Q2_K:
             return dequantize_row_q2_K_cuda;
         //case GGML_TYPE_Q3_K:
