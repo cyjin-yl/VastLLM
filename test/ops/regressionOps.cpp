@@ -1758,6 +1758,66 @@ namespace {
         FastllmCudaSetDevice(originalDevice);
         std::cout << "paged cache grow release regression: PASS\n";
     }
+
+    // 需要在进程启动前设好 FASTLLM_PAGED_POOL_MAX_MB (预算值只解析一次)。
+    void RunPagedPoolBudgetBackpressureRegression() {
+        Expect(fastllm::HasDeviceType("cuda"),
+               "paged pool budget regression requires CUDA.");
+        Expect(std::getenv("FASTLLM_PAGED_POOL_MAX_MB") != nullptr,
+               "paged pool budget regression needs "
+               "FASTLLM_PAGED_POOL_MAX_MB in the environment.");
+        const int originalDevice = FastllmCudaGetDevice();
+        FastllmCudaSetDevice(0);
+        {
+            fastllm::PagedCacheManager manager;
+            manager.pageLen = 1024;
+            manager.dataType = fastllm::DataType::FLOAT16;
+            manager.dataDevice = fastllm::DataDevice::CUDA;
+            manager.UpdateUnitSize();
+            manager.Resize({2, 1024, 1, 64});   // 128 KiB/page
+            manager.Allocate();
+            manager.SetMaxPages(2);
+            manager.maxPages = 64;
+            fastllm::PagedCacheCudaPoolBytesAdd(
+                (long long)((fastllm::Data*)&manager)->GetBytes());
+
+            // 预算内: 涨到 4 页 (512 KiB) 应当成功。
+            std::string growError;
+            Expect(manager.TryGrow(4, &growError),
+                   "TryGrow refused a growth that fits the pool budget: " +
+                       growError);
+            Expect(manager.dims[0] == 4,
+                   "TryGrow reported success without growing the pool.");
+
+            // 超预算: 必须返回 false 而不是抛异常, 且不动池子。
+            growError.clear();
+            const int before = manager.dims[0];
+            const bool grew = manager.TryGrow(64, &growError);
+            Expect(!grew,
+                   "TryGrow ignored FASTLLM_PAGED_POOL_MAX_MB.");
+            Expect(manager.dims[0] == before,
+                   "TryGrow grew the pool after reporting failure.");
+            Expect(growError.find("budget") != std::string::npos ||
+                       growError.find("VRAM") != std::string::npos,
+                   "TryGrow did not report why growth was refused: " +
+                       growError);
+
+            // 旧的抛错语义在 Grow() 上保留(供无法排队的前向途中使用)。
+            bool threw = false;
+            try {
+                manager.Grow(64);
+            } catch (const std::exception &) {
+                threw = true;
+            }
+            Expect(threw,
+                   "Grow no longer signals over-budget growth.");
+            Expect(manager.dims[0] == before,
+                   "Grow grew the pool past the budget.");
+            // 析构会扣减 GetBytes(), 这里不再手工回冲。
+        }
+        FastllmCudaSetDevice(originalDevice);
+        std::cout << "paged pool budget backpressure regression: PASS\n";
+    }
 #endif
 
     void RunPagedPrefixCachePolicyRegression() {
@@ -17858,6 +17918,16 @@ int main(int argc, char **argv) {
             std::string(only) == "paged_prefix_cache_policy") {
             RunPagedPrefixCachePolicyRegression();
             return 0;
+        }
+        if (only != nullptr &&
+            std::string(only) == "paged_pool_budget") {
+#ifdef USE_CUDA
+            RunPagedPoolBudgetBackpressureRegression();
+            return 0;
+#else
+            throw std::runtime_error(
+                "paged_pool_budget regression requires a CUDA build.");
+#endif
         }
         if (only != nullptr &&
             std::string(only) == "paged_cache_grow") {

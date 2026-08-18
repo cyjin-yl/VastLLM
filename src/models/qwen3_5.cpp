@@ -4725,7 +4725,21 @@ namespace fastllm {
         }
 
         static int Qwen35LinearPrefixSnapshotMaxRecords() {
-            return std::max(1, Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS", 8));
+            // 8 条是多 agent 场景下命中率的真正天花板：8 个并发 agent 各自
+            // 的前缀快照互相挤掉，Trie 命中了也会因为"没有对应的线性层快照"
+            // 退回 no-record。改 32 条 + 字节预算双封顶。
+            return std::max(1, Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS", 32));
+        }
+
+        static uint64_t Qwen35LinearPrefixSnapshotMaxBytes() {
+            const char *value = std::getenv(
+                "FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_BYTES");
+            if (value == nullptr || value[0] == 0) {
+                return UINT64_C(4294967296);   // 4 GiB
+            }
+            char *end = nullptr;
+            unsigned long long parsed = std::strtoull(value, &end, 10);
+            return end == value ? UINT64_C(4294967296) : (uint64_t)parsed;
         }
 
         static bool Qwen35LayerIsLinearAttention(const Qwen3_5Model *model, int layer) {
@@ -4969,6 +4983,38 @@ namespace fastllm {
             dst.ToDevice(DataDevice::CUDA, {device}, true);
             return dst.dataDevice == DataDevice::CUDA &&
                    dst.cudaData != nullptr && dst.dims.size() >= 2;
+        }
+
+        static uint64_t Qwen35SnapshotCacheBytes(
+                const Qwen35LinearPrefixSnapshotCache &cache) {
+            if (!cache.valid) {
+                return 0;
+            }
+            uint64_t bytes = cache.single.GetBytes();
+            for (const auto &item : cache.locals) {
+                bytes += item.second.GetBytes();
+            }
+            return bytes;
+        }
+
+        static uint64_t Qwen35LinearPrefixSnapshotBytes(
+                const Qwen35LinearPrefixSnapshot *snapshot) {
+            if (snapshot == nullptr) {
+                return 0;
+            }
+            uint64_t bytes = snapshot->tokens.size() * sizeof(int);
+            for (const auto &layer : snapshot->layers) {
+                if (!layer.linear) {
+                    continue;
+                }
+                bytes += Qwen35SnapshotCacheBytes(layer.first);
+                bytes += Qwen35SnapshotCacheBytes(layer.second);
+            }
+            if (snapshot->mtpValid) {
+                bytes += snapshot->mtpKey.GetBytes();
+                bytes += snapshot->mtpValue.GetBytes();
+            }
+            return bytes;
         }
 
         static const Qwen35LinearPrefixSnapshot *Qwen35FindLinearPrefixSnapshotLocked(
@@ -8989,6 +9035,32 @@ namespace fastllm {
             int maxRecords = Qwen35LinearPrefixSnapshotMaxRecords();
             while ((int)items.size() > maxRecords) {
                 items.erase(items.begin());
+            }
+            const uint64_t maxBytes = Qwen35LinearPrefixSnapshotMaxBytes();
+            if (maxBytes > 0) {
+                uint64_t total = 0;
+                for (auto &item : items) {
+                    total += Qwen35LinearPrefixSnapshotBytes(item.get());
+                }
+                while (total > maxBytes && items.size() > 1) {
+                    total -= std::min(
+                        total,
+                        Qwen35LinearPrefixSnapshotBytes(
+                            items.begin()->get()));
+                    items.erase(items.begin());
+                }
+                if (fastllm::PrefixCacheStatsEnabled()) {
+                    static std::atomic<uint64_t> logged{0};
+                    if ((logged.fetch_add(1) & 31) == 0) {
+                        printf("[PrefixCache] linear-snapshots: n=%zu "
+                               "bytes=%lluMB cap{n=%d bytes=%lluMB}\n",
+                               items.size(),
+                               (unsigned long long)(total >> 20),
+                               maxRecords,
+                               (unsigned long long)(maxBytes >> 20));
+                        fflush(stdout);
+                    }
+                }
             }
         }
         context->intParams["qwen35_linear_prefix_last_len"] = currentLen;
@@ -19753,8 +19825,11 @@ namespace fastllm {
             extraCachedLen = std::max(0, std::min(extraCachedLen, cachedLen));
             minCachedPages = extraCachedLen / probeManager->pageLen;
             if (minCachedPages <= 0) {
+                // L1 Trie 明明命中了 cachedLen 个 token，只是混合模型缺少
+                // 对应长度的线性层快照。原来把这种情况也算成 no-record，
+                // 于是"trie 有 1.7 万页却全 miss"看上去像没记录过。
                 PrefixCacheStatsObserveRequest(
-                    prefixQueryTotalTokens, 0, nullptr, "no-record");
+                    prefixQueryTotalTokens, 0, nullptr, "extra-missing");
                 return 0;
             }
             cachedLen = minCachedPages * probeManager->pageLen;

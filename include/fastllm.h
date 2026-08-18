@@ -774,6 +774,10 @@ namespace fastllm {
                 const std::unordered_set<int> *protectedPages);
             bool PageOutTrieNode(CacheTrieNode *node);
             uint64_t EvictCpuTierPayloads(uint64_t bytesNeeded);
+            // L2 -> L3: RAM 层满时把最冷的 payload 写到 disk 层再释放,
+            // 而不是直接丢掉。调用方需自行持有 pageIndexLocker
+            // (与 PageOutTrieNode 同约定)。
+            uint64_t DemoteCpuTierPayloadsToDisk(uint64_t bytesNeeded);
             bool MaterializeTrieNode(
                 CacheTrieNode *node,
                 const std::unordered_set<int> &protectedPages);
@@ -800,6 +804,8 @@ namespace fastllm {
     // deficit while limiting small incremental growth to 128 pages.
     int GetPagedCacheGrowthTarget(
         int physicalPages, int maxPages, int additionalPages);
+    // 全局分页 KV 池物理字节账本(FASTLLM_PAGED_POOL_MAX_MB 的记账口)。
+    void PagedCacheCudaPoolBytesAdd(long long delta);
 
 #ifdef USE_CUDA
     // CUDA graphs retain paged-cache base pointers. Graph launch and pool
@@ -941,6 +947,7 @@ namespace fastllm {
         uint64_t missBelowThreshold = 0;  // MIN_TOKENS/MIN_HITS 门槛不满足
         uint64_t missGenerationMismatch = 0;  // generation/布局不匹配
         uint64_t missRestoreFailed = 0;   // 有命中但恢复(paged/extra)失败
+        uint64_t missExtraMissing = 0;    // L1 命中但缺线性层快照(混合模型)
         uint64_t missOther = 0;
         // 记录被拒原因分布(PageOutTrieNode / Record 路径)
         uint64_t recordAccepted = 0;
@@ -953,6 +960,7 @@ namespace fastllm {
         uint64_t evictCpuTierCalls = 0;   // EvictCpuTierPayloads 调用次数
         uint64_t evictCpuTierBytes = 0;   // CPU 层逐出释放字节
         uint64_t evictDemotePages = 0;    // 主动下沉到 L2/L3 的页数
+        uint64_t evictCpuToDiskBytes = 0; // RAM 满时从 L2 沉到 L3 的字节
         uint64_t evictHardDropNodes = 0;  // 下沉失败被直接销毁的 Trie 节点
         // 层占用快照(调用 Get 时采样, 非累计)
         uint64_t memTrieResidentBytes = 0;
