@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <climits>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <exception>
 #include <set>
@@ -190,6 +191,62 @@ namespace fastllm {
             return true;
         }
 
+        // ---- 工具名规范化 -------------------------------------------------
+        // 模型对工具名有很强的先验(被训练成写 "Bash"/"Read"/"WebSearch"),
+        // 而 harness 声明的可能是 "bash"/"read"/"web_search"。生产上实测:
+        // omp 声明 12 个全小写工具, 模型一吐出 "B", 名字约束就找不到任何
+        // 合法后继 -> 掩码清空 -> 静默退回自由采样 -> 写出 "Bash" ->
+        // harness 收到不存在的工具名 -> 调用失败(日志里的 mask EXHAUSTED)。
+        //
+        // 规范化规则: 转小写 + 去掉 '-' '_' ' ' '.'。
+        // 这条规则**只依赖客户端自己在请求里声明的 tools 列表**, 不硬编码
+        // 任何 harness 的名字, 因此对 omp / OpenCode / Cherry Studio /
+        // 任意 OpenAI 或 Anthropic 客户端一视同仁。
+        static std::string ToolCallCanonicalKey(const std::string &s) {
+            std::string out;
+            out.reserve(s.size());
+            for (char c : s) {
+                if (c == '-' || c == '_' || c == ' ' || c == '.') {
+                    continue;
+                }
+                out.push_back((char)std::tolower((unsigned char)c));
+            }
+            return out;
+        }
+
+        // 把模型写出的名字映射回声明列表里的那一个。
+        // 精确命中优先; 规范化后有且仅有一个候选才替换 —— 存在歧义时
+        // (比如同时声明了 "read" 和 "Read")宁可原样返回, 不猜。
+        static std::string ResolveDeclaredToolName(
+                const std::string &name,
+                const std::vector<std::string> &declared) {
+            if (name.empty() || declared.empty()) {
+                return name;
+            }
+            for (const auto &d : declared) {
+                if (d == name) {
+                    return name;
+                }
+            }
+            const std::string key = ToolCallCanonicalKey(name);
+            const std::string *hit = nullptr;
+            for (const auto &d : declared) {
+                if (ToolCallCanonicalKey(d) == key) {
+                    if (hit != nullptr) {
+                        return name;   // 多个候选, 有歧义
+                    }
+                    hit = &d;
+                }
+            }
+            if (hit == nullptr) {
+                return name;
+            }
+            printf("[ToolCallTrace] 工具名归一化: '%s' -> '%s'\n",
+                   name.c_str(), hit->c_str());
+            fflush(stdout);
+            return *hit;
+        }
+
         static bool FindActiveToolCallNamePartial(const std::string &text,
                                                   const GenerationConfig &config,
                                                   std::string &partial) {
@@ -253,7 +310,9 @@ namespace fastllm {
             if (closePos != std::string::npos && closePos > bestPos) {
                 return false;
             }
-            toolName = text.substr(nameStart, terminatorPos - nameStart);
+            toolName = ResolveDeclaredToolName(
+                    text.substr(nameStart, terminatorPos - nameStart),
+                    config.tool_call_allowed_names);
             invokePos = bestPos;
             return !toolName.empty();
         }
@@ -467,14 +526,22 @@ namespace fastllm {
             auto terminatorPos = combined.find(terminator);
             std::string namePart = terminatorPos == std::string::npos ?
                                    combined : combined.substr(0, terminatorPos);
+            // 用规范化后的形式比较: 模型写 "Bash" 也算命中声明的 "bash",
+            // 于是掩码不会在第一个 token 就被清空(清空 = 静默退回自由采样,
+            // 那才是工具调用真正坏掉的地方)。名字最终由
+            // ResolveDeclaredToolName 归一化回声明的拼写。
+            const std::string namePartKey = ToolCallCanonicalKey(namePart);
             for (const auto &name : allowedValues) {
                 if (terminatorPos != std::string::npos) {
-                    if (namePart == name) {
+                    if (namePart == name ||
+                        ToolCallCanonicalKey(name) == namePartKey) {
                         return true;
                     }
                     continue;
                 }
-                if (ToolCallConstraintStartsWith(name, namePart)) {
+                if (ToolCallConstraintStartsWith(name, namePart) ||
+                    ToolCallConstraintStartsWith(ToolCallCanonicalKey(name),
+                                                 namePartKey)) {
                     return true;
                 }
             }
@@ -740,7 +807,9 @@ namespace fastllm {
                 cur.segmentStart = nameStart;
                 return cur;
             }
-            cur.functionName = text.substr(nameStart, nameTerm - nameStart);
+            cur.functionName = ResolveDeclaredToolName(
+                    text.substr(nameStart, nameTerm - nameStart),
+                    config.tool_call_allowed_names);
             cur.invokePos = invokePos;
             const std::string funcClose = "</function>";
             const std::string paramClose = "</parameter>";

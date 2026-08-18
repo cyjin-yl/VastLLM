@@ -531,6 +531,56 @@ namespace fastllm {
     static constexpr int QWEN35_MTP_FAST_SEQ_MAX = QWEN35_MTP_MAX_DRAFTS + 1;
     static constexpr float QWEN35_MTP_TYPICAL_POSTERIOR_THRESHOLD = 0.09f;
     static constexpr float QWEN35_MTP_TYPICAL_POSTERIOR_ALPHA = 0.3f;
+
+    // ---- MTP 接受判据 -------------------------------------------------------
+    // typical acceptance (Medusa 系) 只要求"目标模型给这个 draft token 的概率
+    // 超过阈值"就接受, **不做拒绝采样的残差修正, 因此不保持目标分布**。
+    // 对普通行文几乎无害(很多 token 可互换), 但 agent 干活靠的是**逐字抄写**:
+    // 文件路径、函数名、commit hash、工具调用 JSON —— 这些位置只有一个 token
+    // 是对的。此时阈值 0.09 会偶尔放过"看着像"的那个:
+    //     写完 "Proto-" 后目标分布约 UI=0.85 / U=0.10;
+    //     draft 提议 "U", 0.10 > 0.09 -> 接受 -> 输出 "Proto-U"。
+    // 生产日志里正是这个形态(Proto-U / ProtoUI / Dotments / eza), 破坏率约
+    // 0.05%~1.3%, 足以让 agent cd 进不存在的目录, 再据此推翻自己的判断。
+    //
+    // 默认改为 exact acceptance: 仅当 draft 与目标模型**实际采样出的 token**
+    // 相同才接受。这样每个吐出的 token 都由目标模型自己产生, 输出逐字节等价
+    // 于不开投机解码; 代价只是接受率下降(速度), 不是正确性。
+    // 需要拿正确性换吞吐时设 FASTLLM_QWEN35_MTP_EXACT_ACCEPT=0 退回 typical。
+    static bool Qwen35MtpExactAcceptance() {
+        static const bool value = []() {
+            const char *env = std::getenv("FASTLLM_QWEN35_MTP_EXACT_ACCEPT");
+            return env == nullptr ? true : Qwen35MoeIsTrueString(env);
+        }();
+        return value;
+    }
+
+    static float Qwen35MtpEnvFloat(const char *name, float fallback) {
+        const char *env = std::getenv(name);
+        if (env == nullptr || *env == 0) {
+            return fallback;
+        }
+        char *end = nullptr;
+        float parsed = std::strtof(env, &end);
+        if (end == env || !std::isfinite(parsed) || parsed < 0.0f) {
+            return fallback;
+        }
+        return parsed;
+    }
+
+    static float Qwen35MtpTypicalThreshold() {
+        static const float value = Qwen35MtpEnvFloat(
+            "FASTLLM_QWEN35_MTP_TYPICAL_THRESHOLD",
+            QWEN35_MTP_TYPICAL_POSTERIOR_THRESHOLD);
+        return value;
+    }
+
+    static float Qwen35MtpTypicalAlpha() {
+        static const float value = Qwen35MtpEnvFloat(
+            "FASTLLM_QWEN35_MTP_TYPICAL_ALPHA",
+            QWEN35_MTP_TYPICAL_POSTERIOR_ALPHA);
+        return value;
+    }
     static constexpr int QWEN35_MTP_PREFIX_SNAPSHOT_MAX =
         QWEN35_MTP_FAST_SEQ_MAX - 1;
     static constexpr int QWEN35_MTP_PREFIX_SNAPSHOT_BATCH_MAX = 4;
@@ -6847,8 +6897,8 @@ namespace fastllm {
                     typicalCount > 0 && typicalRecoveredIds != nullptr ?
                         typicalRecoveredIds->data() : nullptr,
                     typicalCount,
-                    QWEN35_MTP_TYPICAL_POSTERIOR_THRESHOLD,
-                    QWEN35_MTP_TYPICAL_POSTERIOR_ALPHA,
+                    Qwen35MtpTypicalThreshold(),
+                    Qwen35MtpTypicalAlpha(),
                     flatPenaltyIds.empty() ? nullptr : flatPenaltyIds.data(),
                     flatPenaltyIds.empty() ? nullptr : flatPenaltyFactors.data(),
                     maxRowPenaltyTokens);
@@ -15604,11 +15654,24 @@ namespace fastllm {
             return false;
         }
         if (!mtpLogPrinted.exchange(true)) {
-            const char *acceptance = generationConfigs[0].IsSimpleGreedy() ?
-                "exact" : "typical(posterior_threshold=0.09, posterior_alpha=0.30)";
+            char acceptanceBuf[192];
+            if (generationConfigs[0].IsSimpleGreedy() ||
+                Qwen35MtpExactAcceptance()) {
+                // exact: 只接受与目标模型实际采样一致的 draft ->
+                // 输出逐字节等价于不开投机解码
+                snprintf(acceptanceBuf, sizeof(acceptanceBuf), "exact%s",
+                         generationConfigs[0].IsSimpleGreedy() ?
+                             "(greedy)" : "(FASTLLM_QWEN35_MTP_EXACT_ACCEPT)");
+            } else {
+                // typical: 近似判据, 不保持目标分布, 会偶发替换逐字抄写的 token
+                snprintf(acceptanceBuf, sizeof(acceptanceBuf),
+                         "typical(posterior_threshold=%.3f, posterior_alpha=%.2f)"
+                         "  <<< 有损: 逐字抄写可能被替换",
+                         Qwen35MtpTypicalThreshold(), Qwen35MtpTypicalAlpha());
+            }
             printf("[Qwen3.5 MTP] enabled: layers=%d, drafts_per_step=%d, root_device=cuda:%d, tp_devices=%zu, acceptance=%s, log_interval=%d validations.\n",
                    mtp_num_hidden_layers, mtpDraftsPerStep, device,
-                   devices.size(), acceptance, logInterval);
+                   devices.size(), acceptanceBuf, logInterval);
             fflush(stdout);
         }
 
@@ -16498,6 +16561,7 @@ namespace fastllm {
         auto countAcceptedDrafts = [&](const std::vector<int> &targetTokens,
                                        int draftTokenCount) {
             bool useTypicalAcceptance =
+                !Qwen35MtpExactAcceptance() &&
                 !generationConfigs[0].IsSimpleGreedy() &&
                 (int)speculativeTypicalAccepted.size() >= draftTokenCount;
             // 约束感知截断: draft 提议跨越约束激活边界时, verify 用的
@@ -18558,8 +18622,10 @@ namespace fastllm {
             captureOffsets[b] = captureOffsets[b - 1] + seqLens[b - 1] - 1;
         }
         bool needsTypicalAcceptance = false;
-        for (int b = 0; b < batch; b++) {
-            needsTypicalAcceptance |= !generationConfigs[b].IsSimpleGreedy();
+        if (!Qwen35MtpExactAcceptance()) {
+            for (int b = 0; b < batch; b++) {
+                needsTypicalAcceptance |= !generationConfigs[b].IsSimpleGreedy();
+            }
         }
         if (needsTypicalAcceptance &&
             (int)speculativeTypicalAccepted.size() < totalTokens) {
@@ -18571,6 +18637,7 @@ namespace fastllm {
         for (int b = 0; b < batch; b++) {
             int proposalCount = seqLens[b] - 1;
             bool useTypicalAcceptance =
+                !Qwen35MtpExactAcceptance() &&
                 !generationConfigs[b].IsSimpleGreedy();
             // 约束感知截断(与单请求路径同理): 投机块跨越约束激活边界时,
             // verify 沿用的旧 mask 可能为空, 必须逐 token 预检即将激活的约束。

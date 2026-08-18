@@ -1208,6 +1208,11 @@ namespace fastllm {
 
     void ApplyDeviceMap(const std::map <std::string, int> &deviceMap, int current, int total); // 执行到了current, 一共total，使用deviceMap切换设备
 
+    // 采样前把 NaN/Inf 压成 -1e30f, 返回被修正的个数; where 只用于日志。
+    // 不做这一步的话 NaN 会劫持比较器, 输出退化成 token 0 ('!') 的长串。
+    int SanitizeLogitsForSampling(float *base, int count, const char *where);
+    long long GetNonFiniteLogitSteps();
+
     int LLMSamplingOnly(Data &logits, int outerOffset, const GenerationConfig &config);
 
     int LLMSampling(Data &logits, int outerOffset,

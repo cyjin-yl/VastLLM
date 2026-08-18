@@ -1626,6 +1626,13 @@ struct WorkQueue {
             }
             if (node->config["temperature"].is_number()) {
                 config.temperature = node->config["temperature"].number_value();
+                if (!(config.temperature > 0.0f)) {
+                    // 客户端发 temperature=0 表示"要确定性输出"。CUDA 采样
+                    // kernel 同样会做 1/temperature, 除零后整行 logits 变
+                    // inf/NaN, 输出退化成同一个字符的长串。这里钳到一个极小
+                    // 正值, 数值上等价于 argmax; CPU 侧另有显式贪心分支。
+                    config.temperature = 1e-6f;
+                }
             }
             if (node->config["top_p"].is_number()) {
                 config.top_p = node->config["top_p"].number_value();
