@@ -622,7 +622,8 @@ namespace fastllm {
         // 判断下一个候选 token 是否被当前约束允许。
         virtual void EvaluateToolCallConstraintText(const std::string &generatedText,
                                                     const GenerationConfig &generationConfig,
-                                                    std::vector<int> &allowedIdsOut);
+                                                    std::vector<int> &allowedIdsOut,
+                                                    std::vector<int> *blockedIdsOut = nullptr);
 
         virtual void UpdateToolCallConstraintState(ResponseContext *context, int tokenId);
 

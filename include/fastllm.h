@@ -183,6 +183,9 @@ namespace fastllm {
         bool tool_call_required_parameter_constraint_enabled = false;
         std::map <std::string, std::vector <std::string> > tool_call_required_parameter_names;
         std::vector <int> tool_call_allowed_token_ids;
+        // ROOT CAUSE #4: 黑名单通道 —— S4 空值时屏蔽 </parameter> 等闭合序列的
+        // 起始 token(让空值不可表达)。与 allowed 独立判定, 两者可叠加。
+        std::vector <int> tool_call_blocked_token_ids;
         bool tool_call_content_sampling_enabled = false;
         // Set on the per-step config after Kimi-K3 has drained DSpark's
         // scheduler-ahead queue. DSpark then samples from its batched target
@@ -193,7 +196,8 @@ namespace fastllm {
         float tool_call_content_temperature = 1.0f;
 
         bool IsSimpleGreedy() const {
-            if (!tool_call_allowed_token_ids.empty()) {
+            if (!tool_call_allowed_token_ids.empty() ||
+                !tool_call_blocked_token_ids.empty()) {
                 return false;
             }
             if (fabs(repeat_penalty - 1) > 1e-8) {

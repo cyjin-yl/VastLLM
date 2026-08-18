@@ -624,7 +624,8 @@ namespace fastllm {
         for (int b = 0; b < batch; b++) {
             needLogits |= generationConfigs[b].output_logits;
             needRepeatPenalty |= NeedRepeatPenalty(generationConfigs[b]);
-            needToolNameMask |= !generationConfigs[b].tool_call_allowed_token_ids.empty();
+            needToolNameMask |= !generationConfigs[b].tool_call_allowed_token_ids.empty() ||
+                                !generationConfigs[b].tool_call_blocked_token_ids.empty();
             maxTopK = std::max(maxTopK, generationConfigs[b].top_k);
         }
 

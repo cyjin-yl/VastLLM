@@ -1337,7 +1337,8 @@ namespace fastllm {
         // repeat_penalty 已支持: verify 前向携带 LastTokensManager,
         // typical/greedy 采样 kernel 会对 verify 分布应用惩罚。
         if (config.output_logits ||
-            !config.tool_call_allowed_token_ids.empty()) {
+            !config.tool_call_allowed_token_ids.empty() ||
+            !config.tool_call_blocked_token_ids.empty()) {
             return false;
         }
         if (config.IsSimpleGreedy()) {
@@ -1351,7 +1352,8 @@ namespace fastllm {
     static bool Qwen35GpuTokenHandoffSupportsGenerationConfig(
             const GenerationConfig &config) {
         if (config.output_logits ||
-            !config.tool_call_allowed_token_ids.empty()) {
+            !config.tool_call_allowed_token_ids.empty() ||
+            !config.tool_call_blocked_token_ids.empty()) {
             return false;
         }
         if (config.IsSimpleGreedy()) {
@@ -20852,7 +20854,8 @@ namespace fastllm {
                     logits.push_back(createPendingResultLogits(ctx->generationConfig));
                     selectedNeedLastTokens |= Qwen35NeedRepeatPenalty(ctx->generationConfig) ||
                                               ctx->generationConfig.output_logits ||
-                                              !generationConfigs.back().tool_call_allowed_token_ids.empty();
+                                              !generationConfigs.back().tool_call_allowed_token_ids.empty() ||
+                                              !generationConfigs.back().tool_call_blocked_token_ids.empty();
                     selectedIsPrompt = isPrompt != 0;
                     selectedMultimodal = isMultimodal;
                     if (isPrompt) {

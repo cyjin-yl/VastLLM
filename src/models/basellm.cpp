@@ -178,6 +178,10 @@ namespace fastllm {
             const std::vector<std::string> parameterCloseTags = {
                     "</｜DSML｜parameter>",
                     "</\\DSML\\parameter>",
+                    // Qwen <tool_call><function=..><parameter=..>..</parameter> 格式。
+                    // 缺它时 Qwen 格式下第二个参数块起 HasUnclosed 恒 true,
+                    // 参数名约束永久失效(多参数块循环的元凶之一)。
+                    "</parameter>",
             };
             auto closePos = FindLastNeedleBefore(text, parameterCloseTags, parameterPos);
             if (closePos != std::string::npos && closePos > previousParameterPos) {
@@ -221,6 +225,7 @@ namespace fastllm {
                     config.tool_call_name_terminator.empty() ? "\"" : config.tool_call_name_terminator;
             const std::string standardClose = "</｜DSML｜invoke>";
             const std::string alternateClose = "</\\DSML\\invoke>";
+            const std::string qwenClose = "</function>";  // Qwen 格式 invoke 闭合
             std::string::size_type bestPos = std::string::npos;
             const std::string *bestPrefix = nullptr;
             if (!FindLastPrefix(text, config.tool_call_invoke_name_prefixes,
@@ -232,13 +237,18 @@ namespace fastllm {
             if (terminatorPos == std::string::npos) {
                 return false;
             }
-            auto standardClosePos = text.rfind(standardClose);
+            auto closePos = text.rfind(standardClose);
             auto alternateClosePos = text.rfind(alternateClose);
-            auto closePos = standardClosePos;
+            auto qwenClosePos = text.rfind(qwenClose);
             if (closePos == std::string::npos ||
                 (alternateClosePos != std::string::npos &&
                  alternateClosePos > closePos)) {
                 closePos = alternateClosePos;
+            }
+            if (closePos == std::string::npos ||
+                (qwenClosePos != std::string::npos &&
+                 qwenClosePos > closePos)) {
+                closePos = qwenClosePos;
             }
             if (closePos != std::string::npos && closePos > bestPos) {
                 return false;
@@ -667,6 +677,7 @@ namespace fastllm {
         struct ToolCallGrammarCursor {
             ToolCallGrammarState state = TG_NONE;
             std::string functionName;
+            std::string::size_type invokePos = std::string::npos;
             // 当前分段起点: S0=<tool_call> 之后, S2=间隙起点,
             // S4=值起点, S5=</function> 之后
             size_t segmentStart = std::string::npos;
@@ -730,6 +741,7 @@ namespace fastllm {
                 return cur;
             }
             cur.functionName = text.substr(nameStart, nameTerm - nameStart);
+            cur.invokePos = invokePos;
             const std::string funcClose = "</function>";
             const std::string paramClose = "</parameter>";
             size_t pos = nameTerm + terminator.size();
@@ -779,8 +791,12 @@ namespace fastllm {
 
     void basellm::EvaluateToolCallConstraintText(const std::string &generatedText,
                                                  const GenerationConfig &generationConfig,
-                                                 std::vector<int> &allowedIdsOut) {
+                                                 std::vector<int> &allowedIdsOut,
+                                                 std::vector<int> *blockedIdsOut) {
         allowedIdsOut.clear();
+        if (blockedIdsOut != nullptr) {
+            blockedIdsOut->clear();
+        }
         if (!generationConfig.tool_call_name_constraint_enabled &&
             !generationConfig.tool_call_parameter_name_constraint_enabled &&
             !generationConfig.tool_call_required_parameter_constraint_enabled) {
@@ -796,6 +812,7 @@ namespace fastllm {
             const ToolCallGrammarCursor cursor =
                     LocateToolCallGrammarCursor(generatedText, generationConfig);
             bool handled = false;
+            bool collectValueCloseBlocked = false;
             switch (cursor.state) {
                 case TG_NONE:
                     return;
@@ -825,15 +842,11 @@ namespace fastllm {
                     }
                     break;
                 case TG_PARAM_GAP: {
-                    // S2: 缺必填 -> 只允许 "<parameter="(required-first);
-                    //     必填齐 -> "<parameter=" 或 "</function>"
-                    if (FindForcedToolCallParameterBlockStart(
-                                generatedText, generationConfig, partial,
-                                allowedValues)) {
-                        activeTerminator = "\x01";
-                        handled = true;
-                        break;
-                    }
+                    // S2: 显式按 missing 必填判定(替代 FindForced 的模糊
+                    // false 语义--它无法区分"必填齐"与"缺必填但尾格式不
+                    // 符", 曾导致缺必填时也放行 </function>):
+                    //   缺必填 -> 只允许 "<parameter="(required-first);
+                    //   必填齐 -> "<parameter=" 或 "</function>"
                     const std::string tail =
                             generatedText.substr(cursor.segmentStart);
                     const std::string &paramPrefix =
@@ -842,12 +855,26 @@ namespace fastllm {
                             ? std::string("<parameter=")
                             : generationConfig
                                       .tool_call_parameter_name_prefixes.front();
+                    std::vector<std::string> missing;
+                    if (generationConfig
+                                .tool_call_required_parameter_constraint_enabled &&
+                        cursor.invokePos != std::string::npos) {
+                        missing = MissingRequiredToolCallParameters(
+                                generatedText, generationConfig,
+                                cursor.functionName, cursor.invokePos);
+                    }
                     const size_t m1 =
                             ToolCallTailPrefixOverlap(tail, paramPrefix);
-                    const size_t m2 =
-                            ToolCallTailPrefixOverlap(tail, "</function>");
-                    partial = tail.substr(tail.size() - std::max(m1, m2));
-                    allowedValues = {paramPrefix, "</function>"};
+                    if (!missing.empty()) {
+                        partial = tail.substr(tail.size() - m1);
+                        allowedValues = {paramPrefix};
+                    } else {
+                        const size_t m2 =
+                                ToolCallTailPrefixOverlap(tail, "</function>");
+                        partial =
+                                tail.substr(tail.size() - std::max(m1, m2));
+                        allowedValues = {paramPrefix, "</function>"};
+                    }
                     activeTerminator = "\x01";
                     handled = true;
                     break;
@@ -864,20 +891,33 @@ namespace fastllm {
                     break;
                 case TG_PARAM_VALUE: {
                     // S4: 值自由; 仅当尾部正在形成闭合标签前缀时
-                    // 收紧到 "</parameter>"(屏蔽 "</function>"/"</tool_call>")
+                    // 收紧到 "</parameter>"(屏蔽 "</function>"/"</tool_call>")。
+                    // ROOT CAUSE #4(空值): 该参数块尚未产出非空白字符时,
+                    // 通过黑名单通道屏蔽三个闭合序列的起始 token,
+                    // 让 "<parameter=path></parameter>" 空值不可表达。
                     const std::string tail =
                             generatedText.substr(cursor.segmentStart);
+                    const bool valueStillEmpty =
+                            tail.find_first_not_of(" \t\r\n") ==
+                            std::string::npos;
                     const size_t lt = tail.rfind('<');
                     if (lt != std::string::npos) {
                         const std::string cand = tail.substr(lt);
                         const std::string target = "</parameter>";
                         if (cand.size() < target.size() &&
                             target.compare(0, cand.size(), cand) == 0) {
-                            partial = cand;
-                            allowedValues = {target};
-                            activeTerminator = "\x01";
-                            handled = true;
+                            if (!valueStillEmpty) {
+                                partial = cand;
+                                allowedValues = {target};
+                                activeTerminator = "\x01";
+                                handled = true;
+                            }
+                            // 空值 + 已在闭合前缀: 约束全程生效时不可达
+                            // (入口拦截已屏蔽 '<' 起始), 防御性放行
                         }
+                        // cand 非闭合前缀(值内含其它 '<' 文本): 自由
+                    } else if (valueStillEmpty && blockedIdsOut != nullptr) {
+                        collectValueCloseBlocked = true;
                     }
                     break;
                 }
@@ -902,6 +942,61 @@ namespace fastllm {
                                ? (size_t)-1 : cursor.segmentStart,
                        partial.size(), (int)handled, allowedValues.size());
                 fflush(stdout);
+            }
+            if (collectValueCloseBlocked && blockedIdsOut != nullptr) {
+                // 空值屏蔽: token 使 tail+token 尾部成为任一闭合序列的
+                // 非空前缀(含完整闭合串)则禁。
+                static const char *kValueClosers[] = {
+                    "</parameter>", "</function>", "</tool_call>"
+                };
+                // tail 只需保留最长闭合串-1 个字符参与前缀判定
+                const std::string tailFull =
+                        generatedText.substr(cursor.segmentStart);
+                const std::string tail = tailFull.size() > 12
+                        ? tailFull.substr(tailFull.size() - 12) : tailFull;
+                for (const auto &item :
+                     this->weight.tokenizer.tokenToStringDict) {
+                    const int tokenId = item.first;
+                    const std::string tokenText =
+                            this->weight.tokenizer.DecodeTokens(
+                                std::vector<int>{tokenId});
+                    if (tokenText.empty()) {
+                        continue;
+                    }
+                    const std::string combined = tail + tokenText;
+                    bool blocked = false;
+                    for (const char *closer : kValueClosers) {
+                        const size_t clen = strlen(closer);
+                        const size_t maxLen =
+                                std::min(clen, combined.size());
+                        for (size_t len = 1; len <= maxLen; ++len) {
+                            if (combined.compare(combined.size() - len, len,
+                                                 closer, 0, len) == 0) {
+                                blocked = true;
+                                break;
+                            }
+                        }
+                        if (blocked) {
+                            break;
+                        }
+                    }
+                    if (blocked) {
+                        blockedIdsOut->push_back(tokenId);
+                    }
+                }
+                std::sort(blockedIdsOut->begin(), blockedIdsOut->end());
+                if (ToolCallTraceEnabled()) {
+                    printf("[ToolCallTrace] S4 empty-value: blocked=%zu\n",
+                           blockedIdsOut->size());
+                    fflush(stdout);
+                }
+                if (blockedIdsOut->empty()) {
+                    printf("[ToolCallTrace] S4 empty-value: no closer tokens "
+                           "found, mask skipped (fallback)\n");
+                    fflush(stdout);
+                }
+                // 空值屏蔽是纯黑名单, 不做 allowed 白名单
+                return;
             }
             if (!handled || allowedValues.empty()) {
                 return;
@@ -961,12 +1056,14 @@ namespace fastllm {
 
     void basellm::PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig) {
         generationConfig.tool_call_allowed_token_ids.clear();
+        generationConfig.tool_call_blocked_token_ids.clear();
         if (context == nullptr) {
             return;
         }
         EvaluateToolCallConstraintText(context->toolCallConstraintGeneratedText,
                                        generationConfig,
-                                       generationConfig.tool_call_allowed_token_ids);
+                                       generationConfig.tool_call_allowed_token_ids,
+                                       &generationConfig.tool_call_blocked_token_ids);
     }
 
     void basellm::UpdateToolCallConstraintState(ResponseContext *context, int tokenId) {

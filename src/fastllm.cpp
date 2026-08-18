@@ -3302,6 +3302,11 @@ namespace fastllm {
     Random fastllmRandom;
 
     static bool ToolCallConstraintAllowsToken(const GenerationConfig &config, int tokenId) {
+        const auto &blocked = config.tool_call_blocked_token_ids;
+        if (!blocked.empty() &&
+            std::binary_search(blocked.begin(), blocked.end(), tokenId)) {
+            return false;
+        }
         const auto &allowed = config.tool_call_allowed_token_ids;
         if (allowed.empty()) {
             return true;
@@ -3334,7 +3339,8 @@ namespace fastllm {
             topk = 1;
         }
         std::vector <std::pair <float, int> > v;
-        bool hasToolNameMask = !config.tool_call_allowed_token_ids.empty();
+        bool hasToolNameMask = !config.tool_call_allowed_token_ids.empty() ||
+                               !config.tool_call_blocked_token_ids.empty();
         if (topk <= 64) {
             v.reserve(topk);
             auto betterThan = [](const std::pair<float, int> &a,
@@ -3383,6 +3389,7 @@ namespace fastllm {
         if (v.empty() && hasToolNameMask) {
             GenerationConfig fallbackConfig = config;
             fallbackConfig.tool_call_allowed_token_ids.clear();
+            fallbackConfig.tool_call_blocked_token_ids.clear();
             return LLMSampling(logits, outerOffset, fallbackConfig, tokens);
         }
         topk = std::min(topk, (int)v.size());
@@ -3429,6 +3436,7 @@ namespace fastllm {
         if (candidateOffsets.empty() && !config.tool_call_allowed_token_ids.empty()) {
             GenerationConfig fallbackConfig = config;
             fallbackConfig.tool_call_allowed_token_ids.clear();
+            fallbackConfig.tool_call_blocked_token_ids.clear();
             return LLMSamplingOnly(logits, outerOffset, fallbackConfig);
         }
         if (candidateOffsets.empty()) {
