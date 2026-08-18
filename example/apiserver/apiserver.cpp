@@ -410,7 +410,11 @@ struct WorkNode {
 // 避免对已复用的 fd 二次 close。
 static void CloseNodeClient(WorkNode *node) {
     if (node != nullptr && node->client >= 0) {
-        CloseNodeClient(node);
+        // 这里原本写成了 CloseNodeClient(node) —— 自递归且 node->client 不变,
+        // 守卫永远成立 => 无限递归爆栈 => SIGSEGV。ad019956 把各处的
+        // close(node->client) 重构进本函数时写错了。生产上三次段错误的
+        // backtrace 全是本函数的无限自调用。
+        close(node->client);
         node->client = -1;
     }
 }
