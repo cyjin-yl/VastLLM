@@ -7133,6 +7133,23 @@ namespace fastllm {
         std::atomic<uint64_t> pcStatEvictTrieNodes{0};
         std::atomic<uint64_t> pcStatEvictCpuTierCalls{0};
         std::atomic<uint64_t> pcStatEvictCpuTierBytes{0};
+        // 记录路径(TryRecordPagedCache 链)
+        std::atomic<uint64_t> pcRecCalls{0};
+        std::atomic<uint64_t> pcRecSkipLinearBounded{0};
+        std::atomic<uint64_t> pcRecSkipNoPagedLen{0};
+        std::atomic<uint64_t> pcRecSkipNoUnbounded{0};
+        std::atomic<uint64_t> pcRecSkipBoundedShort{0};
+        std::atomic<uint64_t> pcRecSkipManagerInvalid{0};
+        std::atomic<uint64_t> pcRecLayersOk{0};
+        std::atomic<uint64_t> pcRecManagerNoPages{0};
+        std::atomic<uint64_t> pcExtraCalls{0};
+        std::atomic<uint64_t> pcExtraOk{0};
+        std::atomic<uint64_t> pcExtraSkipDisabled{0};
+        std::atomic<uint64_t> pcExtraSkipLenMisaligned{0};
+        std::atomic<uint64_t> pcExtraSkipNoProgress{0};
+        std::atomic<uint64_t> pcExtraSkipInterval{0};
+        std::atomic<uint64_t> pcExtraSkipSnapshotCopy{0};
+        std::atomic<uint64_t> pcExtraSkipMtp{0};
     }
 
     bool PrefixCacheStatsEnabled() {
@@ -7220,8 +7237,30 @@ namespace fastllm {
                    (unsigned long long)(s.memTrieResidentBytes >> 20),
                    (unsigned long long)(s.cpuTierResidentBytes >> 20),
                    (unsigned long long)(s.diskResidentBytes >> 20));
+            printf("[PrefixCache] record-path: calls=%llu skip{linear-bounded=%llu "
+                   "no-paged-len=%llu no-unbounded=%llu bounded-short=%llu "
+                   "mgr-invalid=%llu mgr-no-pages=%llu} layers-ok=%llu | "
+                   "extra{calls=%llu ok=%llu disabled=%llu len=%llu "
+                   "no-progress=%llu interval=%llu copy=%llu mtp=%llu}\n",
+                   (unsigned long long)s.recordCalls,
+                   (unsigned long long)s.recordSkipLinearBounded,
+                   (unsigned long long)s.recordSkipNoPagedLen,
+                   (unsigned long long)s.recordSkipNoUnbounded,
+                   (unsigned long long)s.recordSkipBoundedShort,
+                   (unsigned long long)s.recordSkipManagerInvalid,
+                   (unsigned long long)s.recordManagerNoPages,
+                   (unsigned long long)s.recordLayersOk,
+                   (unsigned long long)s.extraCalls,
+                   (unsigned long long)s.extraOk,
+                   (unsigned long long)s.extraSkipDisabled,
+                   (unsigned long long)s.extraSkipLenMisaligned,
+                   (unsigned long long)s.extraSkipNoProgress,
+                   (unsigned long long)s.extraSkipInterval,
+                   (unsigned long long)s.extraSkipSnapshotCopy,
+                   (unsigned long long)s.extraSkipMtp);
         }
         fflush(stdout);
+        
     }
 
     void PrefixCacheStatsObserveRecord(bool accepted, const char *rejectReason) {
@@ -7258,6 +7297,28 @@ namespace fastllm {
             pcStatEvictCpuTierCalls.fetch_add(1);
             pcStatEvictCpuTierBytes += nodesOrBytes;
         }
+    }
+
+    void PrefixCacheStatsObserveRecordPath(const char *event) {
+        if (!PrefixCacheStatsEnabled() || event == nullptr) {
+            return;
+        }
+        if (!std::strcmp(event, "call")) pcRecCalls++;
+        else if (!std::strcmp(event, "skip-linear-bounded")) pcRecSkipLinearBounded++;
+        else if (!std::strcmp(event, "skip-no-paged-len")) pcRecSkipNoPagedLen++;
+        else if (!std::strcmp(event, "skip-no-unbounded")) pcRecSkipNoUnbounded++;
+        else if (!std::strcmp(event, "skip-bounded-short")) pcRecSkipBoundedShort++;
+        else if (!std::strcmp(event, "skip-manager-invalid")) pcRecSkipManagerInvalid++;
+        else if (!std::strcmp(event, "layer-ok")) pcRecLayersOk++;
+        else if (!std::strcmp(event, "manager-no-pages")) pcRecManagerNoPages++;
+        else if (!std::strcmp(event, "extra-call")) pcExtraCalls++;
+        else if (!std::strcmp(event, "extra-ok")) pcExtraOk++;
+        else if (!std::strcmp(event, "extra-skip-disabled")) pcExtraSkipDisabled++;
+        else if (!std::strcmp(event, "extra-skip-len")) pcExtraSkipLenMisaligned++;
+        else if (!std::strcmp(event, "extra-skip-no-progress")) pcExtraSkipNoProgress++;
+        else if (!std::strcmp(event, "extra-skip-interval")) pcExtraSkipInterval++;
+        else if (!std::strcmp(event, "extra-skip-copy")) pcExtraSkipSnapshotCopy++;
+        else if (!std::strcmp(event, "extra-skip-mtp")) pcExtraSkipMtp++;
     }
 
     PrefixCacheStats GetPrefixCacheStatsSnapshot() {
@@ -7303,6 +7364,22 @@ namespace fastllm {
                 trieBytes += pageBytes * (uint64_t)manager->triePagesSet.size();
             }
         }
+        s.recordCalls = pcRecCalls.load();
+        s.recordSkipLinearBounded = pcRecSkipLinearBounded.load();
+        s.recordSkipNoPagedLen = pcRecSkipNoPagedLen.load();
+        s.recordSkipNoUnbounded = pcRecSkipNoUnbounded.load();
+        s.recordSkipBoundedShort = pcRecSkipBoundedShort.load();
+        s.recordSkipManagerInvalid = pcRecSkipManagerInvalid.load();
+        s.recordLayersOk = pcRecLayersOk.load();
+        s.recordManagerNoPages = pcRecManagerNoPages.load();
+        s.extraCalls = pcExtraCalls.load();
+        s.extraOk = pcExtraOk.load();
+        s.extraSkipDisabled = pcExtraSkipDisabled.load();
+        s.extraSkipLenMisaligned = pcExtraSkipLenMisaligned.load();
+        s.extraSkipNoProgress = pcExtraSkipNoProgress.load();
+        s.extraSkipInterval = pcExtraSkipInterval.load();
+        s.extraSkipSnapshotCopy = pcExtraSkipSnapshotCopy.load();
+        s.extraSkipMtp = pcExtraSkipMtp.load();
         s.memTrieResidentBytes = trieBytes;
         return s;
     }
@@ -9051,6 +9128,9 @@ namespace fastllm {
         int numPages = (int)tokens.size() / this->pageLen;
         if ((int)pages.size() < numPages) {
             numPages = (int)pages.size();
+        }
+        if (numPages == 0) {
+            PrefixCacheStatsObserveRecordPath("manager-no-pages");
         }
 
         CacheTrieNode *cur = this->trieRoot;

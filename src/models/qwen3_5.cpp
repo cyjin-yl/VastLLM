@@ -8834,23 +8834,28 @@ namespace fastllm {
     }
 
     bool Qwen3_5Model::TryRecordPagedPrefixCacheExtra(ResponseContext *context) {
+        PrefixCacheStatsObserveRecordPath("extra-call");
         if (context == nullptr || !Qwen35LinearPrefixCacheEnabled() ||
             !Qwen35HasLinearAttentionLayers(this, this->block_cnt)) {
+            PrefixCacheStatsObserveRecordPath("extra-skip-disabled");
             return false;
         }
         int pageLen = fastllm::GetPageLen();
         int currentLen = Qwen35CurrentTokenGrowingCacheLen(this, this->block_cnt, context->pastKeyValues);
         if (currentLen <= 0 || currentLen > (int)context->allTokens.size() ||
             currentLen % pageLen != 0) {
+            PrefixCacheStatsObserveRecordPath("extra-skip-len");
             return false;
         }
         int lastSnapshotLen = context->intParams["qwen35_linear_prefix_last_len"];
         int snapshotCount = context->intParams["qwen35_linear_prefix_count"];
         if (currentLen <= lastSnapshotLen) {
+            PrefixCacheStatsObserveRecordPath("extra-skip-no-progress");
             return false;
         }
         int interval = Qwen35LinearPrefixSnapshotIntervalTokens();
         if (snapshotCount > 0 && currentLen % interval != 0) {
+            PrefixCacheStatsObserveRecordPath("extra-skip-interval");
             return false;
         }
         int requestId = context->intParams["qwen35_linear_prefix_request_id"];
@@ -8876,6 +8881,7 @@ namespace fastllm {
             if (i >= (int)context->pastKeyValues.size() ||
                 !Qwen35SnapshotCopyCache(context->pastKeyValues[i].first, snapshot->layers[i].first) ||
                 !Qwen35SnapshotCopyCache(context->pastKeyValues[i].second, snapshot->layers[i].second)) {
+                PrefixCacheStatsObserveRecordPath("extra-skip-copy");
                 return false;
             }
         }
@@ -8893,6 +8899,7 @@ namespace fastllm {
                 mtpIt->second->value.dims[1] != currentLen ||
                 !Qwen35SnapshotCopyTensor(mtpIt->second->key, snapshot->mtpKey) ||
                 !Qwen35SnapshotCopyTensor(mtpIt->second->value, snapshot->mtpValue)) {
+                PrefixCacheStatsObserveRecordPath("extra-skip-mtp");
                 return false;
             }
             snapshot->mtpValid = true;
@@ -8953,6 +8960,7 @@ namespace fastllm {
         }
         context->intParams["qwen35_linear_prefix_last_len"] = currentLen;
         context->intParams["qwen35_linear_prefix_count"] = snapshotCount + 1;
+        PrefixCacheStatsObserveRecordPath("extra-ok");
         return true;
     }
 

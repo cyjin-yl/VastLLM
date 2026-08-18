@@ -947,7 +947,26 @@ namespace fastllm {
         uint64_t memTrieResidentBytes = 0;
         uint64_t cpuTierResidentBytes = 0;
         uint64_t diskResidentBytes = 0;
+        // ---- 记录路径(TryRecordPagedCache 链)跳过原因 ----
+        uint64_t recordCalls = 0;            // TryRecordPagedCache 被调次数
+        uint64_t recordSkipLinearBounded = 0;// linear/bounded 且 extra 未成功
+        uint64_t recordSkipNoPagedLen = 0;   // 无任何层有 paged 长度
+        uint64_t recordSkipNoUnbounded = 0;  // 无 unbounded 层 -> reusable=0
+        uint64_t recordSkipBoundedShort = 0; // bounded 层页链不足 reusable
+        uint64_t recordSkipManagerInvalid = 0;// manager null/非 KV 类型/页空
+        uint64_t recordLayersOk = 0;         // Record() 实际执行层数
+        uint64_t recordManagerNoPages = 0;   // Record 内 numPages=0
+        // qwen3_5 linear-attention extra 子路径
+        uint64_t extraCalls = 0;
+        uint64_t extraOk = 0;
+        uint64_t extraSkipDisabled = 0;      // 前缀缓存关/无 linear 层
+        uint64_t extraSkipLenMisaligned = 0; // len<=0|>allTokens|未页对齐
+        uint64_t extraSkipNoProgress = 0;    // len<=lastSnapshotLen
+        uint64_t extraSkipInterval = 0;      // %snapshotInterval!=0
+        uint64_t extraSkipSnapshotCopy = 0;  // linear 层快照拷贝失败
+        uint64_t extraSkipMtp = 0;           // requireMtp 但 MTP cache 缺/不配
     };
+    void PrefixCacheStatsObserveRecordPath(const char *event);
     bool PrefixCacheStatsEnabled();
     void PrefixCacheStatsObserveRequest(
         int totalTokens, int hitTokens,

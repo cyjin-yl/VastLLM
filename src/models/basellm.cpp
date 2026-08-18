@@ -1092,6 +1092,7 @@ namespace fastllm {
     }
 
     void ResponseContext::TryRecordPagedCache(basellm *model) {
+        PrefixCacheStatsObserveRecordPath("call");
         bool hasLinearAttentionCache = false;
         bool hasBoundedAttentionCache = false;
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
@@ -1109,6 +1110,7 @@ namespace fastllm {
             model != nullptr && model->TryRecordPagedPrefixCacheExtra(this);
         if ((hasLinearAttentionCache || hasBoundedAttentionCache) &&
             !recordedPrefixExtra) {
+            PrefixCacheStatsObserveRecordPath("skip-linear-bounded");
             return;
         }
 
@@ -1161,6 +1163,16 @@ namespace fastllm {
         }
         if (!foundUnboundedCache) {
             reusablePrefixLen = 0;
+            bool anyPagedLen = false;
+            for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
+                if (pagedCacheTokenLen(this->pastKeyValues[i].first) > 0 ||
+                    pagedCacheTokenLen(this->pastKeyValues[i].second) > 0) {
+                    anyPagedLen = true;
+                    break;
+                }
+            }
+            PrefixCacheStatsObserveRecordPath(
+                anyPagedLen ? "skip-no-unbounded" : "skip-no-paged-len");
         }
 
         std::function<void(Data&)> recordPagedCache = [&](Data &cache) {
@@ -1179,6 +1191,9 @@ namespace fastllm {
             if (cache.pagedKVCacheData != nullptr && !cache.pageIndex.empty() &&
                 cache.pagedKVCacheData->type == PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
                 cache.pagedKVCacheData->Record(this->allTokens, cache.pageIndex);
+                PrefixCacheStatsObserveRecordPath("layer-ok");
+            } else {
+                PrefixCacheStatsObserveRecordPath("skip-manager-invalid");
             }
         };
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
@@ -1188,6 +1203,7 @@ namespace fastllm {
                 (reusablePrefixLen <= 0 ||
                  pagedCacheTokenLen(kvFirst) < reusablePrefixLen ||
                  pagedCacheTokenLen(kvSecond) < reusablePrefixLen)) {
+                PrefixCacheStatsObserveRecordPath("skip-bounded-short");
                 continue;
             }
             recordPagedCache(kvFirst);
