@@ -4655,6 +4655,13 @@ namespace fastllm {
                     long long genTokens = 0;
                     const bool printProfile = GetFastllmEnv().printProfile;
                     while (true) {
+                    // NOTE: try block intentionally shares the loop's
+                    // indentation to keep this diff small — an exception
+                    // escaping Forward (e.g. PagedCacheManager::Grow OOM
+                    // pre-check) used to reach the std::thread boundary and
+                    // std::terminate the whole server.  Catch here, fail the
+                    // in-flight batch, and keep serving.
+                    try {
                         if (model->isFree) {
                             break;
                         }
@@ -5028,6 +5035,34 @@ namespace fastllm {
                         if (seqLens.size() == 0) {
                             model->dictCV.wait(dictLocker);
                         }
+                    } catch (const std::exception &batchError) {
+                        fprintf(stderr,
+                                "[mainLoop] batch forward failed: %s — "
+                                "aborting in-flight requests; process survives.\n",
+                                batchError.what());
+                        try {
+                            std::lock_guard<std::mutex> abortGuard(model->dictLocker);
+                            for (auto &abortIt : model->responseContextDict.dicts) {
+                                if (abortIt.second != nullptr && !abortIt.second->isEnding) {
+                                    abortIt.second->isAbort = true;
+                                }
+                            }
+                        } catch (...) {
+                        }
+                    } catch (...) {
+                        fprintf(stderr,
+                                "[mainLoop] batch forward failed with unknown error — "
+                                "aborting in-flight requests; process survives.\n");
+                        try {
+                            std::lock_guard<std::mutex> abortGuard(model->dictLocker);
+                            for (auto &abortIt : model->responseContextDict.dicts) {
+                                if (abortIt.second != nullptr && !abortIt.second->isEnding) {
+                                    abortIt.second->isAbort = true;
+                                }
+                            }
+                        } catch (...) {
+                        }
+                    }
                     }
                 }, this);
                     } // end of else (old engine)

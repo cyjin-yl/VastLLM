@@ -7261,6 +7261,34 @@ namespace fastllm {
                (unsigned long long)reqSeq, totalTokens, hitTokens,
                hitLayer != nullptr ? hitLayer : "-",
                missReason != nullptr ? missReason : "-");
+        // Per-request record-path line: with multi-agent traffic a generation
+        // rarely survives 8 requests, so the %8 periodic snapshot never fires.
+        // Printing the counters alongside every req# line shows exactly which
+        // early-return the record path died on for THIS request.
+        {
+            PrefixCacheStats s = GetPrefixCacheStatsSnapshot();
+            printf("[PrefixCache] record-path: calls=%llu skip{linear-bounded=%llu "
+                   "no-paged-len=%llu no-unbounded=%llu bounded-short=%llu "
+                   "mgr-invalid=%llu mgr-no-pages=%llu} layers-ok=%llu | "
+                   "extra{calls=%llu ok=%llu disabled=%llu len=%llu "
+                   "no-progress=%llu interval=%llu copy=%llu mtp=%llu}\n",
+                   (unsigned long long)s.recordCalls,
+                   (unsigned long long)s.recordSkipLinearBounded,
+                   (unsigned long long)s.recordSkipNoPagedLen,
+                   (unsigned long long)s.recordSkipNoUnbounded,
+                   (unsigned long long)s.recordSkipBoundedShort,
+                   (unsigned long long)s.recordSkipManagerInvalid,
+                   (unsigned long long)s.recordManagerNoPages,
+                   (unsigned long long)s.recordLayersOk,
+                   (unsigned long long)s.extraCalls,
+                   (unsigned long long)s.extraOk,
+                   (unsigned long long)s.extraSkipDisabled,
+                   (unsigned long long)s.extraSkipLenMisaligned,
+                   (unsigned long long)s.extraSkipNoProgress,
+                   (unsigned long long)s.extraSkipInterval,
+                   (unsigned long long)s.extraSkipSnapshotCopy,
+                   (unsigned long long)s.extraSkipMtp);
+        }
         if (reqSeq % 8 == 0) {
             PrefixCacheStats s = GetPrefixCacheStatsSnapshot();
             printf("[PrefixCache] periodic: reqs=%llu hitReqs=%llu "
