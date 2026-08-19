@@ -169,16 +169,17 @@ namespace fastllm {
                 msg += ", name = " + data.name;
             }
             msg += ".\n";
-            // Tensor-parallel ranks are worker threads in one process.  Waiting
-            // for stdin here leaves peer ranks blocked in NCCL and makes an API
-            // server look healthy while every request hangs.  Allocation
-            // failure is not recoverable at this layer, so fail the complete TP
-            // process promptly; the serving supervisor can restart it and
-            // clients receive a connection failure instead of an infinite wait.
-            fprintf(stderr, "FastLLM fatal CUDA allocation error: %s", msg.c_str());
+            // OOM 不再杀进程:reload 权重需 4 分钟,太贵。抛异常让请求层
+            // catch → abort 当前请求(其 KV 页/临时量随栈展开释放),服务
+            // 继续。cudaErrorMemoryAllocation 不污染 CUDA context,后续
+            // 请求可正常执行。加载/warmup 期的 throw 无 catch 仍会
+            // terminate —— 那是合理行为(模型没加载完无服务能力,proxy
+            // 会重拉)。MTPLoop 的请求级 catch 覆盖 serving 期。
+            fprintf(stderr, "FastLLM CUDA allocation error (request aborted): %s", msg.c_str());
             fflush(stdout);
             fflush(stderr);
-            std::_Exit(EXIT_FAILURE);
+            ErrorInFastLLM("CUDA out of memory: " + msg);
+            return false; // unreachable; ErrorInFastLLM throws
         }
 
         static void CudaFreeForData(const Data &data, void *ptr) {
