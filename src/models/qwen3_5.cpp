@@ -20444,7 +20444,37 @@ namespace fastllm {
             decodePositionIds.reserve(mtpSchedulerLanes);
 
             std::unique_lock<std::mutex> dictLocker(model->dictLocker);
-            auto &forwardLocker = model->forwardLocker;
+            // 【上游BUMP勿回退】这里必须是 unique_lock, 不能退回
+            //     auto &forwardLocker = model->forwardLocker;
+            // 那个裸引用写法是一个**静默僵死**的根因(2026-08-20 生产实测)。
+            //
+            // 前因: 本 try 位于 while 循环内, 每轮一个。循环体在 L~21271 手工
+            //   forwardLocker.lock(), 跑完批前向后在 L~21991 手工 unlock()。
+            //   两者之间没有 continue/break, 唯一能跳过 unlock 的就是**抛异常**
+            //   —— 而批前向内部的 PagedCacheManager::Grow 在显存不足/超预算时
+            //   正是抛异常的(日志: "[MTPLoop] batch forward failed:
+            //   PagedCacheManager::Grow: insufficient free VRAM ...")。
+            //
+            // 后果: 裸 std::mutex 没有 RAII, 异常展开跳过 unlock, forwardLocker
+            //   **永久保持锁定**。外层 catch 打印 "process survives" 后 while
+            //   继续下一轮, 再次执行 forwardLocker.lock() —— 同一线程二次加锁,
+            //   std::mutex 非递归 => 永久自死锁。MTP 解码线程就此僵死,
+            //   所有客户端线程随之堵在 FetchResponseTokens 上。
+            //   现场特征: 后端 running=N pending=M 冻结、done 0 req、
+            //   prefill/decode 均 0 tok/s、GPU 0% 而显存照占、代理侧 queued 一路涨;
+            //   gdb 显示 pthread_mutex_t.__owner == 等待线程自己的 tid。
+            //   讽刺的是日志恰恰写着 "process survives"。
+            //
+            // 间歇性: 只有异常**恰好落在 lock/unlock 窗口内**才死。日志里
+            //   Grow 抛过 6 次, 前 5 次抛在窗口外都活了下来, 第 6 次才僵死。
+            //   别把它当成"偶发的玄学问题"。
+            //
+            // 修法: 换成 defer_lock 的 unique_lock。下面两个使用点
+            //   (.lock() / .unlock()) 的写法完全不用改, 但异常展开时析构函数
+            //   会释放锁; 而且万一真的重复 lock, unique_lock 会抛
+            //   resource_deadlock_would_occur 而不是静默挂死 —— 有报错总比僵死好。
+            std::unique_lock<std::mutex> forwardLocker(model->forwardLocker,
+                                                       std::defer_lock);
             std::vector<int> forcedGpuTokenHandoffHandles;
             std::set<int> gpuTokenHandoffDiscardedCacheHandles;
             if (gpuTokenHandoffPending) {

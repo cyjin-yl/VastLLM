@@ -3604,7 +3604,21 @@ namespace fastllm {
             decodePositionIds.reserve(reserveBatch);
 
             std::unique_lock<std::mutex> dictLocker(model->dictLocker);
-            auto &forwardLocker = model->forwardLocker;
+            // 【上游BUMP勿回退】必须是 unique_lock, 不能退回裸引用
+            //     auto &forwardLocker = model->forwardLocker;
+            // 与 qwen3_5.cpp 的 Qwen35MTPLoop 是同一个 bug 的多份拷贝。
+            // 前因: 本循环手工 forwardLocker.lock() ... unlock(), 中间跑批前向;
+            //   而批前向内部的 PagedCacheManager::Grow 在显存不足时**抛异常**。
+            // 后果: 裸 std::mutex 无 RAII, 异常展开跳过 unlock -> 锁永久不释放;
+            //   外层 catch 打印 "process survives" 后循环继续, 再次 lock() ->
+            //   同线程二次加锁, std::mutex 非递归 -> 永久自死锁。该线程攥着锁僵死,
+            //   所有客户端线程堵在 FetchResponseTokens, 后端静默僵死
+            //   (running/pending 冻结、done 0 req、GPU 0%、显存照占)。
+            // 间歇性: 只有异常恰好落在 lock/unlock 窗口内才死, 别当成玄学。
+            // 修法: defer_lock 的 unique_lock —— 下面 .lock()/.unlock() 写法不变,
+            //   但异常展开会析构释放; 真重复 lock 也会抛异常而非静默挂死。
+            std::unique_lock<std::mutex> forwardLocker(model->forwardLocker,
+                                                       std::defer_lock);
 
             // 单次遍历：处理abort、释放isEnding的KV cache、统计alive、构建orders、检测hasPrefill
             std::vector <int> abortHandles;
@@ -4752,7 +4766,21 @@ namespace fastllm {
                         std::vector <std::vector <float>* > logits;
 
                         std::unique_lock<std::mutex> dictLocker(model->dictLocker);
-                        auto &forwardLocker = model->forwardLocker;
+                        // 【上游BUMP勿回退】必须是 unique_lock, 不能退回裸引用
+                        //     auto &forwardLocker = model->forwardLocker;
+                        // 与 qwen3_5.cpp 的 Qwen35MTPLoop 是同一个 bug 的多份拷贝。
+                        // 前因: 本循环手工 forwardLocker.lock() ... unlock(), 中间跑批前向;
+                        //   而批前向内部的 PagedCacheManager::Grow 在显存不足时**抛异常**。
+                        // 后果: 裸 std::mutex 无 RAII, 异常展开跳过 unlock -> 锁永久不释放;
+                        //   外层 catch 打印 "process survives" 后循环继续, 再次 lock() ->
+                        //   同线程二次加锁, std::mutex 非递归 -> 永久自死锁。该线程攥着锁僵死,
+                        //   所有客户端线程堵在 FetchResponseTokens, 后端静默僵死
+                        //   (running/pending 冻结、done 0 req、GPU 0%、显存照占)。
+                        // 间歇性: 只有异常恰好落在 lock/unlock 窗口内才死, 别当成玄学。
+                        // 修法: defer_lock 的 unique_lock —— 下面 .lock()/.unlock() 写法不变,
+                        //   但异常展开会析构释放; 真重复 lock 也会抛异常而非静默挂死。
+                        std::unique_lock<std::mutex> forwardLocker(model->forwardLocker,
+                                                                   std::defer_lock);
 
                         // 首先把已经abort的请求删除掉
                         std::set <int> abortHandles;
