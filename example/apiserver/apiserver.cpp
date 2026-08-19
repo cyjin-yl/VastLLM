@@ -419,10 +419,31 @@ static void CloseNodeClient(WorkNode *node) {
     }
 }
 
+// 健康检查/元数据类路由: 不碰模型、不做推理, 因此不该占用推理并发额度。
+//
+// 为什么需要区分(2026-08-20 生产事故的放大器):
+//   maxActivateQueryNumber = min(256, --batch), 生产是 --batch 1 => 1。
+//   派发闸门 activateQueryNumber < maxActivateQueryNumber 对**所有**路由生效,
+//   于是只要有一个请求在生成, /health 和 /version 就一直排队, 客户端超时。
+//   后果: 上游代理无法区分"后端在忙"与"后端已僵死" —— 本次 MTPLoop 自死锁
+//   期间, 代理始终显示 backend=READY, 故障因此拖了一个小时才被发现。
+// 注意不能把 /admin/* 放进来: 它们会 suspend/resume 模型, 必须串行。
+static bool IsLightweightRoute(const std::string &rawRoute) {
+    std::string route = rawRoute;
+    if (route.size() > 1 && route.back() == '/') {
+        route.pop_back();
+    }
+    return route == "/health" || route == "/version" ||
+           route == "/props" || route == "/config.json";
+}
+
 struct WorkQueue {
     std::unique_ptr<fastllm::basellm> model;
     int maxActivateQueryNumber = 256;
     int activateQueryNumber = 0;
+    // 轻量路由走独立队列, 否则会被队头的推理请求挡住(head-of-line blocking)
+    std::queue <WorkNode*> lightQ;
+    int activateLightNumber = 0;
     int totalQueryNumber = 0;
     std::mutex locker;
     std::condition_variable cv;
@@ -461,9 +482,15 @@ struct WorkQueue {
     }
 
     void Push(char *buffer, int client) {
+        WorkNode *node = new WorkNode();
+        node->Init(buffer, client);
+        const bool light = IsLightweightRoute(node->request.route);
         locker.lock();
-        q.push(new WorkNode());
-        q.back()->Init(buffer, client);
+        if (light) {
+            lightQ.push(node);
+        } else {
+            q.push(node);
+        }
         locker.unlock();
 
         cv.notify_all();
@@ -600,31 +627,29 @@ struct WorkQueue {
                         ts->activateQueryNumber <
                             ts->maxActivateQueryNumber &&
                         !ts->q.empty();
+                    // 轻量路由不看推理额度, 只要没在 checkpoint/suspend 就能发
+                    const bool canDispatchLight =
+                        !ts->checkpointInProgress &&
+                        !ts->suspendInProgress &&
+                        !ts->resumeInProgress &&
+                        !ts->lightQ.empty();
                     const bool drained =
                         ts->stopping &&
                         !ts->checkpointInProgress &&
                         ts->activateQueryNumber == 0 &&
-                        ts->q.empty();
-                    return canDispatch || drained;
+                        ts->activateLightNumber == 0 &&
+                        ts->q.empty() && ts->lightQ.empty();
+                    return canDispatch || canDispatchLight || drained;
                 });
                 if (ts->stopping &&
                     ts->activateQueryNumber == 0 &&
-                    ts->q.empty()) {
+                    ts->activateLightNumber == 0 &&
+                    ts->q.empty() && ts->lightQ.empty()) {
                     return;
                 }
-                while (!ts->checkpointInProgress &&
-                       !ts->suspendInProgress &&
-                       !ts->resumeInProgress &&
-                       ts->activateQueryNumber <
-                           ts->maxActivateQueryNumber &&
-                       !ts->q.empty()) {
-                    WorkNode *now = ts->q.front();
-                    ts->q.pop();
-                    ts->activateQueryNumber++;
-                    ts->totalQueryNumber++;
-                    printf("totalQueryNumber = %d\n",
-                           ts->totalQueryNumber);
-                    std::thread([ts](WorkNode *now) {
+                // 请求线程体。轻量路由(健康检查/元数据)与推理请求共用同一段
+                // 逻辑, 只是记在不同的并发计数上 —— 见 IsLightweightRoute 的说明。
+                auto runNode = [ts](WorkNode *now, bool light) {
                         // 请求线程兜底:Deal 内任何异常(如 KV 页池 Grow OOM)
                         // 不得逃逸——detached 线程异常 = std::terminate 全进程自杀。
                         // 记 500 + 关闭连接,调度簿记照常,进程继续服务。
@@ -669,12 +694,64 @@ struct WorkQueue {
                                now->client);
                         delete now;
                         {
-                            std::lock_guard<std::mutex> lock(
-                                ts->locker);
+                        std::lock_guard<std::mutex> lock(ts->locker);
+                        if (light) {
+                            ts->activateLightNumber--;
+                        } else {
                             ts->activateQueryNumber--;
                         }
-                        ts->cv.notify_all();
-                    }, now).detach();
+                    }
+                    ts->cv.notify_all();
+                };
+
+                // 先发轻量路由: 不占推理额度, 也不能被队头的长请求挡住。
+                // 这样 /health 在后端满负荷时依然秒回, 上游代理才能区分
+                // "在忙"和"已僵死"。
+                while (!ts->checkpointInProgress &&
+                       !ts->suspendInProgress &&
+                       !ts->resumeInProgress &&
+                       !ts->lightQ.empty()) {
+                    WorkNode *now = ts->lightQ.front();
+                    ts->lightQ.pop();
+                    if (SocketPeerDisconnected(now->client)) {
+                        CloseNodeClient(now);
+                        delete now;
+                        continue;
+                    }
+                    ts->activateLightNumber++;
+                    std::thread(runNode, now, true).detach();
+                }
+
+                while (!ts->checkpointInProgress &&
+                       !ts->suspendInProgress &&
+                       !ts->resumeInProgress &&
+                       ts->activateQueryNumber <
+                           ts->maxActivateQueryNumber &&
+                       !ts->q.empty()) {
+                    WorkNode *now = ts->q.front();
+                    ts->q.pop();
+                    // 排队期间客户端很可能已经走了(agent 超时、用户 Ctrl-C、
+                    // 上游 proxy 断流)。此时再去算它是纯亏:
+                    //   - 一个 262K 的 prefill 要独占 GPU 几分钟;
+                    //   - 它占的 KV 页在整个生成期间不释放, 把页池顶到水位线,
+                    //     进而诱发 PagedCacheManager::Grow 失败(实测会连带
+                    //     中断所有在飞请求);
+                    //   - 真实请求被它挤在队列后面干等。
+                    // 生产上见过后端 running=1 pending=5 全是这种僵尸请求。
+                    // 探活只是一次 select(0 超时)+MSG_PEEK, 不消耗数据也不阻塞。
+                    if (SocketPeerDisconnected(now->client)) {
+                        printf("[queue] 丢弃已断开的排队请求 client=%d\n",
+                               now->client);
+                        fflush(stdout);
+                        CloseNodeClient(now);
+                        delete now;
+                        continue;
+                    }
+                    ts->activateQueryNumber++;
+                    ts->totalQueryNumber++;
+                    printf("totalQueryNumber = %d\n",
+                           ts->totalQueryNumber);
+                    std::thread(runNode, now, false).detach();
                 }
             }
         }, this);
@@ -2043,6 +2120,22 @@ struct WorkQueue {
                                            parsed.toolCalls.end());
                 };
                 while (true) {
+                    // 非流式路径原本直接调阻塞的 FetchResponseTokens, 于是
+                    // **整个 prefill 期间都没有任何断连检测** —— 262K 的 prefill
+                    // 要跑几分钟, 客户端早走了也照算到底, 白烧 GPU 和 KV 页。
+                    // 流式路径已经是下面这个非阻塞轮询写法, 这里对齐它。
+                    // (机制本来就有: basellm.h 里 isAbort 的注释写着"不会再有人
+                    //  来 fetch 它了, 推理完就可以删除这个请求" —— 缺的只是
+                    //  没人去触发。)
+                    while (!model->CanFetchResponse(handleId)) {
+                        if (SocketPeerDisconnected(node->client)) {
+                            model->AbortResponse(handleId);
+                            CloseNodeClient(node);
+                            return;
+                        }
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(10));
+                    }
                     int result = model->FetchResponseTokens(handleId);
                     if (result == -1) {
                         recordMetrics(outputTokens);
