@@ -7,6 +7,7 @@
 //   V: Turbo3 (fp16 corrected norm + 3-bit indices per 128-value block)
 // Every (page, token, head) owns an independent packed row.
 //
+#include <cstdlib>
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
@@ -479,12 +480,27 @@ __global__ void GatherTurbo4HeadRangeKernel(
         __float2half_rn(x[lane]);
 }
 
+// TurboKV 诊断打印总开关。
+// 这两条 printf 原本是无条件/弱条件打开的, 在生产日志里累计刷了 13 万行
+// (Copy enter 98240 行 + MultiPage enter 35029 行), 而且每次都 fflush(stdout)
+// —— 热路径上的系统调用。Copy enter 的条件是 copyLen>=128, 只在 prefill 时
+// 爆发, decode 期间看不出来, 下一个长 prefill 就会再刷 9 万行。
+// 诊断能力保留, 默认关闭。
+static bool TurboKvTraceEnabled() {
+    static const bool enabled = []() {
+        const char *env = std::getenv("FASTLLM_TURBOKV_TRACE");
+        return env != nullptr && env[0] != 0 && env[0] != '0';
+    }();
+    return enabled;
+}
+
 template <typename SrcT>
 bool LaunchCopy(uint8_t *pagedData, int pageIdx, int pageLen, int numHeads,
                 int headDim, fastllm::DataType dstType, const SrcT *inputData,
                 int seqLen, int inputOffset, int copyLen, int pageOffset) {
     // hang 定位: 大拷贝(prefill chunk)打参数, decode(copyLen=1)不打。
-    if (copyLen >= 128 || pageIdx < 0 || pageIdx >= 1024 * 1024) {
+    if (TurboKvTraceEnabled() &&
+        (copyLen >= 128 || pageIdx < 0 || pageIdx >= 1024 * 1024)) {
         printf("[TurboKV] Copy enter: pageIdx=%d copyLen=%d pageOffset=%d "
                "inputOffset=%d seqLen=%d numHeads=%d dstType=%d "
                "pagedData=%p inputData=%p\n",
@@ -602,12 +618,17 @@ bool LaunchCopyMultiPage(uint8_t *pagedData, const int *pageIdxHost,
                          const SrcT *inputData, int seqLen,
                          int dstRowLimit) {
     // hang 定位: multipage 入口参数。
-    printf("[TurboKV] MultiPage enter: pageCount=%d firstPageOffset=%d "
-           "pageLen=%d seqLen=%d numHeads=%d dstRowLimit=%d pages=[%d..%d]\n",
-           pageCount, firstPageOffset, pageLen, seqLen, numHeads, dstRowLimit,
-           pageIdxHost ? pageIdxHost[0] : -1,
-           (pageIdxHost && pageCount > 0) ? pageIdxHost[pageCount - 1] : -1);
-    fflush(stdout);
+    // 这条原本是无条件打印, 在生产日志里累积了 12.8 万行, 而且每次都
+    // fflush(stdout) —— 热路径上的系统调用, 既污染日志又拖性能。
+    // 诊断能力保留, 改为 FASTLLM_TURBOKV_TRACE=1 才开。
+    if (TurboKvTraceEnabled()) {
+        printf("[TurboKV] MultiPage enter: pageCount=%d firstPageOffset=%d "
+               "pageLen=%d seqLen=%d numHeads=%d dstRowLimit=%d pages=[%d..%d]\n",
+               pageCount, firstPageOffset, pageLen, seqLen, numHeads, dstRowLimit,
+               pageIdxHost ? pageIdxHost[0] : -1,
+               (pageIdxHost && pageCount > 0) ? pageIdxHost[pageCount - 1] : -1);
+        fflush(stdout);
+    }
     if (headDim != kHeadDim || seqLen <= 0 || pageIdxHost == nullptr ||
         pageCount <= 0 || pageCount > kMaxMultiPageCount ||
         firstPageOffset < 0 || firstPageOffset >= pageLen) {

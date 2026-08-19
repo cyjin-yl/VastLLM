@@ -8722,6 +8722,8 @@ namespace fastllm {
 
     int PagedCacheManager::GetUnusedPageIndex(bool pick) {
         int pageIndex;
+        // >0 表示"水位低但预算未用尽, 出临界区后扩容到这个页数"
+        int growForWatermarkTo = -1;
         {
             std::lock_guard<std::mutex> guard(this->pageIndexLocker);
             pageIndex = GetUnusedPageIndexLocked(pick, nullptr);
@@ -8739,7 +8741,25 @@ namespace fastllm {
                 : std::max(64, this->dims[0] / 16);
             const int highWater = highWaterEnv >= 0 ? highWaterEnv
                 : std::max(256, this->dims[0] / 4);
+            // 预算内优先扩容, 而不是逐出缓存。
+            // 代价完全不对等: 逐出一页冷前缀 = 丢掉一段已经算好的 KV
+            // (重算 100K 上下文要几百秒), 而扩容只是申请一块本来就允许
+            // 申请的显存。所以只有顶到 maxPages(逻辑预算)时才该动缓存。
+            //
+            // 原实现只在"取页彻底失败(pageIndex < 0)"时才 Grow, 而批量
+            // 回收总能凑出页 -> pageIndex 从不为负 -> Grow 永不触发 ->
+            // 池子长期停在很小规模、缓存被反复吃掉。
+            // 实测: batch recycle 触发 54924 次、freePages 常年 63、
+            // 前缀缓存 hitReqs=0 / record ok=0, 而池预算 6600MB 只用到 2871MB。
+            //
+            // Grow 会自己锁 pageIndexLocker(非递归锁), 所以这里只置标志,
+            // 出了临界区再扩容。
             if ((int)this->freePages.size() < lowWater &&
+                this->maxPages > this->dims[0]) {
+                growForWatermarkTo = GetPagedCacheGrowthTarget(
+                    this->dims[0], this->maxPages,
+                    std::max(1, highWater - (int)this->freePages.size()));
+            } else if ((int)this->freePages.size() < lowWater &&
                 !this->triePages.empty()) {
                 const int target =
                     highWater - (int)this->freePages.size();
@@ -8768,6 +8788,19 @@ namespace fastllm {
                             (int)this->freePages.size(),
                             lowWater, highWater, (long long)elapsedMs);
                 }
+            }
+        }
+        if (growForWatermarkTo > 0) {
+            // 水位驱动的扩容: 一次涨到高水位, 不是"缺一页涨一页",
+            // 避免 grow->回收->grow 的抖动(滞回)。
+            fprintf(stderr,
+                    "[PagedCache] 水位扩容(优先于逐出缓存): dims0=%d -> %d "
+                    "maxPages=%d\n",
+                    this->dims[0], growForWatermarkTo, this->maxPages);
+            this->Grow(growForWatermarkTo);
+            std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+            if (pageIndex < 0) {
+                pageIndex = GetUnusedPageIndexLocked(pick, nullptr);
             }
         }
         if (pageIndex < 0) {
