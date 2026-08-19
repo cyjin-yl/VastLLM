@@ -1210,6 +1210,23 @@ namespace fastllm {
 
     // 采样前把 NaN/Inf 压成 -1e30f, 返回被修正的个数; where 只用于日志。
     // 不做这一步的话 NaN 会劫持比较器, 输出退化成 token 0 ('!') 的长串。
+    // 全部 layer 的 paged KV 池当前占用的显存字节(用于与 nvidia-smi 对账)
+    uint64_t GetPagedPoolCudaBytes();
+
+    // 显存对账明细。nvidia-smi 的"已用"应当能被 pool + allocBusy + allocFree
+    // 解释, 剩下的就是 other(线上曾有 7.6GB 无主, 只能靠猜)。
+    // 注意 cudaMemGetInfo 的 free **不含** allocFree —— fastllm 自己的缓存
+    // 分配器攥着的空闲块对 CUDA 而言仍是"已用"。
+    struct VramBreakdown {
+        uint64_t usedBytes = 0;
+        uint64_t totalBytes = 0;
+        uint64_t pagedPoolBytes = 0;
+        uint64_t allocBusyBytes = 0;
+        uint64_t allocFreeBytes = 0;
+        uint64_t graphPinnedBytes = 0;
+    };
+    bool GetVramBreakdown(VramBreakdown &out);
+
     int SanitizeLogitsForSampling(float *base, int count, const char *where);
     long long GetNonFiniteLogitSteps();
 

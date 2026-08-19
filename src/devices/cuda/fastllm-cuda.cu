@@ -5360,6 +5360,33 @@ void FastllmCudaMallocBigBuffer(size_t size) {
     bigBuffers.push_back(CudaMemoryBuffer(ret, size, false));
 }
 
+// 显存明细记账。
+// 背景: 线上出现过 "kv_pool 只占 44%(3.4GB) + 权重 21.3GB, 但 nvidia-smi 显示
+// 已用 32.3GB" —— 有 7.6GB 不在任何账上, 只能靠猜。而 cudaMemGetInfo 的 free
+// **不包含** fastllm 自己缓存分配器里已释放但没还给 CUDA 的块, 于是会出现
+// "自己手里闲着 1.4GB 却报显存不足"。把 busy/free 分开报出来才能对账。
+void FastllmCudaMemoryBreakdown(uint64_t *bigBusyOut, uint64_t *bigFreeOut,
+                                uint64_t *smallBusyOut, uint64_t *smallFreeOut,
+                                uint64_t *graphPinnedOut) {
+    uint64_t bigBusy = 0, bigFree = 0, smallBusy = 0, smallFree = 0, pinned = 0;
+    std::vector<FastllmCudaMemPoolView> views = FastllmSnapshotCudaMemPoolViews();
+    for (auto &view : views) {
+        std::lock_guard<std::mutex> lock(*view.lock);
+        for (const auto &b : *view.bigBuffers) {
+            if (b.busy) { bigBusy += b.size; } else { bigFree += b.size; }
+            if (b.graphPins > 0) { pinned += b.size; }
+        }
+        for (const auto &b : *view.smallBuffers) {
+            if (b.busy) { smallBusy += b.size; } else { smallFree += b.size; }
+        }
+    }
+    if (bigBusyOut != nullptr) { *bigBusyOut = bigBusy; }
+    if (bigFreeOut != nullptr) { *bigFreeOut = bigFree; }
+    if (smallBusyOut != nullptr) { *smallBusyOut = smallBusy; }
+    if (smallFreeOut != nullptr) { *smallFreeOut = smallFree; }
+    if (graphPinnedOut != nullptr) { *graphPinnedOut = pinned; }
+}
+
 void FastllmCudaClearBigBuffer() {
     if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
         return;

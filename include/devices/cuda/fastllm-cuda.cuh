@@ -200,6 +200,11 @@ bool FastllmCudaGetGraphError();
 int FastllmCudaTryMallocBigBuffers(size_t size, int count);
 void FastllmCudaMallocBigBuffer(size_t size);
 void FastllmCudaClearBigBuffer();
+// 分配器明细: big/small 各自的 busy/free 字节, 以及被 CUDA Graph 钉住的字节。
+// cudaMemGetInfo 的 free 不含这里的 free 部分, 对账时必须一起看。
+void FastllmCudaMemoryBreakdown(uint64_t *bigBusyOut, uint64_t *bigFreeOut,
+                                uint64_t *smallBusyOut, uint64_t *smallFreeOut,
+                                uint64_t *graphPinnedOut);
 #ifdef __CUDACC__
 cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, int line);
 #endif

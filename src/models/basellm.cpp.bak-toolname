@@ -9,7 +9,6 @@
 #include <cstdlib>
 #include <climits>
 #include <algorithm>
-#include <cctype>
 #include <chrono>
 #include <exception>
 #include <set>
@@ -191,62 +190,6 @@ namespace fastllm {
             return true;
         }
 
-        // ---- 工具名规范化 -------------------------------------------------
-        // 模型对工具名有很强的先验(被训练成写 "Bash"/"Read"/"WebSearch"),
-        // 而 harness 声明的可能是 "bash"/"read"/"web_search"。生产上实测:
-        // omp 声明 12 个全小写工具, 模型一吐出 "B", 名字约束就找不到任何
-        // 合法后继 -> 掩码清空 -> 静默退回自由采样 -> 写出 "Bash" ->
-        // harness 收到不存在的工具名 -> 调用失败(日志里的 mask EXHAUSTED)。
-        //
-        // 规范化规则: 转小写 + 去掉 '-' '_' ' ' '.'。
-        // 这条规则**只依赖客户端自己在请求里声明的 tools 列表**, 不硬编码
-        // 任何 harness 的名字, 因此对 omp / OpenCode / Cherry Studio /
-        // 任意 OpenAI 或 Anthropic 客户端一视同仁。
-        static std::string ToolCallCanonicalKey(const std::string &s) {
-            std::string out;
-            out.reserve(s.size());
-            for (char c : s) {
-                if (c == '-' || c == '_' || c == ' ' || c == '.') {
-                    continue;
-                }
-                out.push_back((char)std::tolower((unsigned char)c));
-            }
-            return out;
-        }
-
-        // 把模型写出的名字映射回声明列表里的那一个。
-        // 精确命中优先; 规范化后有且仅有一个候选才替换 —— 存在歧义时
-        // (比如同时声明了 "read" 和 "Read")宁可原样返回, 不猜。
-        static std::string ResolveDeclaredToolName(
-                const std::string &name,
-                const std::vector<std::string> &declared) {
-            if (name.empty() || declared.empty()) {
-                return name;
-            }
-            for (const auto &d : declared) {
-                if (d == name) {
-                    return name;
-                }
-            }
-            const std::string key = ToolCallCanonicalKey(name);
-            const std::string *hit = nullptr;
-            for (const auto &d : declared) {
-                if (ToolCallCanonicalKey(d) == key) {
-                    if (hit != nullptr) {
-                        return name;   // 多个候选, 有歧义
-                    }
-                    hit = &d;
-                }
-            }
-            if (hit == nullptr) {
-                return name;
-            }
-            printf("[ToolCallTrace] 工具名归一化: '%s' -> '%s'\n",
-                   name.c_str(), hit->c_str());
-            fflush(stdout);
-            return *hit;
-        }
-
         static bool FindActiveToolCallNamePartial(const std::string &text,
                                                   const GenerationConfig &config,
                                                   std::string &partial) {
@@ -310,9 +253,7 @@ namespace fastllm {
             if (closePos != std::string::npos && closePos > bestPos) {
                 return false;
             }
-            toolName = ResolveDeclaredToolName(
-                    text.substr(nameStart, terminatorPos - nameStart),
-                    config.tool_call_allowed_names);
+            toolName = text.substr(nameStart, terminatorPos - nameStart);
             invokePos = bestPos;
             return !toolName.empty();
         }
@@ -526,22 +467,14 @@ namespace fastllm {
             auto terminatorPos = combined.find(terminator);
             std::string namePart = terminatorPos == std::string::npos ?
                                    combined : combined.substr(0, terminatorPos);
-            // 用规范化后的形式比较: 模型写 "Bash" 也算命中声明的 "bash",
-            // 于是掩码不会在第一个 token 就被清空(清空 = 静默退回自由采样,
-            // 那才是工具调用真正坏掉的地方)。名字最终由
-            // ResolveDeclaredToolName 归一化回声明的拼写。
-            const std::string namePartKey = ToolCallCanonicalKey(namePart);
             for (const auto &name : allowedValues) {
                 if (terminatorPos != std::string::npos) {
-                    if (namePart == name ||
-                        ToolCallCanonicalKey(name) == namePartKey) {
+                    if (namePart == name) {
                         return true;
                     }
                     continue;
                 }
-                if (ToolCallConstraintStartsWith(name, namePart) ||
-                    ToolCallConstraintStartsWith(ToolCallCanonicalKey(name),
-                                                 namePartKey)) {
+                if (ToolCallConstraintStartsWith(name, namePart)) {
                     return true;
                 }
             }
@@ -807,9 +740,7 @@ namespace fastllm {
                 cur.segmentStart = nameStart;
                 return cur;
             }
-            cur.functionName = ResolveDeclaredToolName(
-                    text.substr(nameStart, nameTerm - nameStart),
-                    config.tool_call_allowed_names);
+            cur.functionName = text.substr(nameStart, nameTerm - nameStart);
             cur.invokePos = invokePos;
             const std::string funcClose = "</function>";
             const std::string paramClose = "</parameter>";
@@ -5250,25 +5181,9 @@ namespace fastllm {
                         return -1;
                     }
                 }
-                // 这里原本是 unlock -> MySleep(0) -> lock 的**忙等**:
-                // MySleep(0) 等于不睡, 于是每个等待中的客户端线程都在以最快
-                // 速度反复抢 dictLocker。而生成线程要拿同一把锁才能把 token
-                // 塞进 resultTokenQueue —— 并发一多, 生成线程被饿死, 不产
-                // token, 轮询线程继续空转, 形成活锁。
-                // 实测现场: 一个线程 99.8% CPU 卡在 pthread_mutex_lock
-                // (FetchResponseTokens), MTP 解码线程同时卡在 mtpCacheMutex,
-                // GPU 利用率 0%、显存充足、metrics 计数全部冻结。
-                // 并发越高越致命(60 并发直接把后端打死)。
-                //
-                // 改成条件变量等待: 生产者路径已有 dictCV.notify_all()。
-                // 仍带 2ms 超时兜底, 万一某条产出路径漏了 notify 也只退化成
-                // 2ms 轮询, 而不是 0ms 自旋。
-                dictCV.wait_for(dictLocker, std::chrono::milliseconds(2));
-                // 等待期间锁被释放, context 可能已被别的线程移除, 必须重取。
-                context = responseContextDict.GetHandle(handleId);
-                if (context == nullptr) {
-                    return -1;
-                }
+                dictLocker.unlock();
+                MySleep(0);
+                dictLocker.lock();
             }
         }
     }

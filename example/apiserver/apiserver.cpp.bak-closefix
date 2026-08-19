@@ -410,11 +410,7 @@ struct WorkNode {
 // 避免对已复用的 fd 二次 close。
 static void CloseNodeClient(WorkNode *node) {
     if (node != nullptr && node->client >= 0) {
-        // 这里原本写成了 CloseNodeClient(node) —— 自递归且 node->client 不变,
-        // 守卫永远成立 => 无限递归爆栈 => SIGSEGV。ad019956 把各处的
-        // close(node->client) 重构进本函数时写错了。生产上三次段错误的
-        // backtrace 全是本函数的无限自调用。
-        close(node->client);
+        CloseNodeClient(node);
         node->client = -1;
     }
 }
@@ -541,30 +537,6 @@ struct WorkQueue {
                         (unsigned long long) (triePages *
                             (uint64_t) std::max(0, pageLen)));
                     cacheDesc = buf;
-                    // 显存对账: nvidia-smi 的"已用"要能被下面几项解释,
-                    // 剩下的 other 就是还没找到主的部分(线上曾有 7.6GB 无主)。
-                    // alloc_free 是 fastllm 自己缓存分配器攥着的空闲块 ——
-                    // 对 CUDA 而言它仍算"已用", 所以会出现"手里闲着几 GB
-                    // 却报显存不足"。
-                    fastllm::VramBreakdown vram;
-                    if (fastllm::GetVramBreakdown(vram)) {
-                        const long long otherB =
-                            (long long)vram.usedBytes -
-                            (long long)vram.pagedPoolBytes -
-                            (long long)vram.allocBusyBytes -
-                            (long long)vram.allocFreeBytes;
-                        std::snprintf(buf, sizeof(buf),
-                            " | vram=%llu/%lluMB(pool=%llu alloc_busy=%llu "
-                            "alloc_free=%llu graph_pin=%llu other=%lld)",
-                            (unsigned long long)(vram.usedBytes / 1048576),
-                            (unsigned long long)(vram.totalBytes / 1048576),
-                            (unsigned long long)(vram.pagedPoolBytes / 1048576),
-                            (unsigned long long)(vram.allocBusyBytes / 1048576),
-                            (unsigned long long)(vram.allocFreeBytes / 1048576),
-                            (unsigned long long)(vram.graphPinnedBytes / 1048576),
-                            (long long)(otherB / 1048576));
-                        cacheDesc += buf;
-                    }
                     const auto disk =
                         fastllm::GetPersistentPrefixCacheStatus();
                     if (disk.enabled) {
@@ -1650,13 +1622,6 @@ struct WorkQueue {
             }
             if (node->config["temperature"].is_number()) {
                 config.temperature = node->config["temperature"].number_value();
-                if (!(config.temperature > 0.0f)) {
-                    // 客户端发 temperature=0 表示"要确定性输出"。CUDA 采样
-                    // kernel 同样会做 1/temperature, 除零后整行 logits 变
-                    // inf/NaN, 输出退化成同一个字符的长串。这里钳到一个极小
-                    // 正值, 数值上等价于 argmax; CPU 侧另有显式贪心分支。
-                    config.temperature = 1e-6f;
-                }
             }
             if (node->config["top_p"].is_number()) {
                 config.top_p = node->config["top_p"].number_value();

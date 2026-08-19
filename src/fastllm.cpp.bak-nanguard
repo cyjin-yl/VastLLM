@@ -3314,52 +3314,11 @@ namespace fastllm {
         return std::binary_search(allowed.begin(), allowed.end(), tokenId);
     }
 
-    // ---- 非有限 logits 防护 ----------------------------------------------
-    // 现象: 输出变成成片的 "!!!!!!!!"。
-    // 原因: 采样比较器 betterThan(a,b) 里 NaN 与任何值比较都是 false, 于是
-    //   1) 前 topk 次无条件入堆的 NaN(下标恰好是 0..topk-1)再也踢不出去;
-    //   2) maxValue 变 NaN -> expf(x-NaN) 全 NaN -> psum/ps/curSum 全 NaN ->
-    //      "curSum > rnd" 恒 false -> 一路落到 i==topk-1 返回低位下标;
-    //   本模型 token 0 == '!', 1 == '"', 2 == '#', 所以表现为满屏感叹号。
-    // 附带危害: 含 NaN 的比较器不满足严格弱序, std::sort / std::partial_sort
-    //   在此属于未定义行为, libstdc++ 的 introsort 可能越界写。
-    // 处理: 把非有限值统一压到 -1e30f, 让它们必然排在最后, 真正的 top token
-    //   得以胜出; 同时把这件事打进日志, 不再静默降智。
-    static std::atomic<long long> g_nonFiniteLogitSteps(0);
-
-    int SanitizeLogitsForSampling(float *base, int count, const char *where) {
-        int bad = 0, firstBad = -1;
-        for (int i = 0; i < count; i++) {
-            if (!std::isfinite(base[i])) {
-                if (firstBad < 0) {
-                    firstBad = i;
-                }
-                base[i] = -1e30f;
-                bad++;
-            }
-        }
-        if (bad > 0) {
-            long long n = ++g_nonFiniteLogitSteps;
-            if (n <= 16 || (n % 100) == 0) {
-                printf("[sampling] 非有限 logits: %s bad=%d/%d first=%d 累计=%lld%s\n",
-                       where == nullptr ? "?" : where, bad, count, firstBad, (long long)n,
-                       bad == count ? "  <<< 整层 logits 全废, 本步输出必然是垃圾" : "");
-                fflush(stdout);
-            }
-        }
-        return bad;
-    }
-
-    long long GetNonFiniteLogitSteps() {
-        return g_nonFiniteLogitSteps.load();
-    }
-
     int LLMSampling(Data &logits, int outerOffset,
                     const GenerationConfig &config, const LastTokensUnit &tokens) {
         logits.ToDevice(DataDevice::CPU);
         int vocabSize = logits.dims.back();
         float *base = ((float*)logits.cpuData) + outerOffset * vocabSize;
-        SanitizeLogitsForSampling(base, vocabSize, "LLMSampling");
 
         if (fabs(config.repeat_penalty - 1.0) > 1e-6) {
             std::multiset<int>::iterator begin = tokens.tokenSet.begin();
@@ -3374,16 +3333,7 @@ namespace fastllm {
                 base[id] = (base[id] < 0 ? base[id] * config.repeat_penalty : base[id] / config.repeat_penalty);
             }
         }
-        // temperature == 0 是"要确定性输出"的通行写法(工具调用、结构化输出
-        // 几乎都这么发), 但这里 1.0f/0.0f == +inf: base[i]*invTemp 全变成
-        // ±inf(logit 恰为 0 时是 0*inf == NaN), maxValue 也是 inf, 于是
-        // expf(inf-inf) == NaN -> psum/ps/curSum 全 NaN -> "curSum > rnd"
-        // 恒 false -> 落到兜底分支返回一个固定的低位 token, 输出退化成同一个
-        // 字符的长串(实测 temperature=0 的请求返回 "44444444...")。
-        // 正确语义: temperature <= 0 等价于贪心 argmax。
-        // 写成 !(x > 0) 是为了同时挡住 NaN。
-        const bool zeroTemperature = !(config.temperature > 0.0f);
-        float invTemp = zeroTemperature ? 1.0f : 1.0f / config.temperature;
+        float invTemp = 1.0f / config.temperature;
         int topk = std::min(vocabSize, config.top_k);
         if (topk <= 0) {
             topk = 1;
@@ -3443,10 +3393,6 @@ namespace fastllm {
             return LLMSampling(logits, outerOffset, fallbackConfig, tokens);
         }
         topk = std::min(topk, (int)v.size());
-        if (zeroTemperature) {
-            // v 已按 betterThan 降序, v[0] 就是 argmax
-            return v.begin()->second;
-        }
         float psum = 0.0, maxValue = v.begin()->first;
         std::vector <float> ps;
         for (int i = 0; i < topk; i++) {
@@ -3477,30 +3423,8 @@ namespace fastllm {
     int LLMSamplingOnly(Data &logits, int outerOffset, const GenerationConfig &config) {
         int maxTopKSize = logits.dims.back() / 2;
         float *base = ((float*)logits.cpuData) + outerOffset * maxTopKSize * 2;
-        // 同 LLMSampling: temperature<=0 走贪心, 不做除零。
-        const bool zeroTemperature = !(config.temperature > 0.0f);
-        float invTemp = zeroTemperature ? 1.0f : 1.0f / config.temperature;
+        float invTemp = 1.0f / config.temperature;
         int topk = std::min(config.top_k, maxTopKSize);
-        {
-            // 这里是 (tokenId, logit) 交错对, 只净化 logit 分量;
-            // tokenId 分量若非有限则整条候选不可用, 一并压掉。
-            int bad = 0;
-            for (int i = 0; i < maxTopKSize; i++) {
-                if (!std::isfinite(base[i * 2 + 1]) || !std::isfinite(base[i * 2])) {
-                    base[i * 2 + 1] = -1e30f;
-                    bad++;
-                }
-            }
-            if (bad > 0) {
-                long long n = ++g_nonFiniteLogitSteps;
-                if (n <= 16 || (n % 100) == 0) {
-                    printf("[sampling] 非有限 logits: LLMSamplingOnly bad=%d/%d 累计=%lld%s\n",
-                           bad, maxTopKSize, (long long)n,
-                           bad == maxTopKSize ? "  <<< 整层候选全废" : "");
-                    fflush(stdout);
-                }
-            }
-        }
         std::vector<int> candidateOffsets;
         candidateOffsets.reserve(topk);
         for (int i = 0; i < topk; i++) {
@@ -3519,10 +3443,6 @@ namespace fastllm {
             return base[0];
         }
         topk = candidateOffsets.size();
-        if (zeroTemperature) {
-            // 候选是 CUDA top-k 按分数降序给出的, 第一个合法候选即 argmax
-            return base[candidateOffsets[0] * 2];
-        }
         float psum = 0.0, maxValue = base[candidateOffsets[0] * 2 + 1];
         std::vector <float> ps;
         for (int i = 0; i < topk; i++) {
@@ -8386,38 +8306,6 @@ namespace fastllm {
     // 进程存活)。
     static std::atomic<long long> g_pagedPoolCudaBytes{0};
 
-    uint64_t GetPagedPoolCudaBytes() {
-        long long v = g_pagedPoolCudaBytes.load(std::memory_order_relaxed);
-        return v > 0 ? (uint64_t)v : 0;
-    }
-
-    bool GetVramBreakdown(VramBreakdown &out) {
-#ifdef USE_CUDA
-        // 用 fastllm 已有的封装, 避免在这里引 CUDA runtime 头
-        const long long freeLL = FastllmCudaGetFreeSize();
-        std::vector<long long> totals = FastllmCudaGetTotalSizes();
-        if (freeLL <= 0 || totals.empty() || totals[0] <= 0) {
-            return false;
-        }
-        const uint64_t freeB = (uint64_t)freeLL;
-        const uint64_t totalB = (uint64_t)totals[0];
-        uint64_t bigBusy = 0, bigFree = 0, smallBusy = 0, smallFree = 0,
-                 pinned = 0;
-        FastllmCudaMemoryBreakdown(&bigBusy, &bigFree, &smallBusy, &smallFree,
-                                   &pinned);
-        out.totalBytes = totalB;
-        out.usedBytes = totalB > freeB ? totalB - freeB : 0;
-        out.pagedPoolBytes = GetPagedPoolCudaBytes();
-        out.allocBusyBytes = bigBusy + smallBusy;
-        out.allocFreeBytes = bigFree + smallFree;
-        out.graphPinnedBytes = pinned;
-        return true;
-#else
-        (void)out;
-        return false;
-#endif
-    }
-
     void PagedCacheCudaPoolBytesAdd(long long delta) {
         g_pagedPoolCudaBytes.fetch_add(delta, std::memory_order_relaxed);
     }
@@ -8511,36 +8399,16 @@ namespace fastllm {
             // 异常信息带上 free/need,便于与 nvidia-smi 对账。
             // (失败路径由请求线程顶层 catch 兜底,进程不再 terminate。)
             {
-                // 需要的是"新池"这一块新增显存。旧池此刻**已经占着**显存,
-                // 它不在 cudaMemGetInfo 的 free 里, 因此不该再被算进需求。
-                // 原判据写成 newBytes + oldBytes, 把旧池重复计了一次, 在池子
-                // 越大时越离谱(池子 4GB 想再涨 15MB, 却要求 8GB 空闲)。
-                // 实测日志 "free=139MB, need=187MB" 即此: 真实需求约 100MB,
-                // 139MB 本来是够的。
-                const uint64_t needBytes = newBytes;
                 long long freeBytesLL = FastllmCudaGetFreeSize();
-                if (freeBytesLL > 0 && (uint64_t)freeBytesLL < needBytes) {
-                    // fastllm 自己的缓存分配器攥着"已释放但没还给 CUDA"的大块,
-                    // cudaMemGetInfo 看不见它们 —— 于是会出现"自己手里闲着几 GB,
-                    // 却报显存不足"。先还回去再判。
-                    // 此处刚做过 ForceDeviceSync(), 没有在途异步工作, 释放安全。
-                    const long long beforeFree = freeBytesLL;
-                    FastllmCudaClearBigBuffer();
-                    freeBytesLL = FastllmCudaGetFreeSize();
-                    printf("[PagedCache] Grow 显存不足, 回收缓存缓冲区: "
-                           "free %lldMB -> %lldMB (需要 %lluMB)\n",
-                           beforeFree / 1048576, freeBytesLL / 1048576,
-                           (unsigned long long)(needBytes / 1048576));
-                    fflush(stdout);
-                }
-                if (freeBytesLL > 0 && (uint64_t)freeBytesLL < needBytes) {
+                if (freeBytesLL > 0 &&
+                    (uint64_t)freeBytesLL < newBytes + oldBytes) {
                     ErrorInFastLLM(
                         "PagedCacheManager::Grow: insufficient free VRAM "
                         "for pool growth (free=" +
                         std::to_string(freeBytesLL / 1048576) +
                         "MB, need=" +
-                        std::to_string(needBytes / 1048576) +
-                        "MB, 已回收缓存后仍不足).");
+                        std::to_string((newBytes + oldBytes) / 1048576) +
+                        "MB).");
                 }
                 // 全局页池预算:高并发把物理池 Grow 到撞满显存前硬顶。
                 uint64_t budget = PagedPoolBudgetBytes();

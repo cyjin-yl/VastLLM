@@ -5250,25 +5250,9 @@ namespace fastllm {
                         return -1;
                     }
                 }
-                // 这里原本是 unlock -> MySleep(0) -> lock 的**忙等**:
-                // MySleep(0) 等于不睡, 于是每个等待中的客户端线程都在以最快
-                // 速度反复抢 dictLocker。而生成线程要拿同一把锁才能把 token
-                // 塞进 resultTokenQueue —— 并发一多, 生成线程被饿死, 不产
-                // token, 轮询线程继续空转, 形成活锁。
-                // 实测现场: 一个线程 99.8% CPU 卡在 pthread_mutex_lock
-                // (FetchResponseTokens), MTP 解码线程同时卡在 mtpCacheMutex,
-                // GPU 利用率 0%、显存充足、metrics 计数全部冻结。
-                // 并发越高越致命(60 并发直接把后端打死)。
-                //
-                // 改成条件变量等待: 生产者路径已有 dictCV.notify_all()。
-                // 仍带 2ms 超时兜底, 万一某条产出路径漏了 notify 也只退化成
-                // 2ms 轮询, 而不是 0ms 自旋。
-                dictCV.wait_for(dictLocker, std::chrono::milliseconds(2));
-                // 等待期间锁被释放, context 可能已被别的线程移除, 必须重取。
-                context = responseContextDict.GetHandle(handleId);
-                if (context == nullptr) {
-                    return -1;
-                }
+                dictLocker.unlock();
+                MySleep(0);
+                dictLocker.lock();
             }
         }
     }
