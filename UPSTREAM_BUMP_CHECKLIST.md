@@ -12,7 +12,7 @@ grep -rn "上游BUMP勿回退" src/ include/ example/ --include=*.cpp --include=
 
 每处标记都写明了「回退会导致什么」。**冲突解决时以本仓版本为准。**
 
-## 当前受保护的 10 处
+## 当前受保护的 17 处
 
 | 文件 | 修复 | 回退的后果 |
 |---|---|---|
@@ -27,6 +27,12 @@ grep -rn "上游BUMP勿回退" src/ include/ example/ --include=*.cpp --include=
 | `src/fastllm.cpp` | 预算内优先扩容 | 回收器空转 54924 次 / 471.5 秒在关键路径, 缓存被反复吃掉 |
 | `example/apiserver/apiserver.cpp` | temperature 钳制 | 同上, 覆盖 CUDA 采样 kernel 那条路 |
 | `src/devices/cuda/.../fastllm-turboquant-kv.cu` | TurboKV 打印改 env 开关 | 生产日志刷 13 万行 + 热路径 `fflush` |
+| `src/models/qwen3_5.cpp` + `src/models/basellm.cpp`(x2) + `src/models/deepseekv4.cpp` | **`forwardLocker` 用 defer_lock 的 `unique_lock` 而非裸引用** | 批前向抛异常(Grow 显存不足)时跳过手工 `unlock()` -> 锁永久不释放 -> 下一轮 `lock()` 自死锁, 且线程攥着锁僵死 -> 所有客户端堵在 `FetchResponseTokens`。现场: running/pending 冻结、done 0 req、GPU 0% 而显存照占, 日志却写着 "process survives"。**间歇性**: 异常抛在 unlock 区间就不死(实测 6 次里前 5 次都活), 别当成玄学 |
+| `src/fastllm.cpp` | **页字节数按 `dims[0]` 而非 `maxPages` 换算**(4 处) | `dims[0] <= maxPages` 恒成立(懒分配+Grow 被预算挡住)。恰好整除时 pageBytes 算小 -> 从错误 offset 抠页, "下放成功"但内容错; 上提用正确的 `dims[0]`, 尺寸永远对不上 -> **前缀缓存上提 100% 失败**, 表现为 `L1trie` 跳一下就归零 + `hits=0` 恒成立。另含 linear-attention 借用指针 stride 错(会指到别的请求的页上, 静默数据串扰) |
+| `src/fastllm.cpp` | **`GetUnusedPageIndex` 里的投机性 `Grow` 包 try/catch + 退避** | 该处 `pageIndex` 通常已拿到手, 扩容只是提前垫水位; 裸调 `Grow` 抛异常会穿到 MTPLoop 的 catch, 把**所有**在飞请求 `isAbort`。实测 `prefill 63231 tok 87.94s / decode 0 tok` —— 跑完 88 秒 prefill 一个 token 没吐就被打掉 |
+| `src/prefixcache_persistence.cpp` | **配额不足时先回收陈旧 generation 再判** | 原顺序把回收写在提交成功之后: 目录顶到配额线 -> 提交失败 -> 回收永不执行 -> **永久失败**。另: 旧顺序凭空多要一代余量(判定时需同时容纳三代) |
+| `example/apiserver/apiserver.cpp` | **派发前 + 非流式循环的 `SocketPeerDisconnected` 探活** | 客户端早走了仍把请求算到底: 262K prefill 独占 GPU 几分钟、KV 页整段不释放把池顶到水位线诱发 `Grow` 失败、真请求被挤在队列后面。非流式路径原本用阻塞 `FetchResponseTokens`, 整个 prefill 期间零检测 |
+| `example/apiserver/apiserver.cpp` | **轻量路由(`IsLightweightRoute` + `lightQ`)不占推理并发额度** | `maxActivateQueryNumber = min(256, --batch)`, 生产 `--batch 1` => 1; 闸门对所有路由一视同仁 -> 只要有请求在生成, `/health` `/version` 就排队到超时 -> **上游代理无法区分"在忙"与"已僵死"**, 本次死锁故障因此拖了一小时才被发现。注意 `/admin/*` 不能放进来(会 suspend/resume 模型, 必须串行) |
 
 ## 最危险的一处: `src/model.cpp` 的 token score
 
@@ -100,4 +106,4 @@ cmake -DUNIT_TEST=ON .. && cmake --build . --target testSamplingGuard testToolCa
 - 上游 `ztxz16/fastllm` 的 `pushurl = no_push`, 推不上去, 只能单向拉。
 - 我们领先上游 70+ 个 commit, 落后约 10 个。历史冲突点只有
   `src/models/deepseekv4.cpp` 和 `test/ops/regressionOps.cpp` 两个文件,
-  与上面 9 处修复**不重叠**。
+  与上面 15 处修复**不重叠**。
