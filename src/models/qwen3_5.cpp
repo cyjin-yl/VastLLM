@@ -26,6 +26,9 @@
 
 #include <cctype>
 #include <cstring>
+#include <thread>
+#include <map>
+#include <functional>
 #include <cstdlib>
 #include <cmath>
 #include "json11.hpp"
@@ -525,6 +528,93 @@ namespace fastllm {
         }
         return env != nullptr && Qwen35MoeIsTrueString(env);
     }
+
+    // ---- mtpCacheMutex 持有者追踪(死锁诊断) --------------------------------
+    // 现象: MTPLoop 卡在 mtpCacheMutex 上, 而 gdb 显示**没有任何线程在跑**
+    //   (其余 8 线程全在 __syscall_cancel_arch)。所有用法都是 lock_guard,
+    //   不存在异常展开漏解锁; 但 Qwen35MTPLoop 是 3100 行、6 处加锁点、
+    //   lambda 全被内联, 栈上看不出中间帧 —— 纯静态分析不可靠。
+    // 所以让锁自己说话: 记录当前持有者的 tid 与加锁位置, 等锁超时就打印出来。
+    // FASTLLM_MTP_LOCK_DEBUG=1 开启; 默认关闭时退化成普通 lock_guard, 零额外开销。
+    struct Qwen35MtpLockState {
+        std::atomic<unsigned long long> holderTid{0};
+        std::atomic<const char*> holderWhere{nullptr};
+        std::atomic<int> holderLine{0};
+    };
+
+    static Qwen35MtpLockState &Qwen35MtpLockStateOf(std::mutex *m) {
+        static std::mutex mapMutex;
+        static std::map<std::mutex*, Qwen35MtpLockState*> states;
+        std::lock_guard<std::mutex> g(mapMutex);
+        auto it = states.find(m);
+        if (it == states.end()) {
+            it = states.emplace(m, new Qwen35MtpLockState()).first;
+        }
+        return *it->second;
+    }
+
+    static bool Qwen35MtpLockDebugEnabled() {
+        static const bool on = []() {
+            const char *env = std::getenv("FASTLLM_MTP_LOCK_DEBUG");
+            return env != nullptr && env[0] != 0 && env[0] != '0';
+        }();
+        return on;
+    }
+
+    static unsigned long long Qwen35SelfTid() {
+        return (unsigned long long)std::hash<std::thread::id>{}(
+            std::this_thread::get_id());
+    }
+
+    class Qwen35MtpLockGuard {
+    public:
+        Qwen35MtpLockGuard(std::mutex &m, const char *where, int line)
+                : mutex_(m), debug_(Qwen35MtpLockDebugEnabled()) {
+            if (!debug_) {
+                mutex_.lock();
+                return;
+            }
+            auto &st = Qwen35MtpLockStateOf(&mutex_);
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(10);
+            bool warned = false;
+            while (!mutex_.try_lock()) {
+                if (!warned &&
+                    std::chrono::steady_clock::now() > deadline) {
+                    warned = true;
+                    const char *hw = st.holderWhere.load();
+                    printf("[MtpLock] 等待超过 10s: 本线程 tid=%llu 在 %s:%d; "
+                           "持有者 tid=%llu 在 %s:%d\n",
+                           Qwen35SelfTid(), where, line,
+                           st.holderTid.load(),
+                           hw == nullptr ? "?" : hw,
+                           st.holderLine.load());
+                    fflush(stdout);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            st.holderTid.store(Qwen35SelfTid());
+            st.holderWhere.store(where);
+            st.holderLine.store(line);
+        }
+
+        ~Qwen35MtpLockGuard() {
+            if (debug_) {
+                auto &st = Qwen35MtpLockStateOf(&mutex_);
+                st.holderTid.store(0);
+                st.holderWhere.store(nullptr);
+                st.holderLine.store(0);
+            }
+            mutex_.unlock();
+        }
+
+        Qwen35MtpLockGuard(const Qwen35MtpLockGuard &) = delete;
+        Qwen35MtpLockGuard &operator=(const Qwen35MtpLockGuard &) = delete;
+
+    private:
+        std::mutex &mutex_;
+        const bool debug_;
+    };
 
     static constexpr int QWEN35_MTP_LOG_INTERVAL = 64;
     static constexpr int QWEN35_MTP_MAX_DRAFTS = 9;
@@ -8664,7 +8754,7 @@ namespace fastllm {
 #ifdef USE_CUDA
         ResetCudaServingForKvCacheResize();
         {
-            std::lock_guard<std::mutex> guard(mtpCacheMutex);
+            Qwen35MtpLockGuard guard(mtpCacheMutex, __FILE__, __LINE__);
             mtpCaches.clear();
         }
         int previousDevice = FastllmCudaGetDevice();
@@ -8960,7 +9050,7 @@ namespace fastllm {
         bool requireMtp = RequiresMtpPrefixSnapshot(context);
         if (requireMtp) {
 #ifdef USE_CUDA
-            std::lock_guard<std::mutex> guard(mtpCacheMutex);
+            Qwen35MtpLockGuard guard(mtpCacheMutex, __FILE__, __LINE__);
             auto mtpIt = mtpCaches.find(context);
             bool mtpSnapshotOk =
                 mtpIt != mtpCaches.end() &&
@@ -9240,7 +9330,7 @@ namespace fastllm {
                     snapshot->mtpValid && snapshot->mtpTokens == cachedLen &&
                     GetQwen35GPUForwardDevices(this->deviceMap, devices, ratios) &&
                     !devices.empty();
-                std::lock_guard<std::mutex> mtpGuard(mtpCacheMutex);
+                Qwen35MtpLockGuard mtpGuard(mtpCacheMutex, __FILE__, __LINE__);
                 mtpCaches.erase(context);
                 if (canRestoreMtp) {
                     MtpKvCache &mtpCache = GetMtpCache(context);
@@ -9319,7 +9409,7 @@ namespace fastllm {
             context->pastKeyValues[i].first.isLinearAttention = true;
             context->pastKeyValues[i].second.isLinearAttention = true;
         }
-        std::lock_guard<std::mutex> guard(mtpCacheMutex);
+        Qwen35MtpLockGuard guard(mtpCacheMutex, __FILE__, __LINE__);
         mtpCaches.erase(context);
     }
 
@@ -9327,7 +9417,7 @@ namespace fastllm {
         if (context == nullptr) {
             return;
         }
-        std::lock_guard<std::mutex> guard(mtpCacheMutex);
+        Qwen35MtpLockGuard guard(mtpCacheMutex, __FILE__, __LINE__);
         mtpCaches.erase(context);
     }
 
@@ -9365,7 +9455,7 @@ namespace fastllm {
                     context->cacheLen +
                         context->longPrefill.cursor :
                     -1;
-            std::lock_guard<std::mutex> guard(mtpCacheMutex);
+            Qwen35MtpLockGuard guard(mtpCacheMutex, __FILE__, __LINE__);
             auto it = mtpCaches.find(
                 const_cast<ResponseContext*>(context));
             if (it == mtpCaches.end() ||
@@ -9407,7 +9497,7 @@ namespace fastllm {
         std::unique_ptr<Qwen35ResponseContextCpuState> prepared(
             new Qwen35ResponseContextCpuState());
         {
-            std::lock_guard<std::mutex> guard(mtpCacheMutex);
+            Qwen35MtpLockGuard guard(mtpCacheMutex, __FILE__, __LINE__);
             auto it = mtpCaches.find(context);
             const int expectedMtpTokens =
                 context->longPrefill.inProgress ?
@@ -9456,7 +9546,7 @@ namespace fastllm {
             (!context->longPrefill.inProgress ||
              context->longPrefill.mtpViable);
         if (!preserveMtp) {
-            std::lock_guard<std::mutex> guard(mtpCacheMutex);
+            Qwen35MtpLockGuard guard(mtpCacheMutex, __FILE__, __LINE__);
             mtpCaches.erase(context);
             return true;
         }
@@ -9479,7 +9569,7 @@ namespace fastllm {
             }
             return false;
         }
-        std::lock_guard<std::mutex> guard(mtpCacheMutex);
+        Qwen35MtpLockGuard guard(mtpCacheMutex, __FILE__, __LINE__);
         mtpCaches.erase(context);
         MtpKvCache &mtpCache = GetMtpCache(context);
         if (!Qwen35RestoreMtpSnapshotTensor(
@@ -9503,7 +9593,7 @@ namespace fastllm {
         if (context == nullptr) {
             return;
         }
-        std::lock_guard<std::mutex> guard(mtpCacheMutex);
+        Qwen35MtpLockGuard guard(mtpCacheMutex, __FILE__, __LINE__);
         mtpCaches.erase(context);
     }
 
@@ -15643,7 +15733,7 @@ namespace fastllm {
             return false;
         }
 
-        std::lock_guard<std::mutex> mtpCacheGuard(mtpCacheMutex);
+        Qwen35MtpLockGuard mtpCacheGuard(mtpCacheMutex, __FILE__, __LINE__);
         MtpKvCache &mtpCache = GetMtpCache(context);
         if (context->cacheLen > 0 && mtpCache.tokens == 0) {
             logMtpSkip("prefix cache hit without MTP cache");
@@ -18106,7 +18196,7 @@ namespace fastllm {
         const bool tensorParallel = devices.size() > 1;
         const int rootDevice = devices[0];
 
-        std::lock_guard<std::mutex> mtpCacheGuard(mtpCacheMutex);
+        Qwen35MtpLockGuard mtpCacheGuard(mtpCacheMutex, __FILE__, __LINE__);
         std::vector<MtpKvCache*> requestMtpCaches(batch, nullptr);
         for (int b = 0; b < batch; b++) {
             auto cacheIt = mtpCaches.find(contexts[b]);
@@ -19258,7 +19348,7 @@ namespace fastllm {
             if (ctx == nullptr) {
                 return;
             }
-            std::lock_guard<std::mutex> guard(model->mtpCacheMutex);
+            Qwen35MtpLockGuard guard(model->mtpCacheMutex, __FILE__, __LINE__);
             model->mtpCaches.erase(ctx);
         };
 
@@ -21295,7 +21385,7 @@ namespace fastllm {
                     }
                     int expectedTokens = selectedLongPrefillQuantum.baseTokens;
                     if (seedMtp) {
-                        std::lock_guard<std::mutex> guard(model->mtpCacheMutex);
+                        Qwen35MtpLockGuard guard(model->mtpCacheMutex, __FILE__, __LINE__);
                         if (expectedTokens == 0) {
                             model->mtpCaches.erase(singleContext);
                         } else {
@@ -21371,7 +21461,7 @@ namespace fastllm {
                             mtpInputTokens[i] = nextIndex < singleContext->longPrefill.total ?
                                 singleContext->currentTokens[nextIndex] : ret.back();
                         }
-                        std::lock_guard<std::mutex> guard(model->mtpCacheMutex);
+                        Qwen35MtpLockGuard guard(model->mtpCacheMutex, __FILE__, __LINE__);
                         auto cacheIt = model->mtpCaches.find(singleContext);
                         if (cacheIt == model->mtpCaches.end()) {
                             if (expectedTokens == 0) {
@@ -21520,7 +21610,7 @@ namespace fastllm {
                             !longPrefillMtpDevices.empty();
                         int longPrefillMtpBaseTokens = singleContext->cacheLen;
                         if (seedLongPrefillMtp) {
-                            std::lock_guard<std::mutex> guard(model->mtpCacheMutex);
+                            Qwen35MtpLockGuard guard(model->mtpCacheMutex, __FILE__, __LINE__);
                             if (longPrefillMtpBaseTokens == 0) {
                                 model->mtpCaches.erase(singleContext);
                             } else {
@@ -21535,7 +21625,7 @@ namespace fastllm {
                             }
                         }
                         auto eraseLongPrefillMtpCache = [&]() {
-                            std::lock_guard<std::mutex> guard(model->mtpCacheMutex);
+                            Qwen35MtpLockGuard guard(model->mtpCacheMutex, __FILE__, __LINE__);
                             model->mtpCaches.erase(singleContext);
                         };
                         auto appendLongPrefillMtpCache =
@@ -21544,7 +21634,7 @@ namespace fastllm {
                                 const Data &mtpPositionIds,
                                 int expectedTokens, bool cacheOnly,
                                 int &draftToken) {
-                                std::lock_guard<std::mutex> guard(model->mtpCacheMutex);
+                                Qwen35MtpLockGuard guard(model->mtpCacheMutex, __FILE__, __LINE__);
                                 auto cacheIt = model->mtpCaches.find(singleContext);
                                 if (cacheIt == model->mtpCaches.end()) {
                                     if (expectedTokens != 0) {
