@@ -39,6 +39,7 @@
 #include "fastllm.h"
 #include "gguf.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -404,6 +405,10 @@ void RunCorpus(const std::string &ggufPath, const std::string &listFile) {
 
     int total = 0, offMatch = 0, onMatch = 0;
     long long offTokDiff = 0, onTokDiff = 0;
+    // 预分词跑在 prefill 的关键路径上(262K 上下文一次要切几十万个码点),
+    // 所以顺手量一下吞吐, 防止"正确但慢十倍"这种改法混进来。
+    double offMs = 0.0, onMs = 0.0;
+    long long goldTokens = 0;
     for (const std::string &stem : stems) {
         std::string text, goldLine;
         if (!ReadWholeFile(stem + ".txt", text) ||
@@ -413,8 +418,14 @@ void RunCorpus(const std::string &ggufPath, const std::string &listFile) {
             continue;
         }
         const std::vector<int> gold = ParseIds(goldLine);
+        const auto t0 = std::chrono::steady_clock::now();
         const std::vector<int> a = EncodeToIds(off, text);
+        const auto t1 = std::chrono::steady_clock::now();
         const std::vector<int> b = EncodeToIds(on, text);
+        const auto t2 = std::chrono::steady_clock::now();
+        offMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        onMs += std::chrono::duration<double, std::milli>(t2 - t1).count();
+        goldTokens += (long long)gold.size();
         total++;
         if (a == gold) {
             offMatch++;
@@ -435,6 +446,10 @@ void RunCorpus(const std::string &ggufPath, const std::string &listFile) {
            total, offMatch, onMatch);
     printf("  token 数与 llama.cpp 的累计差: 关掉 %+lld, 启用 %+lld\n",
            offTokDiff, onTokDiff);
+    printf("  编码耗时(共 %lld token): 关掉预分词 %.1f ms (%.0f tok/s), "
+           "启用预分词 %.1f ms (%.0f tok/s)\n",
+           goldTokens, offMs, offMs > 0 ? goldTokens * 1000.0 / offMs : 0.0,
+           onMs, onMs > 0 ? goldTokens * 1000.0 / onMs : 0.0);
     Check(total > 0 && onMatch == total, "批量对拍: 每一篇都与 llama.cpp 逐 token 一致");
 }
 
