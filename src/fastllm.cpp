@@ -8423,6 +8423,30 @@ namespace fastllm {
         g_pagedPoolCudaBytes.fetch_add(delta, std::memory_order_relaxed);
     }
 
+    // 显存保留区: KV 池不能把显存吃光。
+    // 线上实测: 池子涨到 gpuFree 只剩 5MB, 随后激活张量申请 96MB
+    // (dims=[1,48,8192,128] fp16, 48 正是线性注意力层数)直接
+    // "FastLLM fatal CUDA allocation error" 杀掉进程 —— 30 分钟内崩溃重启 5 代。
+    // 池预算(FASTLLM_PAGED_POOL_MAX_MB)只约束池子自己, 管不住"池子涨完之后
+    // 还剩多少给激活用", 所以必须另有一条硬保留。
+    // 加上保留区后, 失败点从"进程被 fatal 杀死"前移成"Grow 拒绝增长",
+    // 上层走 aborting in-flight requests 的可恢复路径, 进程存活。
+    static uint64_t PagedPoolVramReserveBytes() {
+        static uint64_t cached = []() -> uint64_t {
+            const char *env = std::getenv("FASTLLM_VRAM_POOL_RESERVE_MB");
+            double mb = 1536.0;
+            if (env != nullptr && env[0] != 0) {
+                char *end = nullptr;
+                double parsed = std::strtod(env, &end);
+                if (end != env && parsed >= 0) {
+                    mb = parsed;
+                }
+            }
+            return (uint64_t)(mb * 1048576.0);
+        }();
+        return cached;
+    }
+
     static uint64_t PagedPoolBudgetBytes() {
         static uint64_t cached = []() -> uint64_t {
             const char *env = std::getenv("FASTLLM_PAGED_POOL_MAX_MB");
@@ -8518,7 +8542,9 @@ namespace fastllm {
                 // 越大时越离谱(池子 4GB 想再涨 15MB, 却要求 8GB 空闲)。
                 // 实测日志 "free=139MB, need=187MB" 即此: 真实需求约 100MB,
                 // 139MB 本来是够的。
-                const uint64_t needBytes = newBytes;
+                // 需求 = 新池字节 + 必须留给激活/工作区的保留区
+                const uint64_t reserveBytes = PagedPoolVramReserveBytes();
+                const uint64_t needBytes = newBytes + reserveBytes;
                 long long freeBytesLL = FastllmCudaGetFreeSize();
                 if (freeBytesLL > 0 && (uint64_t)freeBytesLL < needBytes) {
                     // fastllm 自己的缓存分配器攥着"已释放但没还给 CUDA"的大块,
@@ -8541,6 +8567,8 @@ namespace fastllm {
                         std::to_string(freeBytesLL / 1048576) +
                         "MB, need=" +
                         std::to_string(needBytes / 1048576) +
+                        "MB, 含保留区 " +
+                        std::to_string(reserveBytes / 1048576) +
                         "MB, 已回收缓存后仍不足).");
                 }
                 // 全局页池预算:高并发把物理池 Grow 到撞满显存前硬顶。
