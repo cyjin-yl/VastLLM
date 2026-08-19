@@ -3786,6 +3786,59 @@ namespace fastllm {
                 printf("Load chatTemplate = %s\n", model->weight.tokenizer.chatTemplate.c_str());
             }
 
+            // 【上游BUMP勿回退】下面读 tokenizer.ggml.merges 的这段不能删。
+            //
+            // 线上故障(表现为"模型胡言乱语、路径拼不对"):
+            //   Proto-UI -> Proto-UUI      prototypes -> proto-types
+            //   brutalist -> "bru talist"(插空格) / "buta-list"(掉字符+插连字符)
+            //
+            // 根因: 原代码给**所有** token 写死 score = 1.0f。而 BPE 的合并优先级
+            // 正是按 score 排的 —— TryMergePairs 里 q.push(SymbolPairs(now->score,
+            // ...)), 比较是 a.score < b.score || (a.score == b.score && a.l > b.l)。
+            // score 全相等 => 比较退化成按位置 => **变成"从左到右贪心合并"**,
+            // 完全不看 merges 排名。那不是 BPE。
+            //
+            // 规范 BPE 由 merges 的**排名**唯一定义: 排名 0 优先级最高, 合并点可以
+            // 出现在词的任何位置。GPT-2 系词表(tokenizer.ggml.model == "gpt2")
+            // 没有 scores 字段, 分词完全靠 merges —— 本模型的 GGUF 里确实只有
+            // tokens / token_type / merges, 没有 scores。拿 SentencePiece 的
+            // "按分数贪心"去套 GPT-2 词表, 得到的是合法但**非规范**的切分,
+            // 模型看到的 token 序列与训练时不同, 逐字复述必然走样。
+            //
+            // 这也是为什么只有本仓有这个问题: llama.cpp / vLLM / HF 都实现了
+            // 按 merges 排名的规范 BPE。
+            //
+            // 修法: 第 i 条 merge 规则合成的 token, score 设为 -i。现有的最大堆
+            // 就会优先弹出排名最小(rank 0 -> score 0)的合并, 等价于规范 BPE,
+            // 不必改动算法骨架。不由任何 merge 产生的 token(单字节等)给极低分,
+            // 保证永远盖不过真实 merge。没有 merges 时退回原行为, 兼容旧模型。
+            std::unordered_map<std::string, int> ggufMergeRank;
+            {
+                const auto &mergeItems =
+                    params["tokenizer.ggml.merges"].array_items();
+                ggufMergeRank.reserve(mergeItems.size() * 2);
+                for (int mi = 0; mi < (int)mergeItems.size(); mi++) {
+                    const std::string &rule = mergeItems[mi].string_value();
+                    // 每条规则形如 "左 右", 合成串就是二者直接拼接
+                    const size_t sep = rule.find(' ');
+                    if (sep == std::string::npos || sep == 0 ||
+                        sep + 1 >= rule.size()) {
+                        continue;
+                    }
+                    std::string merged =
+                        rule.substr(0, sep) + rule.substr(sep + 1);
+                    // 同一合成串只应由一条规则产生; 若重复, 保留排名更靠前的
+                    if (ggufMergeRank.find(merged) == ggufMergeRank.end()) {
+                        ggufMergeRank[merged] = mi;
+                    }
+                }
+                if (!mergeItems.empty()) {
+                    printf("Load tokenizer merges = %d (BPE 合并排名已启用)\n",
+                           (int)ggufMergeRank.size());
+                    fflush(stdout);
+                }
+            }
+
             const auto &tokenItems = params["tokenizer.ggml.tokens"].array_items();
             int tokenTotal = (int)tokenItems.size();
             ReportModelLoadProgress("tokenizer", 0, std::max(1, tokenTotal));
@@ -3794,7 +3847,14 @@ namespace fastllm {
                 if (idx < 10) {
                     // printf("%s: %d\n", it.string_value().c_str(), idx);
                 }
-                model->weight.AddTokenizerWord(it.string_value(), idx, 1.0f);
+                float tokenScore = 1.0f;
+                if (!ggufMergeRank.empty()) {
+                    auto rankIt = ggufMergeRank.find(it.string_value());
+                    tokenScore = rankIt != ggufMergeRank.end()
+                                     ? -(float)rankIt->second
+                                     : -1e9f;
+                }
+                model->weight.AddTokenizerWord(it.string_value(), idx, tokenScore);
                 idx++;
                 if (idx == tokenTotal ||
                     idx * 100 / std::max(1, tokenTotal) != (idx - 1) * 100 / std::max(1, tokenTotal)) {
