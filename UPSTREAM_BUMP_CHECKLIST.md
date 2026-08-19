@@ -87,7 +87,7 @@ Load tokenizer pre = qwen35 (预分词正则已启用: qwen35)
 cmake -DUNIT_TEST=ON .. && cmake --build . --target testSamplingGuard testToolCallGrammar testPreTokenizer
 ./testSamplingGuard      # 15/15   —— 采样路径(NaN / temperature=0 / top_k 两条分支)
 ./testToolCallGrammar    # ALL PASS —— 工具调用语法状态机
-./testPreTokenizer       # 32/32   —— 预分词切分(不需要模型)
+./testPreTokenizer       # 31/31   —— 预分词切分(不需要模型)
 ./testPreTokenizer <gguf> --corpus /home/ezra/projects/EzraVastLLM/pretokenizer-corpus/corpus_list.txt
                          # 42/42, 45/45 篇与 llama-tokenize 逐 token 一致
 ```
