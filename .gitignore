@@ -37,3 +37,6 @@ CLAUDE.md
 /vllm/
 /test/multimodal/*_probe*.png
 /test/multimodal/*_probe*.gif
+
+# 改代码时的本地备份, 不进版本库
+*.bak-*
