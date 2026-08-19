@@ -483,6 +483,15 @@ template <typename SrcT>
 bool LaunchCopy(uint8_t *pagedData, int pageIdx, int pageLen, int numHeads,
                 int headDim, fastllm::DataType dstType, const SrcT *inputData,
                 int seqLen, int inputOffset, int copyLen, int pageOffset) {
+    // hang 定位: 大拷贝(prefill chunk)打参数, decode(copyLen=1)不打。
+    if (copyLen >= 128 || pageIdx < 0 || pageIdx >= 1024 * 1024) {
+        printf("[TurboKV] Copy enter: pageIdx=%d copyLen=%d pageOffset=%d "
+               "inputOffset=%d seqLen=%d numHeads=%d dstType=%d "
+               "pagedData=%p inputData=%p\n",
+               pageIdx, copyLen, pageOffset, inputOffset, seqLen, numHeads,
+               (int)dstType, pagedData, (const void*)inputData);
+        fflush(stdout);
+    }
     if (headDim != kHeadDim || copyLen <= 0 || inputOffset < 0 ||
         pageOffset < 0 || pageOffset + copyLen > pageLen) {
         printf("[TurboKV] Copy invalid args: headDim=%d kHeadDim=%d "
@@ -592,6 +601,13 @@ bool LaunchCopyMultiPage(uint8_t *pagedData, const int *pageIdxHost,
                          int numHeads, int headDim, fastllm::DataType dstType,
                          const SrcT *inputData, int seqLen,
                          int dstRowLimit) {
+    // hang 定位: multipage 入口参数。
+    printf("[TurboKV] MultiPage enter: pageCount=%d firstPageOffset=%d "
+           "pageLen=%d seqLen=%d numHeads=%d dstRowLimit=%d pages=[%d..%d]\n",
+           pageCount, firstPageOffset, pageLen, seqLen, numHeads, dstRowLimit,
+           pageIdxHost ? pageIdxHost[0] : -1,
+           (pageIdxHost && pageCount > 0) ? pageIdxHost[pageCount - 1] : -1);
+    fflush(stdout);
     if (headDim != kHeadDim || seqLen <= 0 || pageIdxHost == nullptr ||
         pageCount <= 0 || pageCount > kMaxMultiPageCount ||
         firstPageOffset < 0 || firstPageOffset >= pageLen) {

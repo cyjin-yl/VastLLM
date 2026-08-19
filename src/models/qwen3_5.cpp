@@ -9270,7 +9270,19 @@ namespace fastllm {
         int interval = Qwen35LinearPrefixSnapshotIntervalTokens();
         int pageLen = fastllm::GetPageLen();
         interval = std::max(pageLen, interval / pageLen * pageLen);
-        return std::max(pageLen, std::min(base, interval));
+        // chunk 只需是 interval 的整数倍即可让 snapshot 边界落在 chunk 内;
+        // min(base, interval) 会把长请求拆成几百个 128-token 小 forward
+        // (77K vision 实测 603 chunk / 38 分钟), per-forward 固定开销爆炸。
+        // 上限 env 可调(默认 1024): V100 32GB 上 8192/2048-token chunk 的
+        // attention scratch (chunk×context 级) 都会顶穿权重+KV 池之外的
+        // 剩余显存(两次实测 OOM 崩)。太小则 per-forward 固定开销爆炸
+        // (128 时 77K vision = 630 chunk / 38 分钟)。
+        if (base < interval) {
+            return interval;
+        }
+        int cap = Qwen35EnvInt("FASTLLM_QWEN35_PREFILL_CHUNK_CAP", 1024);
+        int target = std::min(base, std::max(cap, interval));
+        return std::max(interval, target / interval * interval);
     }
 
     int Qwen3_5Model::GetBatchedPrefillTokenLimit() {
