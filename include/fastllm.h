@@ -763,6 +763,10 @@ namespace fastllm {
             int GetUnusedPageIndexLocked(
                 bool pick,
                 const std::unordered_set<int> *protectedPages);
+            // 淘汰一个最冷的前缀页进 freePages(下沉优先),
+            // 供取页路径与水位批量回收共用。调用方须持 pageIndexLocker。
+            int EvictOneColdPageLocked(
+                const std::unordered_set<int> *protectedPages);
             bool PageOutTrieNode(CacheTrieNode *node);
             uint64_t EvictCpuTierPayloads(uint64_t bytesNeeded);
             bool MaterializeTrieNode(

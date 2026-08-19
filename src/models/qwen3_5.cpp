@@ -4754,17 +4754,28 @@ namespace fastllm {
         }
 
         static int Qwen35LinearPrefixSnapshotIntervalTokens() {
-            int pages = Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES", 64);
+            // 默认 64 页(8K token)过稀: 第二个 snapshot 起必须 interval
+            // 对齐才能记录, 长上下文请求的 snapshot 点稀疏, 查询命中被
+            // 截断到浅点。降到 8 页(1024 token): snapshot 是 CPU tensor,
+            // 密度成本是主机内存, 不是显存。
+            int pages = Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES", 8);
             pages = std::max(1, pages);
             return pages * fastllm::GetPageLen();
         }
 
         static int Qwen35LinearPrefixSnapshotMaxPerRequest() {
-            return std::max(1, Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_PER_REQUEST", 4));
+            // 默认 4 → 16: agent 负载的上下文在几十 K 内持续增长,
+            // 4 个 snapshot/请求在 interval 对齐下覆盖太稀, 查询常被
+            // 截断到早期的浅 snapshot(线上曾出现命中固定 128 token)。
+            return std::max(1, Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_PER_REQUEST", 16));
         }
 
         static int Qwen35LinearPrefixSnapshotMaxRecords() {
-            return std::max(1, Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS", 8));
+            // 默认 8 → 48: 全局 FIFO 只留 8 个时, 多 agent 交替 + 工具
+            // 往返的小 snapshot 会把长上下文 snapshot 挤掉, 后来者查不到
+            // 深 snapshot → 整链 no-record。 snapshot 存 CPU tensor,
+            // 48 个约几 GB 主机内存, 64GB 级主机可承受。
+            return std::max(1, Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS", 48));
         }
 
         static bool Qwen35LayerIsLinearAttention(const Qwen3_5Model *model, int layer) {

@@ -1340,6 +1340,21 @@ bool PreparePersistentPrefixCacheFromEnv(
     if (const char *key =
             std::getenv("FASTLLM_PREFIX_CACHE_PERSIST_KEY")) {
         options.cacheKey = key;
+    } else if (options.enabled && model != nullptr) {
+        // 手工 key 必然漂移(换模型忘改 env → 持久层静默失效)。
+        // 未配置时从模型结构指纹自动派生: 架构 + 层数 + 词表规模,
+        // 同一份权重稳定同 key, 换了模型自然错开目录。
+        std::string arch;
+        auto it = model->weight.dicts.find("general.architecture");
+        if (it != model->weight.dicts.end()) {
+            arch = it->second;
+        }
+        char fingerprint[64];
+        snprintf(fingerprint, sizeof(fingerprint), "%s-b%d-v%d",
+                 arch.empty() ? "model" : arch.c_str(),
+                 model->block_cnt,
+                 (int)model->weight.tokenizer.tokenToStringDict.size());
+        options.cacheKey = fingerprint;
     }
     return PreparePersistentPrefixCache(
         options, model, status, error);

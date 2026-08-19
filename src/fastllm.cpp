@@ -8696,6 +8696,50 @@ namespace fastllm {
         {
             std::lock_guard<std::mutex> guard(this->pageIndexLocker);
             pageIndex = GetUnusedPageIndexLocked(pick, nullptr);
+            // JVM 式水位批量回收: freePages 跌破低水位时, 一次批量淘汰
+            // 冷前缀页(下沉 CPU/disk, 沉不下才丢)补到高水位, 摊销逐页
+            // 同步淘汰的 D2H+zstd 成本——decode 不再每个新页都卡一次。
+            // 批量发生在取页路径上但频率 = 低水位次数, 而非每页一次。
+            // 活跃页不在 triePages(Record 仅收 pageRefCount<=0 的页),
+            // 批量只动冷前缀, 在飞请求不受影响。
+            static const int lowWaterEnv = (int)PrefixCacheEnvBytes(
+                "FASTLLM_KV_RECYCLE_LOW_PAGES", -1);
+            static const int highWaterEnv = (int)PrefixCacheEnvBytes(
+                "FASTLLM_KV_RECYCLE_HIGH_PAGES", -1);
+            const int lowWater = lowWaterEnv >= 0 ? lowWaterEnv
+                : std::max(64, this->dims[0] / 16);
+            const int highWater = highWaterEnv >= 0 ? highWaterEnv
+                : std::max(256, this->dims[0] / 4);
+            if ((int)this->freePages.size() < lowWater &&
+                !this->triePages.empty()) {
+                const int target =
+                    highWater - (int)this->freePages.size();
+                int recycled = 0;
+                const auto recycleStarted =
+                    std::chrono::steady_clock::now();
+                while (recycled < target) {
+                    // 直接淘汰一页进 freePages(不走 Locked 取页,
+                    // 避免 freePages 非空时取 free 页再放回的空转)。
+                    const int p = EvictOneColdPageLocked(nullptr);
+                    if (p < 0) {
+                        break;
+                    }
+                    recycled++;
+                }
+                if (recycled > 0) {
+                    const auto elapsedMs =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() -
+                            recycleStarted).count();
+                    fprintf(stderr,
+                            "[PagedCache] batch recycle: freed %d pages "
+                            "(freePages %d -> %d, low=%d high=%d) in %lld ms\n",
+                            recycled,
+                            (int)this->freePages.size() - recycled,
+                            (int)this->freePages.size(),
+                            lowWater, highWater, (long long)elapsedMs);
+                }
+            }
         }
         if (pageIndex < 0) {
             fprintf(stderr,
@@ -8764,6 +8808,22 @@ namespace fastllm {
             return -1;
         }
 
+        // pick=true 且 freePages 为空: 淘汰一页进 freePages 后再取。
+        const int evicted = EvictOneColdPageLocked(protectedPages);
+        if (evicted < 0) {
+            return -1;
+        }
+        const int pageIndex = this->freePages.back();
+        this->freePages.pop_back();
+        this->freePagesSet.erase(pageIndex);
+        this->pageRefCount[pageIndex] = 1;
+        return pageIndex;
+    }
+
+    // 淘汰一个最冷的前缀页(下沉 CPU/disk 优先, 失败才丢弃), 页进
+    // freePages 而非占用——供取页路径与水位批量回收共用。
+    int PagedCacheManager::EvictOneColdPageLocked(
+            const std::unordered_set<int> *protectedPages) {
         int pageIndex = -1;
         int candidatePosition = -1;
         CacheTrieNode *candidateNode = nullptr;
@@ -8854,7 +8914,9 @@ namespace fastllm {
             }
             this->triePages.resize(write);
         }
-        this->pageRefCount[pageIndex] = 1;
+        this->freePages.push_back(pageIndex);
+        this->freePagesSet.insert(pageIndex);
+        this->pageRefCount[pageIndex] = 0;
         return pageIndex;
     }
     bool PagedCacheManager::PageOutTrieNode(
@@ -8878,9 +8940,9 @@ namespace fastllm {
                 node->maxPrefixDepthPages) *
             (size_t)std::max(1, this->pageLen);
         const uint64_t minHits = PrefixCacheEnvBytes(
-            "FASTLLM_PREFIX_CACHE_MIN_HITS", 2);
+            "FASTLLM_PREFIX_CACHE_MIN_HITS", 1);
         const uint64_t minTokens = PrefixCacheEnvBytes(
-            "FASTLLM_PREFIX_CACHE_MIN_TOKENS", 65536);
+            "FASTLLM_PREFIX_CACHE_MIN_TOKENS", 8192);
         if (node->accessCount < minHits &&
             prefixTokens < minTokens) {
             PrefixCacheStatsObserveRecord(false, "min-hits-tokens");

@@ -1189,8 +1189,12 @@ namespace fastllm {
             model != nullptr && model->TryRecordPagedPrefixCacheExtra(this);
         if ((hasLinearAttentionCache || hasBoundedAttentionCache) &&
             !recordedPrefixExtra) {
+            // 解耦: linear(GDN) snapshot 缺失不再连坐 paged KV 记录。
+            // paged 链记在案后, 后续同前缀请求在更长位置补上 linear
+            // snapshot, 新请求即可命中到 snapshot 覆盖的深度;
+            // 恢复侧仍强制要求 snapshot 覆盖(RestorePagedPrefixCacheExtra),
+            // 正确性不变——只是"记了但暂时用不上"优于"整链不记"。
             PrefixCacheStatsObserveRecordPath("skip-linear-bounded");
-            return;
         }
 
         std::function<int(const Data&)> pagedCacheTokenLen =
