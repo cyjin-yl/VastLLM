@@ -618,6 +618,21 @@ if (UNIT_TEST)
     add_executable(testSamplingGuard test/samplingGuardTest.cpp)
     target_link_libraries(testSamplingGuard fastllm)
 
+    # 【上游BUMP勿回退】预分词(pre-tokenizer)正则切分的回归。
+    # 上游从来没读过 GGUF 的 tokenizer.ggml.pre, BPE 在整段文本上合并,
+    # 切出来的 token 序列与 HF/llama.cpp 不同 -> 模型逐字复述走样,
+    # 而且完全静默(解码回字符串一模一样)。期望值来自两个独立 oracle:
+    # Python regex 跑原始正则(切分) + llama-tokenize(token id)。
+    add_executable(testPreTokenizer test/pretokenizerTest.cpp)
+    target_link_libraries(testPreTokenizer fastllm)
+
+    # 前缀缓存三级下放/上提(L1 显存 -> L2 CPU 内存 -> L3 磁盘)的回归:
+    # 页字节数按 dims[0] 还是 maxPages 换算、下放顺序、L2 溢出轮转、
+    # 最小驻留时间与批量补页这几处一旦回退都是**静默失效**(缓存命中恒为 0,
+    # 服务看起来完全正常), 必须固化成可执行断言。
+    add_executable(testPrefixCacheTier test/prefixCacheTierTest.cpp)
+    target_link_libraries(testPrefixCacheTier fastllm)
+
     add_executable(optest test/ops/cppOps.cpp)
     target_link_libraries(optest fastllm)
     set_target_properties(optest PROPERTIES

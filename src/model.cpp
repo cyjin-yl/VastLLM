@@ -3839,6 +3839,42 @@ namespace fastllm {
                 }
             }
 
+            // 【上游BUMP勿回退】下面读 tokenizer.ggml.pre 的这段不能删。
+            //
+            // 线上故障(与上面 merges 那处同源, 是同一个"分词不规范"问题的另一半):
+            //   /home/ezra/Documents/Proto-UI  ->  /home/eze/Documents/PotouI
+            //   merges 修好之后逐词正确率恢复了, 但整句 exact match 只有 2/5,
+            //   剩下的差距全部来自**没有做预分词切分**。
+            //
+            // 根因: 上游从来没有读过 tokenizer.ggml.pre 这个键
+            // (grep "tokenizer.ggml.pre" src/ include/ 曾经是零命中)。这个键指定
+            // 的是**预分词正则** —— HF / llama.cpp / vLLM 在跑 BPE 之前, 都先用
+            // 它把文本切成块(单词 / 单个数字 / 一串标点 / 一段空白), BPE 只在块内
+            // 合并。少了这一步, BPE 会跨词边界、跨数字、跨标点任意合并, 切出
+            // 训练时不存在的 token 序列 —— 合法但非规范, 解码回字符串完全一样,
+            // 所以字符串层面的自检发现不了, 只表现为模型输出走样。
+            //
+            // 本模型: tokenizer.ggml.model = "gpt2", tokenizer.ggml.pre = "qwen35"。
+            // 正则见 src/tokenizer.cpp 的 PreTokenizeSplit 注释, 注意 \p{N} 是
+            // **单个数字**成块(数字逐位切), 这条最容易漏。
+            //
+            // 缺失 / 不认识的 pre 值: SetPreTokenizer 内部会退回"不切分"的旧行为
+            // 并打印一行 Warning —— 不要改成静默忽略。
+            {
+                const std::string ggufTokenizerModel =
+                    params["tokenizer.ggml.model"].is_string()
+                        ? params["tokenizer.ggml.model"].string_value()
+                        : std::string();
+                const std::string ggufTokenizerPre =
+                    params["tokenizer.ggml.pre"].is_string()
+                        ? params["tokenizer.ggml.pre"].string_value()
+                        : std::string();
+                printf("Load tokenizer model = %s\n",
+                       ggufTokenizerModel.empty() ? "(缺失)"
+                                                  : ggufTokenizerModel.c_str());
+                model->weight.tokenizer.SetPreTokenizer(ggufTokenizerPre);
+            }
+
             const auto &tokenItems = params["tokenizer.ggml.tokens"].array_items();
             int tokenTotal = (int)tokenItems.size();
             ReportModelLoadProgress("tokenizer", 0, std::max(1, tokenTotal));

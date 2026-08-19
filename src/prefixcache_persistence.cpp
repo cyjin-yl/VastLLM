@@ -790,9 +790,71 @@ bool CommitPersistentPrefixCacheGeneration(
             return false;
         }
         if (maxPresent) {
+            // 【上游BUMP勿回退】配额不够时必须"先回收再判", 不能直接拒写。
+            //
+            // 原来是什么: 量一次 DirectoryBytes(root) 就和
+            // FASTLLM_PREFIX_CACHE_DISK_MAX_BYTES 比, 不够直接 return false;
+            // 而唯一的回收动作 PrunePersistentPrefixCacheGenerations 写在本函数
+            // **最后一行**, 只有提交成功才会被执行到。
+            //
+            // 为什么错: 这构成自锁 —— 目录一旦涨到配额线, 提交失败;
+            // 提交失败 -> 回收不执行 -> 目录永远不缩 -> 之后每次提交都失败。
+            // 陈旧的历史 generation 白占配额, 没有任何出口能清掉它们。
+            // 另外这个顺序还凭空多要一代的余量: 判定时目录里是"当前 + 上一代"
+            // 两代(提交后的回收 keep=2), 再加上正在写的新一代, 等于要求配额能
+            // 同时容纳**三代**; 先回收再判则只需要容纳两代。
+            //
+            // 【2026-08-20 更正, 别再照抄旧版注释里的数字】
+            // 本注释早先写的"root 下 gen-1=1.8G + gen-2=214M 吃满 2.0G"是**误认**:
+            // 那两代属于 FASTLLM_PREFIX_CACHE_DISK_DIR 下的**另一个平级 root**
+            // (q38-prod-cyber-q5-*, 已废弃的 PERSIST_KEY 方案留下的孤儿),
+            // 而 DirectoryBytes(root) 量的是当前活跃 root, 孤儿根本不计入 ——
+            // 记账本身没有错。
+            //
+            // 线上那次"连续 6 次 shutdown checkpoint failed"的真实原因很朴素:
+            // 活跃 root (model-b64-v248320-*, CURRENT=4) 已占 1884.81MB,
+            // 而 FASTLLM_PREFIX_CACHE_DISK_MAX_BYTES 只给了 2GiB, 余量约 163MB,
+            // 262K 上下文的 checkpoint 远大于此 -> 必然写不下。那是**配额定太小**,
+            // 不是本函数的顺序问题(profile 已把配额提到 32GiB)。
+            //
+            // 所以下面这段"先回收再判"不是那次故障的解药, 它解决的是另一件事:
+            // 配额无论定多大, 只要真的顶到线, 旧顺序就只会**永久失败**而不是降级。
+            // 这是可靠性兜底, 不要因为"配额已经调大了"就把它删掉。
+            //
+            // 已知未覆盖: 跨 root 的孤儿(换 PERSIST_KEY 方案 / 换权重指纹后遗留,
+            // 实测有 2086.44MB 一直躺着)没有任何回收出口 —— 它不占配额, 但会长期
+            // 泄漏磁盘。这里不敢顺手删: 别的 root 可能属于另一个当前没在跑的模型,
+            // 删掉就毁了人家的缓存。需要单独设计(按 mtime + 权重指纹存活性判定)。
+            //
+            // 正确做法: 先按现状判一次(有富余就不做任何破坏性操作); 不够时把
+            // 除"当前已发布 generation"以外的历史 generation 回收掉再量一次;
+            // 仍然不够才失败, 并把实际数字带进错误信息便于对账。
             uint64_t existingBytes = DirectoryBytes(root);
-            if (payloadBytes > maxBytes || existingBytes > maxBytes - payloadBytes) {
-                SetError(error, "persistent prefix cache disk byte limit exceeded");
+            bool fits = payloadBytes <= maxBytes &&
+                        existingBytes <= maxBytes - payloadBytes;
+            if (!fits && payloadBytes <= maxBytes) {
+                uint64_t publishedGeneration = 0;
+                std::string readError;
+                // CURRENT 读不出来(首次提交 / 文件损坏)时按 0 处理: 0 不会匹配
+                // 任何 gen-N 目录, 于是历史 generation 全部可回收 —— 此时它们
+                // 本来也已经没人能用(载入路径同样要先读 CURRENT)。
+                if (!ReadCurrentGeneration(root, publishedGeneration,
+                                           &readError)) {
+                    publishedGeneration = 0;
+                }
+                std::string pruneError;
+                if (PrunePersistentPrefixCacheGenerations(
+                        root, publishedGeneration, 1, &pruneError)) {
+                    existingBytes = DirectoryBytes(root);
+                    fits = existingBytes <= maxBytes - payloadBytes;
+                }
+            }
+            if (!fits) {
+                SetError(error,
+                         "persistent prefix cache disk byte limit exceeded "
+                         "(payload=" + std::to_string(payloadBytes) +
+                         "B, existing=" + std::to_string(existingBytes) +
+                         "B, limit=" + std::to_string(maxBytes) + "B)");
                 return false;
             }
         }

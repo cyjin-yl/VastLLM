@@ -707,6 +707,15 @@ namespace fastllm {
         CacheTrieNode *parent = nullptr;
         uint64_t edgeHash = 0;
         std::vector<int> edgeTokens;
+        // 【上游BUMP勿回退】这个字段是"最小驻留时间"滞回的状态位, 删掉会退回
+        // 抖动版本。含义: 该节点的物理页最近一次"成为 L1 常驻"的时刻
+        // (steady_clock 毫秒, 0 表示未知)。Record() 与 MaterializeTrieNode()
+        // 各自在写 pageId 时打点。
+        // 为什么需要: 池子顶到预算天花板后, 取页路径每缺一页就淘汰一页, 刚从
+        // L2/L3 上提回来的页可能在下一次分配就被重新踢下去 —— 上提做的 H2D +
+        // 解压全白费, 表现为 CPU/磁盘层反复读写而命中率不涨。淘汰候选里跳过
+        // "刚常驻不久"的页即可打断这个循环。
+        long long residentSinceMs = 0;
         std::shared_ptr<PagedPrefixCacheTierPayload> tierPayload;
         std::shared_ptr<PagedPrefixCacheTierDiskRef> tierDisk;
     };
@@ -748,6 +757,16 @@ namespace fastllm {
             // 每个页面的引用计数
             std::vector<int> pageRefCount;
 
+            // 【上游BUMP勿回退】滞回状态: 上一轮"水位批量回收"发生的时刻
+            // (steady_clock 毫秒)。用于两轮回收之间的冷却期, 避免在天花板附近
+            // 高频重复扫描 trie + D2H + zstd。freePages 真的见底时会绕过冷却。
+            long long lastRecycleMs = 0;
+
+            // 【上游BUMP勿回退】上一次"水位扩容"失败(池预算/显存不足)的时刻
+            // (steady_clock 毫秒, 0 = 从未失败)。撞到天花板后进入退避期, 期间
+            // 直接走回收路径, 不再每次取页都去撞同一堵墙。
+            long long lastGrowFailureMs = 0;
+
 
             // Trie树缓存管理
             CacheTrieNode *trieRoot = nullptr;
@@ -766,8 +785,20 @@ namespace fastllm {
             // 淘汰一个最冷的前缀页进 freePages(下沉优先),
             // 供取页路径与水位批量回收共用。调用方须持 pageIndexLocker。
             int EvictOneColdPageLocked(
-                const std::unordered_set<int> *protectedPages);
+                const std::unordered_set<int> *protectedPages,
+                bool ignoreResidencyGuard = false);
+            // 批量淘汰: 一次补够 wantPages 页, 而不是"缺一页放一页"。
+            // 返回实际淘汰到 freePages 的页数。调用方须持 pageIndexLocker。
+            int EvictColdPagesLocked(
+                const std::unordered_set<int> *protectedPages,
+                int wantPages);
             bool PageOutTrieNode(CacheTrieNode *node);
+            // L2(CPU 内存) -> L3(磁盘) 轮转: 把 CPU 层最冷的载荷写盘并释放其
+            // 内存, 直到腾出 bytesNeeded 字节。allowDrop=true 时, 写盘失败的
+            // 载荷才允许直接丢弃(仅用于硬内存压力)。
+            // 调用方须持 pageIndexLocker。
+            uint64_t RotateCpuTierToDiskLocked(
+                uint64_t bytesNeeded, bool allowDrop);
             uint64_t EvictCpuTierPayloads(uint64_t bytesNeeded);
             bool MaterializeTrieNode(
                 CacheTrieNode *node,
@@ -1103,6 +1134,42 @@ namespace fastllm {
 
         TokenizerType type = TokenizerType::BPE;
 
+        // 【上游BUMP勿回退】下面这组"预分词(pre-tokenizer)"成员不能删。
+        //
+        // 线上故障(与 merges 那处同源, 表现同样是"胡言乱语 / 路径抄不对"):
+        //   /home/ezra/Documents/Proto-UI  ->  /home/eze/Documents/PotouI
+        //
+        // 根因: 上游 Tokenizer::Encode 只按 special token 切分, 剩下的**整段**
+        // 文本直接丢进 BytePairEncode。而 HF / llama.cpp / vLLM 都是先用
+        // GGUF 里 `tokenizer.ggml.pre` 指定的**预分词正则**把文本切成小块,
+        // BPE 只在块内合并, 永远跨不出块边界。少了这一步, BPE 就能跨词、
+        // 跨数字、跨标点任意合并, 产生训练时根本不存在的 token 序列 ——
+        // 合法但**非规范**, 模型在分布外推理, 逐字复述必然走样。
+        //
+        // 现场特征: 单词级别正确率恢复(merges 修好之后)但整句 exact match 上不去;
+        // 出错的地方集中在"字母紧挨数字/标点/连字符"以及长数字上。
+        //
+        // 正确做法: 读 GGUF 的 `tokenizer.ggml.pre`, 按对应正则切块再逐块 BPE。
+        // qwen35 的正则(取自 llama.cpp src/llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_QWEN35):
+        //   (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])
+        //   |[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}
+        //   | ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+        // 注意 `\p{N}` 是**单独一位**成块 —— 数字逐位切, 这点最容易漏。
+        //
+        // std::regex 不支持 \p{L} 这类 Unicode 属性, 所以实现方式与 llama.cpp
+        // 一致: 查码点类别表 + 手写状态机, 见 src/tokenizer.cpp 的 PreTokenizeSplit
+        // 和 include/utils/unicode_categories.h。
+        //
+        // 未知/缺失的 pre 值必须**保持不切分的旧行为并打印提示**, 绝不静默改行为。
+        enum PreTokenizerType {
+            PRE_TOKENIZER_NONE = 0,    // 不切分 —— 上游原始行为
+            PRE_TOKENIZER_QWEN2 = 1,   // \p{L}+        (qwen2 / deepseek-r1-qwen ...)
+            PRE_TOKENIZER_QWEN35 = 2   // [\p{L}\p{M}]+ (qwen35)
+        };
+
+        PreTokenizerType preTokenizerType = PreTokenizerType::PRE_TOKENIZER_NONE;
+        std::string preTokenizerName = "";   // GGUF 里 tokenizer.ggml.pre 的原值, 仅用于日志
+
         int blankRepeatCount = 0;     // 重复空格替换数量，0表示不替换
         bool addDummyPrefix = true;   // 是否在首位添加空格
         bool removeExtraWhitespaces = true;   // 是否将多个空格合并为一个
@@ -1139,6 +1206,15 @@ namespace fastllm {
         void SetTokenizerConfig(const json11::Json &config);
 
         std::string Normalize(const std::string &ori, const bool addDummyPrefix=true); // 字符规范化
+
+        // 【上游BUMP勿回退】设置 GGUF 的 tokenizer.ggml.pre。
+        // 认识的值 -> 启用对应预分词正则; 空值/不认识的值 -> 保持"不切分"的旧行为,
+        // 并打印一行提示(不要改成静默忽略: 静默 = 线上悄悄输出垃圾)。
+        void SetPreTokenizer(const std::string &pre);
+
+        // 【上游BUMP勿回退】按预分词正则把文本切成块, 每块之后各自独立走 BPE。
+        // 未启用预分词时原样返回 {s}, 与上游行为逐字节一致。
+        std::vector <std::string> PreTokenizeSplit(const std::string &s) const;
 
         Data Encode(const std::string &s); // 编码
 
