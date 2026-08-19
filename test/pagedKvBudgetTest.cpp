@@ -378,16 +378,24 @@ void TestTierAdmission() {
               0.0, kNoDecompress, kRecomputeTps, kNvmeSeek, 1, kMargin),
           "带宽为 0(未知设备): 不划算");
 
-    // margin 必须真的起作用: 打平的场景不能算划算
-    // 取回 100ms, 重算 100ms -> margin=0.2 要求取回 < 80ms
+    // margin 必须真的起作用。构造: 取回 90ms, 重算 100ms。
+    //   margin=0   -> 要求 90 < 100        成立, 算划算
+    //   margin=0.2 -> 要求 90 < 80         不成立, 不算划算
+    // 两次调用只有 margin 不同, 因此差异只能来自 margin。
+    const size_t kMarginBytes = (size_t)(100.0 * 1048576.0 * 0.09);
+    Check(fastllm::PagedPrefixCacheStorageWinsPure(
+              kMarginBytes, 0, false, 100,
+              100.0, kNoDecompress, 1000.0, 0.0, 1, 0.0),
+          "取回 90ms vs 重算 100ms: margin=0 时算划算");
+    Check(!fastllm::PagedPrefixCacheStorageWinsPure(
+              kMarginBytes, 0, false, 100,
+              100.0, kNoDecompress, 1000.0, 0.0, 1, 0.2),
+          "同一场景 margin=0.2 时不算划算(只差 10% < 20% 门槛)");
+    // 恰好打平也不能算划算(判据是严格小于)
     Check(!fastllm::PagedPrefixCacheStorageWinsPure(
               (size_t)(100.0 * 1048576.0 * 0.1), 0, false, 100,
-              100.0, kNoDecompress, 1000.0, 0.0, 1, 0.2),
-          "打平不算划算(margin=0.2 生效)");
-    Check(fastllm::PagedPrefixCacheStorageWinsPure(
-              (size_t)(100.0 * 1048576.0 * 0.1), 0, false, 100,
               100.0, kNoDecompress, 1000.0, 0.0, 1, 0.0),
-          "同一场景 margin=0 时算划算(证明差异确实来自 margin)");
+          "取回与重算恰好打平: 不算划算");
 
     // --- 本机实际解析出的介质画像 ---
     const auto prof = fastllm::GetPagedPrefixCacheDiskProfileInfo();

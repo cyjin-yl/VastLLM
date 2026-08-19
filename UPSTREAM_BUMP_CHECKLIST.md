@@ -12,7 +12,7 @@ grep -rn "上游BUMP勿回退" src/ include/ example/ --include=*.cpp --include=
 
 每处标记都写明了「回退会导致什么」。**冲突解决时以本仓版本为准。**
 
-## 当前受保护的 22 处
+## 当前受保护的 23 处
 
 | 文件 | 修复 | 回退的后果 |
 |---|---|---|
@@ -38,6 +38,7 @@ grep -rn "上游BUMP勿回退" src/ include/ example/ --include=*.cpp --include=
 | `src/fastllm.cpp` | **KV 预算守卫的每页字节数走 `GetPagedPoolPageBytes`(打包感知), 不再用 `unitSize` 乘** | 打包 KV 类型(`Q8_0_KV`/`TURBO3_KV`/`TURBO4_KV`)的 `unitSize` 恒为 1, 是占位值不是每元素字节数。用 `pageLen*numHeads*headDim*unitSize` 估算, 在 head_dim=256 下给出 256B/行, 而真实是 q8_0 272B、turbo3 100B、turbo4 132B —— 对 K 少算 5.9%, 对 V 多算 156%, 32 个池合计**高估 1.376 倍**, 守卫于是把 `maxPages` 砍到实际能放下的 72.7%, **上下文容量凭空少 27%**。现场只留一句 `clamping maxPages A → B`, 会把人误导去调 `--tokens` / `--kv_cache_dtype`。注意 `Grow()` 一直用的是 `GetDataBytes`(正确), 只有这个守卫在用另一套账 |
 | `src/models/basellm.cpp` + `include/models/basellm.h` + `example/apiserver/apiserver.cpp` | **`GetPagedCachePoolStats` 按物理页 `dims[0]` 统计水位, 逻辑预算 `maxPages` 单独由 `logicalMaxPagesOut` 带出; metrics 行加 `budget=` 字段** | 这是 af3830b1(页字节数 `dims[0]` vs `maxPages`)的**同胞, 当时漏掉的一处**。页池懒分配: `initialPages = min(128, maxPages)`, 之后靠 `Grow()` 追赶, 而 `freePages` 里只可能有物理页。旧式 `maxPages - FreePageCount()` 把"还没分配出来的页"全算成"正在使用"。线上实测(2026-08-20 空载, 只跑过 2 个请求): 32 个 manager 各 `maxPages=2048`/`dims[0]=128` 且全空闲, 打印成 **`kv_pool=61440/65536 pg (94%)`, 而真实占用是 0%**。一整天"页池顶满"的判断都建立在这个数上, 导致反复去动池预算和前缀缓存, 而池子其实是空的。`qwen3_5.cpp` 调度器里 `busyPages` 一直是对的(显式用 `dims[0]`), 两边口径必须一致 |
 | `src/fastllm.cpp` + `src/models/qwen3_5.cpp` | **GDN 快照标称长度与递归状态位置不一致时计数(`extra-skip-unaligned`), 并提供 `FASTLLM_PREFIX_CACHE_STRICT_SNAPSHOT_ALIGN` 逃生开关** | `TryRecordPagedPrefixCacheExtra` 把 `currentLen` 向下取整到页边界, 但快照里的 GDN 递归状态对应的是取整**前**的 `currentLenRaw`。命中恢复时全注意力 KV 被恢复成正好 `cachedLen` 个 token, 而递归状态已经吃过更多, 区间 `[cachedLen, currentLenRaw)`(最多 127 个 token)被**卷进递归状态两次** —— 静默算错, 不报错不崩溃。**默认不拒绝**是刻意的: agent 负载的主导形态是单调增长的会话(第 N 轮 prompt 严格包含第 N-1 轮全部内容), 服务它的恰恰是生成结束时那个必然不对齐的快照, 拒绝掉会让每轮全量重算。真正的解法是"在 decode 的对齐点记录快照", 未验证前不上。回退掉计数器就再也看不到这个偏差有多频繁 |
+| `src/fastllm.cpp` | **L3 准入判据加寻道项 + 并发放大 + margin; 介质能力只读 sysfs 推导, 零探针零写入** | 原判据只有带宽项 `storedBytes/readRate`, 冷启动默认 300MB/s。本机 L3 落在 `/dev/sda` = **ST16000NM000J 7200rpm 机械盘**(实测随机读中位 24ms / 41MB/s), 于是: (1) 一个 372KB 的页按纯带宽算 9ms、按"寻道+带宽"算 33ms, **高估 3.7 倍**; (2) 机械盘寻道在并发下**串行化**, 8 并发时取回 263ms 反而慢于重算 199ms —— 这就是"单请求划算、并发就亏"的分界线; (3) 冷启动 300MB/s 比实测快 7 倍, 样本攒够之前一路误判。**探测方式是硬约束**: 不做启动探针 —— 写探针文件消耗 SSD 的 TBW 寿命, 随机读探测有机械磨损, 而这是**用户设备**上长期生效的行为。改用只读 `/proc/mounts` + `/sys/class/block/<dev>/queue/rotational` 推导(零 I/O、零写入、换机器自动正确, 不需要校准文件和设备指纹失效逻辑); 运行期真实带宽/重算速度本来就在被动累积(`ObservePagedPrefixCacheRecompute` 等), 有样本就顶掉 sysfs 默认值。未识别设备(NFS/tmpfs)落**保守**默认(按机械盘), 宁可少用一层也不要在未知介质上把请求拖死。判据做成纯函数 `PagedPrefixCacheStorageWinsPure` 以便单测钉死 —— 判错不会报错, 只会悄悄变慢 |
 
 ## 新增: 算子路由普查(`include/fastllm-kernel-route.h`)
 
