@@ -24,6 +24,7 @@
 #endif
 
 #include "fastllm-cuda.cuh"
+#include "fastllm-kernel-route.h"
 #include "fastllm.h"
 #include "utils/utils.h"
 #include "attention/fastllm-attention-dtype.cuh"
@@ -3083,6 +3084,73 @@ void FastllmFlashInferAppendPointerKey(std::vector<uint32_t> &key,
 } // namespace
 #endif
 
+// SM70 两个注意力快路径为什么没生效 —— 一次性诊断。
+//
+// 前因后果(2026-08-20 审计):
+//   生产 profile 里写着
+//       FASTLLM_CUDA_SM70_FLASH_ATTN=0
+//       FASTLLM_CUDA_SM70_PAGED_XQA=0
+//   而 include/devices/cuda/attention/fastllm-paged-attention-native.cuh:15
+//   的注释写的是 "Enabled by default for the exact shape" —— 于是很自然会
+//   得出"我们把一个默认开启的优化显式关掉了, 打开就能提速"的结论。
+//
+//   这个结论是**错的**, 而且错得很隐蔽:
+//     FastllmCudaTrySm70PagedAttentionDecode 要求分页 K/V 都是 FLOAT16
+//       (fastllm-paged-attention-native.cu 里 pagedK->dataType != FLOAT16 直接 return false)
+//     FastllmCudaTrySm70FlashAttentionPrefill 要求分页 K/V 都是 FP8_E4M3
+//       (fastllm-sm70-flash-attention.cu 同理), 且 kvLen <= 512、qLen 每请求 2..10
+//   生产用的是 turbo3(K=q8_0, V=turbo3), 两个条件一个都不满足 ——
+//   **这两条路无论开关取 0 还是 1 都进不去**, 设 0 是 no-op, 不是性能取舍。
+//
+//   代价: v100-perfs 的 sweep 把这两个开关绑成一个 "SM70 开/关" 维度扫过
+//   (scripts/sweep_profiles.py 的 SM70_ON/SM70_OFF), 两组配置的后端日志逐行
+//   相同(都是 "Native paged attention uses chunked cublas attention"), 也就是
+//   这一维**什么都没测到**; 却被写进文档当成 "SM70 开 -> MTP 接受率更高" 的
+//   选型依据(v100-perfs/docs/EXPERIENCE.md 关于 c1/c6 的结论), 那条归因不成立。
+//
+// 正确做法: 与其让人靠读代码推断, 不如运行期直接说清楚。只在**显式设置过**
+// 环境变量时打印(没设的人不关心), 且整个进程只打印一次。
+static void FastllmReportSm70AttentionRouteOnce(const fastllm::Data &kCaches,
+                                                const fastllm::Data &vCaches) {
+    static std::atomic<bool> reported {false};
+    bool expected = false;
+    if (!reported.compare_exchange_strong(expected, true)) {
+        return;
+    }
+    const char *xqaEnv = std::getenv("FASTLLM_CUDA_SM70_PAGED_XQA");
+    const char *flashEnv = std::getenv("FASTLLM_CUDA_SM70_FLASH_ATTN");
+    const bool xqaSet = xqaEnv != nullptr && xqaEnv[0] != '\0';
+    const bool flashSet = flashEnv != nullptr && flashEnv[0] != '\0';
+    if (!xqaSet && !flashSet) {
+        return;
+    }
+    const fastllm::Data *pagedK = kCaches.pagedKVCacheData;
+    const fastllm::Data *pagedV = vCaches.pagedKVCacheData;
+    const std::string kName = pagedK != nullptr
+        ? fastllm::GetDataTypeName(pagedK->dataType) : std::string("(null)");
+    const std::string vName = pagedV != nullptr
+        ? fastllm::GetDataTypeName(pagedV->dataType) : std::string("(null)");
+    const bool xqaReachable = pagedK != nullptr && pagedV != nullptr &&
+        pagedK->dataType == fastllm::DataType::FLOAT16 &&
+        pagedV->dataType == fastllm::DataType::FLOAT16;
+    const bool flashReachable = pagedK != nullptr && pagedV != nullptr &&
+        pagedK->dataType == fastllm::DataType::FP8_E4M3 &&
+        pagedV->dataType == fastllm::DataType::FP8_E4M3;
+    printf("[Fastllm][sm70-attn] 分页 KV dtype: K=%s V=%s\n",
+           kName.c_str(), vName.c_str());
+    if (xqaSet && !xqaReachable) {
+        printf("[Fastllm][sm70-attn] FASTLLM_CUDA_SM70_PAGED_XQA=%s 不起作用: "
+               "该路径要求分页 K/V 均为 float16, 当前不是 -> 开关取任何值结果都一样。\n",
+               xqaEnv);
+    }
+    if (flashSet && !flashReachable) {
+        printf("[Fastllm][sm70-attn] FASTLLM_CUDA_SM70_FLASH_ATTN=%s 不起作用: "
+               "该路径要求分页 K/V 均为 fp8_e4m3, 当前不是 -> 开关取任何值结果都一样。\n",
+               flashEnv);
+    }
+    fflush(stdout);
+}
+
 bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q,
                                         fastllm::Data &kCaches,
                                         fastllm::Data &vCaches,
@@ -3096,9 +3164,14 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q,
                                         bool sync, bool enableCudaGraph,
                                         int flashInferCudaGraph,
                                         int windowLeft) {
+    FastllmReportSm70AttentionRouteOnce(kCaches, vCaches);
+    // 普查用的 "token 数": q 的第 1 维在 decode 是 batch, 在 prefill 是 chunk 长度。
+    const int routeQTokens = q.dims.size() > 1 ? (int)q.dims[1] : 1;
     if (FastllmCudaTrySm70PagedAttentionDecode(
             q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens,
             output, group, scale, attentionType)) {
+        fastllm::KernelRouteHit(fastllm::KERNEL_ROUTE_ATTN_SM70_PAGED_XQA,
+                                -1, routeQTokens, 0, 0);
         if (sync) {
             FastllmCudaSyncCurrentThreadStream();
         }
@@ -3107,6 +3180,8 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q,
     if (FastllmCudaTrySm70FlashAttentionPrefill(
             q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens,
             output, group, scale, attentionType)) {
+        fastllm::KernelRouteHit(fastllm::KERNEL_ROUTE_ATTN_SM70_FLASH_PREFILL,
+                                -1, routeQTokens, 0, 0);
         if (sync) {
             FastllmCudaSyncCurrentThreadStream();
         }
@@ -3116,6 +3191,8 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q,
 #ifndef FASTLLM_ENABLE_FLASHINFER
     fastllm::AssertInFastLLM(windowLeft < 0,
                              "Sliding-window paged attention requires FlashInfer.\n");
+    fastllm::KernelRouteHit(fastllm::KERNEL_ROUTE_ATTN_NATIVE_FALLBACK,
+                            -1, routeQTokens, 0, 0);
     bool ok = FastllmCudaHalfPagedAttentionBatchFastllmFallback(
         q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale);
     if (sync) {
@@ -3126,6 +3203,8 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q,
     if (!FastllmCudaFlashInferSupported()) {
         fastllm::AssertInFastLLM(windowLeft < 0,
                                  "Sliding-window paged attention requires FlashInfer support on this GPU.\n");
+        fastllm::KernelRouteHit(fastllm::KERNEL_ROUTE_ATTN_NATIVE_FALLBACK,
+                                -1, routeQTokens, 0, 0);
         bool ok = FastllmCudaHalfPagedAttentionBatchFastllmFallback(
             q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale);
         if (sync) {
@@ -3133,6 +3212,8 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q,
         }
         return ok;
     }
+    fastllm::KernelRouteHit(fastllm::KERNEL_ROUTE_ATTN_FLASHINFER,
+                            -1, routeQTokens, 0, 0);
     using namespace flashinfer;
     FlashInferWorkSpaceManager& workspace = getFastllmFlashInferWorkSpace();
     

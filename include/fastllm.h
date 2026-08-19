@@ -362,6 +362,48 @@ namespace fastllm {
     size_t GetDataBytes(DataType type, size_t rows, size_t columns);
     bool IsPackedKVCacheDataType(DataType type);
     size_t GetKVCacheRowBytes(DataType type, size_t columns);
+
+    // 【上游BUMP勿回退】分页 KV 池"一页占多少字节"的唯一口径。
+    // 打包 KV 类型(Q8_0_KV/TURBO3_KV/TURBO4_KV)的 unitSize 恒为 1, 是占位值而非
+    // 每元素字节数, 任何地方都不许用 pageLen*numHeads*headDim*unitSize 去估页大小。
+    // 详见 src/fastllm.cpp 中 AllocatePagedCacheManager 里预算守卫处的长注释。
+    size_t GetPagedPoolPageBytes(
+        DataType type, int pageLen, int numHeads, int headDim);
+
+    // 【上游BUMP勿回退】GDN/线性注意力递归状态快照的"标称长度"合法性判据。
+    // 递归状态不能截断: 它对应的 token 数(currentLenRaw)必须恰好等于快照标称的
+    // 页对齐长度, 否则命中恢复时会把 [alignedLen, currentLenRaw) 这段 token 卷进
+    // 递归状态两次(静默算错)。详见 src/models/qwen3_5.cpp 中
+    // TryRecordPagedPrefixCacheExtra 的长注释。
+    // 返回 true 表示可安全记录, *alignedLen 写回对齐后的长度。
+    bool PagedPrefixSnapshotLengthUsable(
+        int currentLenRaw, int pageLen, int *alignedLen);
+    // FASTLLM_PREFIX_CACHE_STRICT_SNAPSHOT_ALIGN=1 时才真的拒绝未对齐快照。
+    // 默认 false: 见 src/fastllm.cpp 里该函数的权衡说明。
+    bool PagedPrefixSnapshotStrictAlign();
+
+    // 【上游BUMP勿回退】分层准入的纯判据。做成纯函数是为了让单测能把
+    // "什么时候该走存储、什么时候该重算"钉死 —— 这个判断错了不会报错,
+    // 只会悄悄变慢(在机械盘上把请求拖死, 或在 NVMe 上白白放弃一整层)。
+    //   restore = seekSeconds * max(1,inflight) + storedBytes/readMiBps [+解压]
+    //   recompute = recomputeTokens / recomputeTps
+    // 返回 true = 从存储取回比重算划算(且至少快 margin 这么多)。
+    bool PagedPrefixCacheStorageWinsPure(
+        size_t storedBytes, size_t uncompressedBytes, bool zstdCompressed,
+        size_t recomputeTokens, double readMiBps, double decompressMiBps,
+        double recomputeTps, double seekSeconds, int inflight, double margin);
+
+    // L3 介质画像。**只读 sysfs 推导, 零 I/O 零写入**, 不做探针,
+    // 不写校准文件 —— 探针会消耗 SSD 的 TBW 寿命和机械盘的机械磨损,
+    // 而这是用户设备上长期生效的行为。详见 src/fastllm.cpp 里的长注释。
+    struct PagedPrefixCacheDiskProfileInfo {
+        bool resolved = false;
+        bool rotational = true;
+        double seekSeconds = 0.012;
+        double readMiBPerSecond = 60.0;
+        std::string deviceKey = "unknown";
+    };
+    PagedPrefixCacheDiskProfileInfo GetPagedPrefixCacheDiskProfileInfo();
     constexpr size_t INT4_GROUP32_GROUP_SIZE = 32;
     constexpr size_t INT4_GROUP32_PACKED_BYTES = 16;
     constexpr size_t INT4_GROUP32_BLOCK_GROUPS = 4;
@@ -1000,6 +1042,11 @@ namespace fastllm {
         uint64_t extraSkipInterval = 0;      // %snapshotInterval!=0
         uint64_t extraSkipSnapshotCopy = 0;  // linear 层快照拷贝失败
         uint64_t extraSkipMtp = 0;           // requireMtp 但 MTP cache 缺/不配
+        // 【上游BUMP勿回退】GDN 递归状态位置与快照标称长度不一致而丢弃的次数。
+        // 这个计数**不为 0 是正常的**(生成结束时的记录点几乎必然不页对齐),
+        // 它存在的意义是: 一旦 extraOk 长期为 0 而这一项很大, 说明快照只在
+        // 非对齐点被尝试记录 —— 即分块 prefill 的对齐记录钩子没生效。
+        uint64_t extraSkipUnaligned = 0;     // GDN 状态位置未页对齐, 丢弃以免错位
     };
     void PrefixCacheStatsObserveRecordPath(const char *event);
     bool PrefixCacheStatsEnabled();

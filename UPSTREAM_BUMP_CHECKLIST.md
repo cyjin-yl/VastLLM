@@ -12,7 +12,7 @@ grep -rn "上游BUMP勿回退" src/ include/ example/ --include=*.cpp --include=
 
 每处标记都写明了「回退会导致什么」。**冲突解决时以本仓版本为准。**
 
-## 当前受保护的 17 处
+## 当前受保护的 22 处
 
 | 文件 | 修复 | 回退的后果 |
 |---|---|---|
@@ -33,6 +33,40 @@ grep -rn "上游BUMP勿回退" src/ include/ example/ --include=*.cpp --include=
 | `src/prefixcache_persistence.cpp` | **配额不足时先回收陈旧 generation 再判** | 原顺序把回收写在提交成功之后: 目录顶到配额线 -> 提交失败 -> 回收永不执行 -> **永久失败**。另: 旧顺序凭空多要一代余量(判定时需同时容纳三代) |
 | `example/apiserver/apiserver.cpp` | **派发前 + 非流式循环的 `SocketPeerDisconnected` 探活** | 客户端早走了仍把请求算到底: 262K prefill 独占 GPU 几分钟、KV 页整段不释放把池顶到水位线诱发 `Grow` 失败、真请求被挤在队列后面。非流式路径原本用阻塞 `FetchResponseTokens`, 整个 prefill 期间零检测 |
 | `example/apiserver/apiserver.cpp` | **轻量路由(`IsLightweightRoute` + `lightQ`)不占推理并发额度** | `maxActivateQueryNumber = min(256, --batch)`, 生产 `--batch 1` => 1; 闸门对所有路由一视同仁 -> 只要有请求在生成, `/health` `/version` 就排队到超时 -> **上游代理无法区分"在忙"与"已僵死"**, 本次死锁故障因此拖了一小时才被发现。注意 `/admin/*` 不能放进来(会 suspend/resume 模型, 必须串行) |
+| `src/devices/cuda/fastllm-iq4xs-sm70.cu` | **设备能力查询缓存(`s70_device_caps`), 不再每次调用都 `cudaGetDeviceProperties`** | `FastllmCudaTrySm70Iq4XsMmq` 在**每一次 IQ4_XS 线性层调用**上都会先查设备属性, 而且排在 `n/m/k` 形状判定之前。本机实测 `cudaGetDeviceProperties` = **36.5 us/call**(对比 `cudaGetDevice` 0.027us、`cudaDeviceGetAttribute` 0.016us), 微基准见 `~/projects/EzraVastLLM/scripts/sm70-audit/bench_devprops.cu`。Qwen3.8-27B 每 decode 一个 token 约数百次线性调用 -> 约 **10+ ms/token 纯白花开销**, 而且 decode 的 n=1..3 必然在后面的 `n range` 上被拒, 这次查询 100% 无用。**只在 IQ4_XS 档位出现**(Q5_K_M 的权重不是 `GGML_TYPE_IQ4_XS`, 根本不进这个 trial), 所以表现成"换成更低位宽反而更慢", 极易被误判成"IQ 量化在 V100 上不行"而错误回退到 Q5 |
+| `src/devices/cuda/fastllm-iq4xs-sm70.cu` + `src/fastllm-kernel-route.cpp` | **MMQ 形状资格判定收敛到纯函数 `Sm70Iq4XsMmqShapeRejectReason`** | `n in [8,64] / m%256 / k>=128` 这几个数字决定了这个 749 行 kernel 在生产里**到底有没有被用到**: decode 的 n=1..3、长 prefill 的 n=1024 两头都在区间外。判定若在 kernel 里再抄一份, 就会和 `test/kernelRouteCensusTest.cpp` 里用真实模型形状钉死的断言悄悄走岔, 测试随之失效 |
+| `src/fastllm.cpp` | **KV 预算守卫的每页字节数走 `GetPagedPoolPageBytes`(打包感知), 不再用 `unitSize` 乘** | 打包 KV 类型(`Q8_0_KV`/`TURBO3_KV`/`TURBO4_KV`)的 `unitSize` 恒为 1, 是占位值不是每元素字节数。用 `pageLen*numHeads*headDim*unitSize` 估算, 在 head_dim=256 下给出 256B/行, 而真实是 q8_0 272B、turbo3 100B、turbo4 132B —— 对 K 少算 5.9%, 对 V 多算 156%, 32 个池合计**高估 1.376 倍**, 守卫于是把 `maxPages` 砍到实际能放下的 72.7%, **上下文容量凭空少 27%**。现场只留一句 `clamping maxPages A → B`, 会把人误导去调 `--tokens` / `--kv_cache_dtype`。注意 `Grow()` 一直用的是 `GetDataBytes`(正确), 只有这个守卫在用另一套账 |
+| `src/models/basellm.cpp` + `include/models/basellm.h` + `example/apiserver/apiserver.cpp` | **`GetPagedCachePoolStats` 按物理页 `dims[0]` 统计水位, 逻辑预算 `maxPages` 单独由 `logicalMaxPagesOut` 带出; metrics 行加 `budget=` 字段** | 这是 af3830b1(页字节数 `dims[0]` vs `maxPages`)的**同胞, 当时漏掉的一处**。页池懒分配: `initialPages = min(128, maxPages)`, 之后靠 `Grow()` 追赶, 而 `freePages` 里只可能有物理页。旧式 `maxPages - FreePageCount()` 把"还没分配出来的页"全算成"正在使用"。线上实测(2026-08-20 空载, 只跑过 2 个请求): 32 个 manager 各 `maxPages=2048`/`dims[0]=128` 且全空闲, 打印成 **`kv_pool=61440/65536 pg (94%)`, 而真实占用是 0%**。一整天"页池顶满"的判断都建立在这个数上, 导致反复去动池预算和前缀缓存, 而池子其实是空的。`qwen3_5.cpp` 调度器里 `busyPages` 一直是对的(显式用 `dims[0]`), 两边口径必须一致 |
+| `src/fastllm.cpp` + `src/models/qwen3_5.cpp` | **GDN 快照标称长度与递归状态位置不一致时计数(`extra-skip-unaligned`), 并提供 `FASTLLM_PREFIX_CACHE_STRICT_SNAPSHOT_ALIGN` 逃生开关** | `TryRecordPagedPrefixCacheExtra` 把 `currentLen` 向下取整到页边界, 但快照里的 GDN 递归状态对应的是取整**前**的 `currentLenRaw`。命中恢复时全注意力 KV 被恢复成正好 `cachedLen` 个 token, 而递归状态已经吃过更多, 区间 `[cachedLen, currentLenRaw)`(最多 127 个 token)被**卷进递归状态两次** —— 静默算错, 不报错不崩溃。**默认不拒绝**是刻意的: agent 负载的主导形态是单调增长的会话(第 N 轮 prompt 严格包含第 N-1 轮全部内容), 服务它的恰恰是生成结束时那个必然不对齐的快照, 拒绝掉会让每轮全量重算。真正的解法是"在 decode 的对齐点记录快照", 未验证前不上。回退掉计数器就再也看不到这个偏差有多频繁 |
+
+## 新增: 算子路由普查(`include/fastllm-kernel-route.h`)
+
+这一处不是"防回退", 是**防再次误判**。本仓在 V100 上给同一个逻辑算子准备了多份
+实现, 靠一串 `if (...) return false;` 在运行期**静默**选路 —— 选错路不报错、结果
+也对, 只是慢。因此"实际走了哪条 kernel"长期只能靠读代码猜, 而且已经猜错两次:
+
+1. 生产 profile 里 `FASTLLM_CUDA_SM70_PAGED_XQA=0`, 而
+   `fastllm-paged-attention-native.cuh:15` 写着 "Enabled by default", 于是被当成
+   "我们把一个默认开启的优化关掉了, 打开就能提速"。
+   **真相**: 该路径要求分页 K/V 都是 `FLOAT16`, 生产用 turbo3(K=q8_0, V=turbo3),
+   开关取 0 还是 1 结果完全一样。同理 `FASTLLM_CUDA_SM70_FLASH_ATTN` 要求
+   `FP8_E4M3`, 也进不去。
+   连带后果: `v100-perfs/scripts/sweep_profiles.py` 把这两个开关绑成一个
+   "SM70 开/关" 维度扫过, 两组的后端日志逐行相同, 这一维**什么都没测到**,
+   却被写进 `v100-perfs/docs/EXPERIENCE.md` 当成选型依据。
+2. 749 行的 SM70 IQ4_XS DP4A MMQ 被当成 "IQ4_XS 的 decode 快路径"。
+   **真相**: 它只接受 `n in [8,64]`, decode 的 n 是 1..3, 长 prefill 的 n 是上千。
+
+对应的三件事:
+
+- `KernelRouteHit()` 常开计数(每次一个 relaxed 原子自增), 经 `/props` 的
+  `kernel_routes` 暴露: `curl -s localhost:8002/props | jq .kernel_routes`
+- `FASTLLM_KERNEL_ROUTE_STATS=1` 额外记录 `(route, ggml_type, n, m, k)` 明细,
+  并让 15 秒的 `[metrics]` 行附带一行 `[kernel-route] ...`
+- `FastllmReportSm70AttentionRouteOnce()`: 只要**显式设置过**那两个 SM70 环境变量,
+  启动后第一次注意力就打印一次"该开关在当前 KV dtype 下不起作用"
+
+**bump 时若这些被当成'调试代码'删掉, 上面两类误判会立刻重新可能发生。**
 
 ## 最危险的一处: `src/model.cpp` 的 token score
 
@@ -90,10 +124,13 @@ Load tokenizer pre = qwen35 (预分词正则已启用: qwen35)
 ## bump 后必须跑的回归
 
 ```bash
-cmake -DUNIT_TEST=ON .. && cmake --build . --target testSamplingGuard testToolCallGrammar testPreTokenizer
+cmake -DUNIT_TEST=ON .. && cmake --build . --target testSamplingGuard testToolCallGrammar testPreTokenizer testPrefixCacheTier testPagedKvBudget
 ./testSamplingGuard      # 15/15   —— 采样路径(NaN / temperature=0 / top_k 两条分支)
 ./testToolCallGrammar    # ALL PASS —— 工具调用语法状态机
 ./testPreTokenizer       # 31/31   —— 预分词切分(不需要模型)
+./testPrefixCacheTier    # 29/29   —— 前缀缓存三级下放/上提
+./testPagedKvBudget      # 分页 KV 显存账本 + 页池水位口径 + GDN 快照对齐
+FASTLLM_PREFIX_CACHE_STRICT_SNAPSHOT_ALIGN=1 ./testPagedKvBudget   # 严格对齐分支
 ./testPreTokenizer <gguf> --corpus /home/ezra/projects/EzraVastLLM/pretokenizer-corpus/corpus_list.txt
                          # 42/42, 45/45 篇与 llama-tokenize 逐 token 一致
 ```

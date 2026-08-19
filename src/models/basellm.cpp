@@ -1323,10 +1323,43 @@ namespace fastllm {
         return false;
     }
 
+    // 【上游BUMP勿回退】页池水位必须按**物理页数 dims[0]** 算, 不能按逻辑预算
+    // maxPages 算 —— 这是 af3830b1 那个根因的同胞, 当时漏掉了这一处。
+    //
+    // 原来是什么:
+    //     totalPages += manager->maxPages;
+    //     usedPages  += manager->maxPages - min(maxPages, FreePageCount());
+    // 为什么错: 页池是**懒分配**的。AllocatePagedCacheManager 只先分配
+    // initialPages = min(128, maxPages) 个物理页(见 src/fastllm.cpp 内该函数),
+    // 之后靠 Grow() 按需追赶; 而 maxPages 是 --tokens 换算出来的逻辑上限
+    // (262144 / 128 = 2048)。freePages/triePages 里**只可能有物理页**, 所以
+    // "maxPages - 空闲页" 会把"还没分配出来的页"全部算成"正在使用"。
+    //
+    // 线上实测(2026-08-20, 空载, 只跑过 2 个请求):
+    //     32 个 manager, 每个 maxPages=2048, dims[0]=128(还没 Grow 过), 全空闲
+    //     错误口径: used = 32*(2048-128) = 61440, total = 32*2048 = 65536
+    //               => 打印成 "kv_pool=61440/65536 pg (94%)"
+    //     真实情况: used = 32*(128-128) = 0
+    //               => 应该是 "kv_pool=0/4096 pg (0%)"
+    // 也就是说**空载时报 94% 占用, 而实际是 0%**。一整天所有"页池顶满"的判断
+    // 都建立在这个数字上, 导致反复去动页池预算/前缀缓存, 而真正的池子是空的。
+    //
+    // 注意 qwen3_5.cpp 的调度器(Qwen35MTPLoop 里 busyPages 的计算)一直是对的,
+    // 它显式用 probeManager->dims[0] 并写了注释; 只有这个给 metrics 用的函数
+    // 在用另一套口径, 两边对不上账。
+    //
+    // logicalMaxPagesOut 单独把逻辑预算带出去, 免得修了口径反而看不见上限。
+    //
+    // 校验: 见 test/pagedKvBudgetTest.cpp 的
+    //       "页池水位: 懒分配下必须按物理页算" 用例。
     void basellm::GetPagedCachePoolStats(uint64_t &totalPages, uint64_t &usedPages,
-                                         uint64_t &triePages, int &pageLenOut) {
+                                         uint64_t &triePages, int &pageLenOut,
+                                         uint64_t *logicalMaxPagesOut) {
         totalPages = usedPages = triePages = 0;
         pageLenOut = 0;
+        if (logicalMaxPagesOut != nullptr) {
+            *logicalMaxPagesOut = 0;
+        }
         std::unordered_set<PagedCacheManager*> seen;
         for (int li = 0; li < this->block_cnt; li++) {
             for (int keyFlag = 0; keyFlag < 2; keyFlag++) {
@@ -1336,11 +1369,18 @@ namespace fastllm {
                         continue;
                     }
                     std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
-                    totalPages += (uint64_t)manager->maxPages;
+                    const uint64_t physicalPages =
+                        (!manager->dims.empty() && manager->dims[0] > 0) ?
+                            (uint64_t)manager->dims[0] : 0;
+                    totalPages += physicalPages;
                     uint64_t freePages = (uint64_t)manager->FreePageCount();
-                    usedPages += (uint64_t)manager->maxPages -
-                                 std::min((uint64_t)manager->maxPages, freePages);
+                    usedPages += physicalPages -
+                                 std::min(physicalPages, freePages);
                     triePages += (uint64_t)manager->triePages.size();
+                    if (logicalMaxPagesOut != nullptr) {
+                        *logicalMaxPagesOut +=
+                            (uint64_t)std::max(0, manager->maxPages);
+                    }
                     if (pageLenOut == 0) {
                         pageLenOut = manager->pageLen;
                     }

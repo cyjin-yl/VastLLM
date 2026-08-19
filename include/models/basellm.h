@@ -535,8 +535,11 @@ namespace fastllm {
         virtual std::vector<std::pair<int, PagedCacheManager*> > GetPagedKVCacheManagers(int layerIndex, bool isKey) const;
         // 汇总所有层的分页 KV 池占用(按 manager 指针去重):
         // totalPages=池容量, usedPages=已分配(含 trie 引用), triePages=前缀缓存驻留页。
+        // totalPages/usedPages 是**物理页**(dims[0])口径; 逻辑预算(maxPages)
+        // 由 logicalMaxPagesOut 单独带出。原因见 basellm.cpp 里的长注释。
         void GetPagedCachePoolStats(uint64_t &totalPages, uint64_t &usedPages,
-                                    uint64_t &triePages, int &pageLenOut);
+                                    uint64_t &triePages, int &pageLenOut,
+                                    uint64_t *logicalMaxPagesOut = nullptr);
         virtual std::pair<DataType, DataType> GetKVCacheDataTypes(int layerIndex) const {
             (void)layerIndex;
             return {this->kvCacheDataType, this->kvCacheDataType};

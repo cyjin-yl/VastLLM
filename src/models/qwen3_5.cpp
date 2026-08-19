@@ -9002,10 +9002,52 @@ namespace fastllm {
         // currentLen % pageLen == 0 meant hybrid-agent requests never recorded
         // anything (the whole record path is gated on this extra returning
         // true, leaving the L1 trie permanently empty).
-        int currentLen = pageLen > 0 ? currentLenRaw - currentLenRaw % pageLen
-                                     : currentLenRaw;
+        int currentLen = 0;
+        const bool snapshotLenUsable = fastllm::PagedPrefixSnapshotLengthUsable(
+            currentLenRaw, pageLen, &currentLen);
         if (currentLen <= 0 || currentLen > (int)context->allTokens.size()) {
             PrefixCacheStatsObserveRecordPath("extra-skip-len");
+            return false;
+        }
+        // 【上游BUMP勿回退】GDN 递归状态无法"截断"到页边界, 标称长度必须等于
+        // 状态真实吃过的 token 数, 否则命中即静默算错。
+        //
+        // 上面那句 "currentLen = 向下取整到页" 是为了让生成结束时也能记上快照
+        // (原先要求严格页对齐 -> 混合架构下一条都记不上, L1 trie 恒空)。但它只
+        // 改了**标称长度**, 没有也不可能改**状态本身**:
+        //   snapshot->layers[i] 存的是 pastKeyValues 当前的 GDN 递归状态,
+        //   它对应的是 currentLenRaw 个 token; 而 snapshot->cachedLen 写的是
+        //   向下取整后的 currentLen, snapshot->tokens 也只取前 currentLen 个。
+        // 于是命中恢复时(见本文件 RestorePagedPrefixCacheExtra 与
+        // Qwen35RestoreSnapshotCache):
+        //   - 全注意力 KV 被恢复成正好 cachedLen 个 token(页粒度, 见
+        //     qwen3_5.cpp 内 restoreOne 的 cache.Resize({..., cachedLen, ...}));
+        //   - GDN 递归状态却已经吃过 currentLenRaw 个 token;
+        //   - 模型随后从第 cachedLen 个 token 继续前向,
+        //     区间 [cachedLen, currentLenRaw) 的 token 被**卷进递归状态两次**。
+        // 差值最大 pageLen-1 = 127 个 token。表现是命中后输出悄悄变差, 不报错、
+        // 不崩溃, 没有任何日志 —— 属于最难查的一类。
+        //
+        // 为什么现在才需要修: 线上 token 级命中率长期约 0.13%
+        // (实测 hitTok=2176/1713565, 且 hitTok/hitReqs 恒等于 128), 这条路几乎
+        // 没被走到, 所以一直没暴露。一旦命中率被提上去, 它立刻变成正确性事故。
+        //
+        // 修法: 状态位置(currentLenRaw)与标称长度(currentLen)不一致就直接不记。
+        // 这不会减少**可复用**的快照 —— 真正能跨请求复用的快照来自分块 prefill
+        // 的对齐记录点(见本文件 "cachedTokens % pageLen == 0" 处的
+        // TryRecordPagedCache 调用, chunk 由 GetChunkedPrefillSize() 保证是
+        // pageLen/snapshot-interval 的整数倍), 那些点天然对齐, 不受影响;
+        // 被丢掉的只是生成结束时那个**请求私有、长度任意**的快照, 它本来就因为
+        // token 序列独一无二而几乎不可能被别的请求匹配上。
+        //
+        // 校验: 见 test/prefixSnapshotAlignTest.cpp 的
+        //       "GDN 快照: 非页对齐位置必须拒绝记录" 用例。
+        // 不一致**总是**计数(线上要看到它多频繁); 是否因此拒绝由
+        // FASTLLM_PREFIX_CACHE_STRICT_SNAPSHOT_ALIGN 决定, 默认不拒绝。
+        if (currentLen != currentLenRaw) {
+            PrefixCacheStatsObserveRecordPath("extra-skip-unaligned");
+        }
+        if (!snapshotLenUsable) {
             return false;
         }
         int lastSnapshotLen = context->intParams["qwen35_linear_prefix_last_len"];

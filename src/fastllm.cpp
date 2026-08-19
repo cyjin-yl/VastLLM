@@ -691,6 +691,68 @@ namespace fastllm {
         return GetDataBytes(type, 1, columns);
     }
 
+    size_t GetPagedPoolPageBytes(
+            DataType type, int pageLen, int numHeads, int headDim) {
+        if (pageLen <= 0 || numHeads <= 0 || headDim <= 0) {
+            return 0;
+        }
+        // 分页 KV 的几何是 [maxPages, pageLen, numHeads, headDim];
+        // 打包类型按"行"存(行 = 一个 (page, token, head) 三元组, 列 = headDim),
+        // 所以一页 = pageLen*numHeads 行。
+        return GetDataBytes(
+            type, (size_t)pageLen * (size_t)numHeads, (size_t)headDim);
+    }
+
+    bool PagedPrefixSnapshotStrictAlign() {
+        static const bool cached = []() -> bool {
+            const char *env =
+                std::getenv("FASTLLM_PREFIX_CACHE_STRICT_SNAPSHOT_ALIGN");
+            return env != nullptr && env[0] != 0 &&
+                   IsEnvValueTrueIgnoreCase(env);
+        }();
+        return cached;
+    }
+
+    bool PagedPrefixSnapshotLengthUsable(
+            int currentLenRaw, int pageLen, int *alignedLen) {
+        if (alignedLen != nullptr) {
+            *alignedLen = 0;
+        }
+        if (currentLenRaw <= 0) {
+            return false;
+        }
+        const int aligned = pageLen > 0
+            ? currentLenRaw - currentLenRaw % pageLen
+            : currentLenRaw;
+        if (alignedLen != nullptr) {
+            *alignedLen = aligned;
+        }
+        if (aligned <= 0) {
+            // 连一整页都没有, 没有可记录的前缀。
+            return false;
+        }
+        // aligned != currentLenRaw 时, GDN 递归状态比标称长度多吃了
+        // (currentLenRaw - aligned) 个 token, 最多 pageLen-1 = 127 个。
+        //
+        // 为什么默认**不**拒绝(2026-08-20 的权衡, 别想当然改成默认拒绝):
+        //   agent 负载的主导形态是"单调增长的会话": 第 N 轮的 prompt 严格包含
+        //   第 N-1 轮的全部内容(system + 历次 tool_call + tool_result)。服务
+        //   这个形态的恰恰是**生成结束时**记录的那个快照 —— 而生成结束时
+        //   currentLenRaw = promptLen + 已生成, 几乎必然不页对齐。
+        //   一旦默认拒绝, 这条链上唯一有用的快照就没了, 代价是每轮全量重算
+        //   (实测长历史下 TTFT 差一个数量级), 换来的只是消除 <=127 个 token
+        //   的递归状态偏差。两害相权, 默认保留旧行为。
+        //
+        // 真正的解法不是"拒绝", 而是"在对齐点记录": 在 decode 循环里每
+        // currentLenRaw % interval == 0 时记一次快照, 那时状态与标称长度天然
+        // 一致, 既正确又能服务单调增长的会话。这条改动在 GPU 窗口验证前不上。
+        //
+        // 所以这里只做两件事: (1) 把不一致**计数**出来(extra-skip-unaligned),
+        // 让线上能看到它到底多频繁; (2) 提供 FASTLLM_PREFIX_CACHE_STRICT_SNAPSHOT_ALIGN=1
+        // 作为"宁可不命中也要绝对正确"的逃生开关(排查输出质量问题时用)。
+        return aligned == currentLenRaw || !PagedPrefixSnapshotStrictAlign();
+    }
+
     size_t GetDataBytes(DataType type, size_t rows, size_t columns) {
         if (rows == 0 || columns == 0) {
             return 0;
@@ -5436,9 +5498,34 @@ namespace fastllm {
                 kvBudgetBytes = freeB > 0 ? (long long)(freeB * 0.85) : 0;
             }
             if (kvBudgetBytes > 0) {
-                const long long unitSize = std::max(1, ((Data *)manager)->unitSize);
-                const long long pageBytes =
-                    (long long)pageLen * numHeads * headDim * unitSize;
+                // 【上游BUMP勿回退】页字节数必须走 GetDataBytes(打包感知),
+                // 不能用 unitSize 乘出来。
+                //
+                // 原来是什么: pageBytes = pageLen * numHeads * headDim * unitSize。
+                // 为什么错: 打包 KV 类型(Q8_0_KV / TURBO3_KV / TURBO4_KV)的
+                // UpdateUnitSize() 一律把 unitSize 设成 1(见 fastllm.cpp 的
+                // IsPackedKVCacheDataType 分支), 它**不是**每元素字节数, 只是
+                // 一个占位值; 真实字节数由 GetKVCacheRowBytes 的分块布局决定:
+                //     head_dim=256 时  q8_0=272B/行  turbo3=100B/行  turbo4=132B/行
+                // 而 unitSize=1 的算法给出的是 256B/行 —— 对 K(q8_0) 少算 5.9%,
+                // 对 V(turbo3) 多算 156%。
+                //
+                // 线上实测(Qwen3.8-27B, 16 个全注意力层 × K/V 两个 manager = 32 个池,
+                // pageLen=128, numHeads=4, headDim=256):
+                //     真实每页    K 128*4*272 = 139264 B   V 128*4*100 = 51200 B
+                //     32 池合计   16*(139264+51200)      = 3047424 B/页
+                //     旧算法      32*128*4*256*1         = 4194304 B/页
+                //     => 整体高估 1.376 倍
+                // 后果是这个守卫把 maxPages 砍到实际能放下的 72.7%, 上下文容量凭空
+                // 少掉约 27%, 且日志里那句 "clamping maxPages A → B" 会误导人去调
+                // --tokens / --kv_cache_dtype, 而真正的原因是账算错了。
+                // (Grow() 本身用的是 GetDataBytes, 一直是对的 —— 只有这个守卫在用
+                //  另一套算法, 两边对不上账。)
+                //
+                // 校验: 见 test/pagedBudgetTest.cpp 的
+                //       "预算守卫: 打包 KV 的每页字节数" 用例。
+                const long long pageBytes = (long long)GetPagedPoolPageBytes(
+                    dataType, pageLen, numHeads, headDim);
                 long long plannedBytes = (long long)maxPages * pageBytes;
                 {
                     std::lock_guard<std::mutex> guard(layerPagedCacheManagersMutex);
@@ -5446,9 +5533,10 @@ namespace fastllm {
                         PagedCacheManager *m = kv.second;
                         if (m != nullptr && m->cudaData != nullptr && m->maxPages > 0 &&
                             (int)m->dims.size() >= 4) {
-                            plannedBytes += (long long)m->maxPages * m->dims[1] *
-                                            m->dims[2] * m->dims.back() *
-                                            std::max(1, m->unitSize);
+                            plannedBytes += (long long)m->maxPages *
+                                            (long long)GetPagedPoolPageBytes(
+                                                m->dataType, m->dims[1],
+                                                m->dims[2], m->dims.back());
                         }
                     }
                 }
@@ -6712,6 +6800,8 @@ namespace fastllm {
         std::atomic<uint64_t> pagedPrefixCacheDiskReadBytes{0};
         std::atomic<uint64_t> pagedPrefixCacheDiskHits{0};
         std::atomic<double> pagedPrefixCacheDiskReadMiBPerSecond{0.0};
+        // L3 在途读请求数, 用于把机械盘的寻道串行化反映进准入判据。
+        std::atomic<int> pagedPrefixCacheDiskInflight{0};
         std::atomic<double>
             pagedPrefixCacheRecomputeTokensPerSecond{0.0};
         std::atomic<double>
@@ -7179,6 +7269,161 @@ namespace fastllm {
             GetPagedPrefixCacheDiskStore().Release(offset, bytes);
         }
 
+        // 【上游BUMP勿回退】L3 介质能力靠 **只读 sysfs** 推导, 绝不做探针 I/O。
+        //
+        // 背景: 分层准入的判据是 "取回耗时 < 重算耗时"。取回耗时里, 机械盘的
+        // **寻道**往往比带宽更决定性 —— 本机 /dev/sda 是 ST16000NM000J
+        // (7200rpm, rotational=1), 随机读中位延迟约 24ms; 一个 128 token 的页
+        // 只有约 372KB, 按纯带宽算 9ms, 按 "寻道 + 带宽" 算 33ms, 差 3.7 倍。
+        // 原模型只有带宽项, 于是在机械盘上**系统性高估 L3 的价值**, 并发时更糟
+        // (寻道在机械盘上会串行化)。
+        //
+        // 为什么不做启动探测(重要, 别改回去):
+        //   探测要么写探针文件(消耗 SSD 的 TBW 寿命), 要么随机读(机械盘的机械
+        //   磨损), 而且这是**用户设备**上长期生效的行为, 不是我们这台机器的调优。
+        //   sysfs 的 rotational 是内核已经知道的事实, 读它零 I/O、零写入、零磨损,
+        //   换机器自动正确, 也不需要校准文件和设备指纹失效逻辑。
+        //   真正的运行期参数(实际带宽/重算速度)本来就在被动累积
+        //   (pagedPrefixCacheDiskReadMiBPerSecond / ObservePagedPrefixCacheRecompute),
+        //   那些是免费的 —— I/O 本来就要发生。sysfs 只负责**冷启动默认值**,
+        //   一旦有真实样本就会被实测值取代。
+        //
+        // 冷启动取保守值: 未知介质按机械盘处理, 宁可少用一层也不要在未知设备上
+        // 把请求拖死(例如 NFS 挂载, 延迟可达数十 ms)。
+        struct PagedPrefixCacheDiskProfile {
+            bool rotational = true;
+            bool resolved = false;
+            double seekSeconds = 0.012;      // 冷启动默认: 按机械盘
+            double readMiBPerSecond = 60.0;  // 冷启动默认: 按机械盘顺序读
+            std::string deviceKey = "unknown";
+        };
+
+        std::string PagedPrefixCacheReadSysfs(const std::string &path) {
+            std::ifstream in(path);
+            if (!in.good()) {
+                return std::string();
+            }
+            std::string line;
+            std::getline(in, line);
+            while (!line.empty() &&
+                   (line.back() == '\n' || line.back() == '\r' ||
+                    line.back() == ' ')) {
+                line.pop_back();
+            }
+            return line;
+        }
+
+        const PagedPrefixCacheDiskProfile &GetPagedPrefixCacheDiskProfile() {
+            static PagedPrefixCacheDiskProfile cached = []() {
+                PagedPrefixCacheDiskProfile p;
+                const char *dirEnv =
+                    std::getenv("FASTLLM_PREFIX_CACHE_DISK_DIR");
+                if (dirEnv == nullptr || dirEnv[0] == 0) {
+                    return p;
+                }
+                // 用 /proc/mounts 做"最长挂载点前缀"匹配拿到源设备。
+                // 不走 stat()+major()/minor(): glibc 把 major/minor 藏在
+                // __USE_MISC 后面, 而本项目用 --std=c++17(严格 ISO)编译,
+                // 那两个宏不可见。字符串解析没有这个问题, 也更好排查。
+                std::error_code ec;
+                std::string dir =
+                    std::filesystem::weakly_canonical(dirEnv, ec).string();
+                if (ec || dir.empty()) {
+                    dir = dirEnv;
+                }
+                std::ifstream mounts("/proc/mounts");
+                std::string source, best, line;
+                while (std::getline(mounts, line)) {
+                    std::istringstream iss(line);
+                    std::string src, mnt;
+                    if (!(iss >> src >> mnt)) {
+                        continue;
+                    }
+                    if (dir.compare(0, mnt.size(), mnt) != 0) {
+                        continue;
+                    }
+                    // 必须是路径边界, 避免 /run 匹配上 /runtime
+                    if (mnt.size() > 1 && dir.size() > mnt.size() &&
+                        dir[mnt.size()] != '/') {
+                        continue;
+                    }
+                    if (mnt.size() >= best.size()) {
+                        best = mnt;
+                        source = src;
+                    }
+                }
+                if (source.compare(0, 5, "/dev/") != 0) {
+                    return p;   // tmpfs/网络文件系统等: 保持保守默认
+                }
+                const std::string name = source.substr(5);
+                // 先按分区读, 读不到再退到父设备(分区目录下没有 queue/)。
+                std::string rot = PagedPrefixCacheReadSysfs(
+                    "/sys/class/block/" + name + "/queue/rotational");
+                std::string devDir = "/sys/class/block/" + name;
+                if (rot.empty()) {
+                    devDir = "/sys/class/block/" + name + "/..";
+                    rot = PagedPrefixCacheReadSysfs(
+                        devDir + "/queue/rotational");
+                }
+                if (rot.empty()) {
+                    return p;
+                }
+                p.resolved = true;
+                p.rotational = (rot != "0");
+                const std::string model =
+                    PagedPrefixCacheReadSysfs(devDir + "/device/model");
+                p.deviceKey = source + "(" +
+                    (model.empty() ? std::string("?") : model) +
+                    ", rotational=" + rot + ")";
+                if (p.rotational) {
+                    // 7200rpm 级机械盘: 寻道 + 旋转延迟约 10~25ms。
+                    p.seekSeconds = 0.012;
+                    p.readMiBPerSecond = 60.0;
+                } else {
+                    // SSD/NVMe: 首字节延迟 0.08~0.2ms, 带宽 500MB/s ~ 数 GB/s。
+                    // 取 SATA SSD 档做保守值, 实测样本很快会顶掉它。
+                    p.seekSeconds = 0.0002;
+                    p.readMiBPerSecond = 500.0;
+                }
+                return p;
+            }();
+            return cached;
+        }
+
+        // 纯函数形式的准入判据, 便于单测把失败条件钉死。
+        // 返回 true = "从存储取回" 比 "重算" 更划算。
+        //   restore = seek * max(1, inflight) + storedBytes/bw [+ 解压]
+        //   recompute = tokens / tps
+        // margin: 要求至少快 (1-margin) 倍才算划算; 模型本身有误差, 且取回会
+        //         占用 I/O 影响别的请求, 打平不值得做。
+        bool PagedPrefixCacheStorageWinsPureImpl(
+                size_t storedBytes, size_t uncompressedBytes,
+                bool zstdCompressed, size_t recomputeTokens,
+                double readMiBps, double decompressMiBps,
+                double recomputeTps, double seekSeconds,
+                int inflight, double margin) {
+            if (recomputeTokens == 0 || recomputeTps <= 0.0 ||
+                readMiBps <= 0.0) {
+                return false;
+            }
+            const double effInflight = (double)std::max(1, inflight);
+            double restoreSeconds =
+                std::max(0.0, seekSeconds) * effInflight +
+                (double)storedBytes / (1048576.0 * readMiBps);
+            if (zstdCompressed && decompressMiBps > 0.0) {
+                restoreSeconds +=
+                    (double)uncompressedBytes / (1048576.0 * decompressMiBps);
+            }
+            const double recomputeSeconds =
+                (double)recomputeTokens / recomputeTps;
+            return restoreSeconds < recomputeSeconds * (1.0 - margin);
+        }
+
+        double PagedPrefixCacheAdmitMargin() {
+            return PrefixCacheEnvDouble(
+                "FASTLLM_PREFIX_CACHE_ADMIT_MARGIN", 0.2);
+        }
+
         double EffectivePagedPrefixCacheDiskReadMiBPerSecond() {
             const double measured =
                 pagedPrefixCacheDiskReadMiBPerSecond.load();
@@ -7186,7 +7431,7 @@ namespace fastllm {
                 ? measured
                 : PrefixCacheEnvDouble(
                     "FASTLLM_PREFIX_CACHE_DISK_READ_MBPS",
-                    300.0);
+                    GetPagedPrefixCacheDiskProfile().readMiBPerSecond);
         }
 
         double EffectivePagedPrefixCacheRecomputeTokensPerSecond() {
@@ -7212,29 +7457,55 @@ namespace fastllm {
                 ? EffectivePagedPrefixCacheDiskReadMiBPerSecond()
                 : PrefixCacheEnvDouble(
                     "FASTLLM_PREFIX_CACHE_CPU_READ_MBPS", 10000.0);
-            double restoreSeconds =
-                (double)storedBytes /
-                (1024.0 * 1024.0 * readRate);
-            if (zstdCompressed) {
-                const double decompressRate =
-                    pagedPrefixCacheZstdDecompressMiBPerSecond.load(
-                        std::memory_order_relaxed);
-                const double effectiveDecompressRate =
-                    decompressRate > 0.0
-                        ? decompressRate
-                        : PrefixCacheEnvDouble(
-                            "FASTLLM_PREFIX_CACHE_ZSTD_DECOMPRESS_MBPS",
-                            1000.0);
-                restoreSeconds +=
-                    (double)uncompressedBytes /
-                    (1024.0 * 1024.0 *
-                     effectiveDecompressRate);
-            }
-            const double recomputeSeconds =
-                (double)recomputeTokens /
-                EffectivePagedPrefixCacheRecomputeTokensPerSecond();
-            return restoreSeconds < recomputeSeconds;
+            const double decompressRate =
+                pagedPrefixCacheZstdDecompressMiBPerSecond.load(
+                    std::memory_order_relaxed);
+            const double effectiveDecompressRate =
+                decompressRate > 0.0
+                    ? decompressRate
+                    : PrefixCacheEnvDouble(
+                        "FASTLLM_PREFIX_CACHE_ZSTD_DECOMPRESS_MBPS",
+                        1000.0);
+            // 【上游BUMP勿回退】L3 必须计寻道, 且并发下寻道要放大。
+            // 只有磁盘层有寻道; L2(主机内存)没有。机械盘上寻道会串行化,
+            // 所以按在途请求数线性放大 —— 这正是"单请求划算、8 并发就亏"的
+            // 那条分界线。SSD/NVMe 的 seekSeconds 本身就接近 0, 放大也无害。
+            const double seekSeconds = fromDisk
+                ? GetPagedPrefixCacheDiskProfile().seekSeconds
+                : 0.0;
+            const int inflight = fromDisk
+                ? (int)pagedPrefixCacheDiskInflight.load(
+                      std::memory_order_relaxed) + 1
+                : 1;
+            return PagedPrefixCacheStorageWinsPureImpl(
+                storedBytes, uncompressedBytes, zstdCompressed,
+                recomputeTokens, readRate, effectiveDecompressRate,
+                EffectivePagedPrefixCacheRecomputeTokensPerSecond(),
+                seekSeconds, inflight, PagedPrefixCacheAdmitMargin());
         }
+    }
+
+    bool PagedPrefixCacheStorageWinsPure(
+            size_t storedBytes, size_t uncompressedBytes,
+            bool zstdCompressed, size_t recomputeTokens,
+            double readMiBps, double decompressMiBps,
+            double recomputeTps, double seekSeconds,
+            int inflight, double margin) {
+        return PagedPrefixCacheStorageWinsPureImpl(
+            storedBytes, uncompressedBytes, zstdCompressed, recomputeTokens,
+            readMiBps, decompressMiBps, recomputeTps, seekSeconds,
+            inflight, margin);
+    }
+
+    PagedPrefixCacheDiskProfileInfo GetPagedPrefixCacheDiskProfileInfo() {
+        const auto &p = GetPagedPrefixCacheDiskProfile();
+        PagedPrefixCacheDiskProfileInfo out;
+        out.resolved = p.resolved;
+        out.rotational = p.rotational;
+        out.seekSeconds = p.seekSeconds;
+        out.readMiBPerSecond = p.readMiBPerSecond;
+        out.deviceKey = p.deviceKey;
+        return out;
     }
 
     bool PagedPrefixCacheCpuTierEnabled() {
@@ -7323,6 +7594,7 @@ namespace fastllm {
         std::atomic<uint64_t> pcExtraSkipInterval{0};
         std::atomic<uint64_t> pcExtraSkipSnapshotCopy{0};
         std::atomic<uint64_t> pcExtraSkipMtp{0};
+        std::atomic<uint64_t> pcExtraSkipUnaligned{0};
     }
 
     bool PrefixCacheStatsEnabled() {
@@ -7387,7 +7659,7 @@ namespace fastllm {
                    "no-paged-len=%llu no-unbounded=%llu bounded-short=%llu "
                    "mgr-invalid=%llu mgr-no-pages=%llu} layers-ok=%llu | "
                    "extra{calls=%llu ok=%llu disabled=%llu len=%llu "
-                   "no-progress=%llu interval=%llu copy=%llu mtp=%llu}\n",
+                   "no-progress=%llu interval=%llu copy=%llu mtp=%llu unaligned=%llu}\n",
                    (unsigned long long)s.recordCalls,
                    (unsigned long long)s.recordSkipLinearBounded,
                    (unsigned long long)s.recordSkipNoPagedLen,
@@ -7403,7 +7675,8 @@ namespace fastllm {
                    (unsigned long long)s.extraSkipNoProgress,
                    (unsigned long long)s.extraSkipInterval,
                    (unsigned long long)s.extraSkipSnapshotCopy,
-                   (unsigned long long)s.extraSkipMtp);
+                   (unsigned long long)s.extraSkipMtp,
+                   (unsigned long long)s.extraSkipUnaligned);
         }
         if (reqSeq % 8 == 0) {
             PrefixCacheStats s = GetPrefixCacheStatsSnapshot();
@@ -7442,7 +7715,7 @@ namespace fastllm {
                    "no-paged-len=%llu no-unbounded=%llu bounded-short=%llu "
                    "mgr-invalid=%llu mgr-no-pages=%llu} layers-ok=%llu | "
                    "extra{calls=%llu ok=%llu disabled=%llu len=%llu "
-                   "no-progress=%llu interval=%llu copy=%llu mtp=%llu}\n",
+                   "no-progress=%llu interval=%llu copy=%llu mtp=%llu unaligned=%llu}\n",
                    (unsigned long long)s.recordCalls,
                    (unsigned long long)s.recordSkipLinearBounded,
                    (unsigned long long)s.recordSkipNoPagedLen,
@@ -7458,7 +7731,8 @@ namespace fastllm {
                    (unsigned long long)s.extraSkipNoProgress,
                    (unsigned long long)s.extraSkipInterval,
                    (unsigned long long)s.extraSkipSnapshotCopy,
-                   (unsigned long long)s.extraSkipMtp);
+                   (unsigned long long)s.extraSkipMtp,
+                   (unsigned long long)s.extraSkipUnaligned);
         }
         fflush(stdout);
         
@@ -7521,6 +7795,7 @@ namespace fastllm {
         else if (!std::strcmp(event, "extra-skip-copy")) pcExtraSkipSnapshotCopy++;
         else if (!std::strcmp(event, "extra-skip-mtp")) pcExtraSkipMtp++;
         else if (!std::strcmp(event, "extra-mtp-degraded")) pcExtraSkipMtp++;
+        else if (!std::strcmp(event, "extra-skip-unaligned")) pcExtraSkipUnaligned++;
     }
 
     PrefixCacheStats GetPrefixCacheStatsSnapshot() {
@@ -7590,6 +7865,7 @@ namespace fastllm {
         s.extraSkipInterval = pcExtraSkipInterval.load();
         s.extraSkipSnapshotCopy = pcExtraSkipSnapshotCopy.load();
         s.extraSkipMtp = pcExtraSkipMtp.load();
+        s.extraSkipUnaligned = pcExtraSkipUnaligned.load();
         s.memTrieResidentBytes = trieBytes;
         return s;
     }

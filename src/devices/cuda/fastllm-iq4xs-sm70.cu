@@ -38,6 +38,7 @@
 //
 
 #include "fastllm-cuda.cuh"
+#include "fastllm-kernel-route.h"
 #include "fastllm.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -488,19 +489,84 @@ bool s70_detailed_log() {
     return enabled;
 }
 
+// 【上游BUMP勿回退】设备能力查询必须缓存, 不能每次调用都问一遍驱动。
+//
+// 原来是什么:
+//   s70_current_device() 每次都执行 cudaGetDevice + cudaGetDeviceProperties,
+//   而 FastllmCudaTrySm70Iq4XsMmq() 在**每一次 IQ4_XS 线性层调用**上都会先调
+//   s70_current_device(), 然后才做 n/m/k 的形状判定。
+//
+// 为什么错:
+//   cudaGetDeviceProperties 不是一次属性读取 —— 它要把整个 1032 字节的
+//   cudaDeviceProp 填满(内部逐项问驱动)。本机 V100 + CUDA 12.9 实测:
+//       cudaGetDevice           0.027 us/call
+//       cudaDeviceGetAttribute  0.016 us/call
+//       cudaGetDeviceProperties 36.546 us/call   <-- 高三个数量级
+//   (微基准: scripts/sm70-audit/bench_devprops.cu, 20000 次取平均)
+//
+//   Qwen3.8-27B 是 65 层, decode 一个 token 要跑几百次线性层。按每 token
+//   约 400 次 IQ4_XS 线性调用算, 光这一个查询就是 400 x 36.5us ~= 14.6 ms
+//   **纯开销**, 而且 100% 是白花的: decode 的 n=1..3 必然在后面的
+//   "n range" (n<8) 上被拒。
+//
+// 现场特征(为什么难发现):
+//   1. 只在 IQ4_XS 档位出现。Q5_K_M/Q6_K 的权重不是 GGML_TYPE_IQ4_XS,
+//      调用点 `if (ggufType == GGML_TYPE_IQ4_XS)` 根本不进这个 trial,
+//      开销恒为 0 —— 所以表现成"换了 IQ4_XS 反而更慢", 极易被误判成
+//      "IQ 量化查表贵"或"IQ4_XS 在 V100 上不适合", 从而错误地回退到 Q5。
+//   2. 它是 CPU 侧的 host 开销, nvidia-smi 看到的是 GPU 利用率下降,
+//      nsys 里也散成几百个短 API 调用, 不形成显眼的热点。
+//   3. 功能完全正确, 不报错不崩溃, 只是慢。
+//
+// 正确做法:
+//   设备能力在进程生命周期内不变, 查一次缓存起来即可。这里用
+//   `static thread_local std::map`(与本文件 s70_get_scratch 同风格), 免锁。
+//   保留 cudaGetDevice(0.027us) 是必要的: 一个线程可能切换当前设备。
+//   顺带把 launch 前那次取 sharedMemPerBlockOptin 的 cudaGetDeviceProperties
+//   也并进同一份缓存(见下面 s70_device_caps 的 smemLimit)。
+//
+// 回退的后果: IQ4_XS decode 白白多花约 15 ms/token, 直接吃掉 IQ4_XS 相对
+// Q5_K_M 少读 26% 权重所换来的带宽收益, 让"低位宽更快"的结论反转。
+struct S70DeviceCaps {
+    int sm = 0;
+    size_t smemLimit = 0;
+    bool valid = false;
+};
+
+const S70DeviceCaps *s70_device_caps(int device) {
+    static thread_local std::map<int, S70DeviceCaps> capsByDevice;
+    auto it = capsByDevice.find(device);
+    if (it == capsByDevice.end()) {
+        S70DeviceCaps caps;
+        cudaDeviceProp prop;
+        cudaError_t err = cudaGetDeviceProperties(&prop, device);
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            // 失败也缓存(valid=false): 否则每次调用都会重试这个 36us 的查询。
+            capsByDevice[device] = caps;
+            return nullptr;
+        }
+        caps.sm = prop.major * 10 + prop.minor;
+        caps.smemLimit = prop.sharedMemPerBlockOptin
+            ? (size_t)prop.sharedMemPerBlockOptin
+            : (size_t)prop.sharedMemPerBlock;
+        caps.valid = true;
+        it = capsByDevice.emplace(device, caps).first;
+    }
+    return it->second.valid ? &it->second : nullptr;
+}
+
 bool s70_current_device(int &device, int &sm) {
     cudaError_t err = cudaGetDevice(&device);
     if (err != cudaSuccess) {
         cudaGetLastError();
         return false;
     }
-    cudaDeviceProp prop;
-    err = cudaGetDeviceProperties(&prop, device);
-    if (err != cudaSuccess) {
-        cudaGetLastError();
+    const S70DeviceCaps *caps = s70_device_caps(device);
+    if (caps == nullptr) {
         return false;
     }
-    sm = prop.major * 10 + prop.minor;
+    sm = caps->sm;
     return true;
 }
 
@@ -609,15 +675,18 @@ bool FastllmCudaTrySm70Iq4XsMmq(const void *weight, const void *input,
     if (!s70_current_device(device,sm)) { s70_log_rej(sm,type,n,m,k,"device query"); return false; }
     if (sm != 70)                       { s70_log_rej(sm,type,n,m,k,"sm!=70");       return false; }
     if (!weight || !input || !output)   { s70_log_rej(sm,type,n,m,k,"null ptr");    return false; }
-    if (dataType != fastllm::DataType::FLOAT32 &&
-        dataType != fastllm::DataType::FLOAT16 &&
-        dataType != fastllm::DataType::BFLOAT16) {
-        s70_log_rej(sm,type,n,m,k,"dtype");
+    // 【上游BUMP勿回退】形状资格判定统一走 Sm70Iq4XsMmqShapeRejectReason,
+    // 不要把这几条 if 抄回来。
+    // 原因: 这几个边界(n in [8,64] / m%256 / k>=128)决定了这个 kernel 在生产
+    // 里到底会不会被用到, 而生产的 n 由 batch 和 prefill chunk 决定, 靠读代码
+    // 推很容易推错。抽成不依赖 CUDA 的纯函数后, 可以在没有 GPU 的单测里用真实
+    // 模型形状把结论钉死(test/kernelRouteCensusTest.cpp)。
+    // 如果这里和那个纯函数各写一份, 两边就会悄悄走岔, 测试也就白测了。
+    if (const char *shapeReject =
+            fastllm::Sm70Iq4XsMmqShapeRejectReason((int)dataType, n, m, k)) {
+        s70_log_rej(sm, type, n, m, k, shapeReject);
         return false;
     }
-    if (n < 8 || n > 64)                { s70_log_rej(sm,type,n,m,k,"n range");     return false; }
-    if (m <= 0 || (m % S70_QK_K) != 0)  { s70_log_rej(sm,type,n,m,k,"m%256");       return false; }
-    if (k < S70_Y)                      { s70_log_rej(sm,type,n,m,k,"k<128");       return false; }
 
     const int mmq_x = s70_pick_mmq_x(n);
     if (!s70_mmq_x_ok(mmq_x))           { s70_log_rej(sm,type,n,m,k,"tile-x");      return false; }
@@ -632,16 +701,16 @@ bool FastllmCudaTrySm70Iq4XsMmq(const void *weight, const void *input,
     const size_t smem_bytes =
         tile_y_bytes + (x_qs_ints + x_df_ints) * sizeof(int);
 
-    cudaDeviceProp prop;
-    cudaError_t err = cudaGetDeviceProperties(&prop, device);
-    if (err != cudaSuccess) {
-        cudaGetLastError();
+    // 【上游BUMP勿回退】共享内存上限走同一份设备缓存, 不再重新查驱动。
+    // 原来这里第二次调 cudaGetDeviceProperties(36.5us), 命中 MMQ 的形状
+    // (n in [8,64]) 每次 launch 都要付一遍。理由与上面 s70_device_caps
+    // 的注释相同, 不要改回直接查询。
+    const S70DeviceCaps *caps = s70_device_caps(device);
+    if (caps == nullptr) {
         s70_log_rej(sm,type,n,m,k,"getprop");
         return false;
     }
-    const size_t smem_limit = prop.sharedMemPerBlockOptin
-        ? (size_t)prop.sharedMemPerBlockOptin
-        : (size_t)prop.sharedMemPerBlock;
+    const size_t smem_limit = caps->smemLimit;
     if (smem_bytes > smem_limit) {
         s70_log_rej(sm,type,n,m,k,"shared mem");
         return false;
@@ -659,7 +728,7 @@ bool FastllmCudaTrySm70Iq4XsMmq(const void *weight, const void *input,
         return false;
     }
 
-    err = cudaMemsetAsync(
+    cudaError_t err = cudaMemsetAsync(
         qy, 0, qy_count * sizeof(s70_block_q8_1_mmq), cuStream);
     if (err != cudaSuccess) {
         cudaGetLastError();

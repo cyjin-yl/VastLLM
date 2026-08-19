@@ -206,7 +206,7 @@ message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
 file(GLOB GRAPH_MODEL_FILES "src/models/graph/*.cpp")
 file(GLOB BLOCK_FILES "src/blocks/*.cpp")
 file(GLOB CPU_DEVICE_FILES "src/devices/cpu/*.cpp")
-set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/prefixcache_persistence.cpp src/host_offload.cpp src/weight_materialization.cpp src/device.cpp src/model.cpp src/executor.cpp src/template.cpp src/graph.cpp src/tokenizer.cpp
+set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/fastllm-kernel-route.cpp src/prefixcache_persistence.cpp src/host_offload.cpp src/weight_materialization.cpp src/device.cpp src/model.cpp src/executor.cpp src/template.cpp src/graph.cpp src/tokenizer.cpp
         src/devices/disk/diskdevice.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp
         src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp
@@ -632,6 +632,17 @@ if (UNIT_TEST)
     # 服务看起来完全正常), 必须固化成可执行断言。
     add_executable(testPrefixCacheTier test/prefixCacheTierTest.cpp)
     target_link_libraries(testPrefixCacheTier fastllm)
+
+    add_executable(testPagedKvBudget test/pagedKvBudgetTest.cpp)
+    target_link_libraries(testPagedKvBudget fastllm)
+
+    # 算子路由普查 + SM70 IQ4_XS MMQ 形状资格。
+    # 这两件事的共同点是"数字边界决定整块代码有没有被用到", 而且走错路
+    # **完全静默**(结果对, 只是慢)。已经因此误判过两次: 把恒不生效的
+    # FASTLLM_CUDA_SM70_PAGED_XQA 当成"被关掉的优化", 把只覆盖 n in [8,64]
+    # 的 MMQ 当成"decode 的快路径"。判定是纯函数, 因此**不需要 GPU** 就能跑。
+    add_executable(testKernelRouteCensus test/kernelRouteCensusTest.cpp)
+    target_link_libraries(testKernelRouteCensus fastllm)
 
     add_executable(optest test/ops/cppOps.cpp)
     target_link_libraries(optest fastllm)

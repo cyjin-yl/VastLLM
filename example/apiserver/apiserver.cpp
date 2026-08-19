@@ -150,6 +150,7 @@ using socket_t = int;
 #include "checkpoint_control.h"
 #include "utils/stop_string_matcher.h"
 #include "host_offload.h"
+#include "fastllm-kernel-route.h"
 
 class MultimodalInputGuard {
 public:
@@ -552,18 +553,28 @@ struct WorkQueue {
                     !suspendInProgress.load(std::memory_order_acquire) &&
                     model != nullptr) {
                     uint64_t totalPages = 0, usedPages = 0, triePages = 0;
+                    uint64_t logicalMaxPages = 0;
                     int pageLen = 0;
                     model->GetPagedCachePoolStats(
-                        totalPages, usedPages, triePages, pageLen);
+                        totalPages, usedPages, triePages, pageLen,
+                        &logicalMaxPages);
                     char buf[256];
+                    // 【上游BUMP勿回退】kv_pool 的分母是**已分配的物理页**
+                    // (dims[0] 之和), budget 才是 --tokens 换算出的逻辑上限
+                    // (maxPages 之和)。两者必须分开显示:
+                    // 页池是懒分配的(初始 min(128, maxPages), 之后 Grow),
+                    // 早期 total 远小于 budget 是**正常**的, 不是"池子快满了"。
+                    // 混用这两个口径曾让空载被读成 94% 占用(见 basellm.cpp
+                    // GetPagedCachePoolStats 的长注释)。
                     std::snprintf(buf, sizeof(buf),
-                        " | kv_pool=%llu/%llu pg (%.0f%%) "
+                        " | kv_pool=%llu/%llu pg (%.0f%%, budget=%llu pg) "
                         "L1trie=%llu pg (~%llu tok)",
                         (unsigned long long) usedPages,
                         (unsigned long long) totalPages,
                         totalPages > 0 ?
                             100.0 * (double) usedPages / (double) totalPages :
                             0.0,
+                        (unsigned long long) logicalMaxPages,
                         (unsigned long long) triePages,
                         (unsigned long long) (triePages *
                             (uint64_t) std::max(0, pageLen)));
@@ -613,6 +624,14 @@ struct WorkQueue {
                        (unsigned long long) dt,
                        (double) dt / 15.0,  // 窗口墙钟口径(同 vLLM)
                        (unsigned long long) fin, cacheDesc.c_str());
+                // 算子路由普查。每类算子有多份实现, 靠一串 if 静默选路;
+                // 不打出来就只能靠读代码猜"到底走了哪条", 已经猜错过两次
+                // (见 include/fastllm-kernel-route.h 的说明)。
+                // 累计口径(不是 15 秒窗口口径), 只在显式打开明细统计时刷日志,
+                // 免得占版面; 常态下用 curl /props | jq .kernel_routes 看。
+                if (fastllm::KernelRouteShapeStatsEnabled()) {
+                    printf("%s\n", fastllm::FormatKernelRouteCensus().c_str());
+                }
                 fflush(stdout);
             }
         }).detach();
@@ -1296,10 +1315,51 @@ struct WorkQueue {
                 fastllm::GetPersistentPrefixCacheStatus();
             const auto prefixStats =
                 fastllm::GetPrefixCacheStatsSnapshot();
+            // 算子路由普查: 每类算子实际命中了哪条 kernel。
+            // 判断标准(本模型 Qwen3.8-27B / V100 / turbo3 KV 下的预期):
+            //   gguf.mmvq                 decode 主力(n<=8), 应占绝大多数调用
+            //   gguf.dequant_fp16_gemm    prefill 主力(n>8), 每 chunk 重新展开权重
+            //   gguf.sm70_iq4xs_mmq       只在 n in [8,64] 出现, 常态为 0 是正常的
+            //   attn.native_fallback      V100 无 FlashInfer, 注意力应该全落这里
+            //   attn.sm70_paged_xqa       要求分页 KV 为 float16; turbo3 下恒为 0
+            //   attn.sm70_flash_prefill   要求分页 KV 为 fp8_e4m3; turbo3 下恒为 0
+            // 某一格出乎意料地为 0 或非 0, 就说明选路判定和预期不一致。
+            json11::Json::object kernelRoutes;
+            {
+                const auto routeTotals = fastllm::GetKernelRouteTotals();
+                for (int i = 0; i < (int)routeTotals.size(); i++) {
+                    if (routeTotals[i].calls == 0) {
+                        continue;
+                    }
+                    kernelRoutes[fastllm::GetKernelRouteName(
+                            (fastllm::KernelRoute)i)] =
+                        json11::Json::object {
+                            {"calls", (double)routeTotals[i].calls},
+                            {"tokens", (double)routeTotals[i].tokens},
+                            {"min_n", (double)routeTotals[i].minN},
+                            {"max_n", (double)routeTotals[i].maxN}
+                        };
+                }
+            }
+            json11::Json::array kernelRouteShapes;
+            for (const auto &shape : fastllm::GetKernelRouteShapes()) {
+                kernelRouteShapes.push_back(json11::Json::object {
+                    {"route", fastllm::GetKernelRouteName(shape.route)},
+                    {"ggml_type", (double)shape.ggmlType},
+                    {"n", (double)shape.n},
+                    {"m", (double)shape.m},
+                    {"k", (double)shape.k},
+                    {"calls", (double)shape.calls}
+                });
+            }
             writeJsonAndClose(200, json11::Json::object {
                 {"model", ::config.modelName},
                 {"max_batch", ::config.batch},
                 {"token_pool", ::config.tokens},
+                {"kernel_routes", kernelRoutes},
+                {"kernel_route_shapes", kernelRouteShapes},
+                {"kernel_route_shape_stats_enabled",
+                    fastllm::KernelRouteShapeStatsEnabled()},
                 {"kv_cache_dtype", kvCacheDtype},
                 {"activation_dtype", fastllm::GetDataTypeName(::config.atype)},
                 {"default_max_tokens", ::config.defaultMaxTokens},

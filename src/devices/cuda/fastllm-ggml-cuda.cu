@@ -17,6 +17,7 @@
 #include <thrust/functional.h>
 
 #include "fastllm-cuda.cuh"
+#include "fastllm-kernel-route.h"
 #include "fastllm.h"
 #include <cuda_bf16.h>
 
@@ -2801,8 +2802,19 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
             weight.cudaData, cudaInput, cudaOutput,
             fastllm::DataType::FLOAT32, n, m, k, (void *)stream);
     }
+    // 算子路由普查: 记录 SM70 IQ4_XS DP4A MMQ 实际命中。
+    // 说明: MMQ 只接受 n in [8,64], 所以 decode(n=1..3) 和长 prefill
+    // (chunk 上千 token) 都不会出现在这一格里 —— 这是设计如此, 不是 bug:
+    // n<8 时 MMVQ 更快, n 很大时张量核 HGEMM 更快(V100 DP4A 约 62 TOPS,
+    // FP16 张量核约 125 TFLOPS)。这一格恒为 0 才是正常的生产观测结果。
+    if (sm70Iq4XsDone) {
+        fastllm::KernelRouteHit(fastllm::KERNEL_ROUTE_GGUF_SM70_IQ4XS_MMQ, (int)weight.ggmlType, n, m, k);
+    }
 
     if (!sm70Iq4XsDone && (n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequantFp32 != nullptr) {
+        // 算子路由普查: 反量化成稠密矩阵后走 cuBLAS。
+        // 这是长 prefill 的实际路径(n > 8), 权重每个 chunk 都要重新展开一遍。
+        fastllm::KernelRouteHit(fastllm::KERNEL_ROUTE_GGUF_DEQUANT_FP32_GEMM, (int)weight.ggmlType, n, m, k);
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
         size_t wsBytes = 0;
@@ -2837,6 +2849,9 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
             }
         }
     } else if (!sm70Iq4XsDone && (n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequantFp16 != nullptr) {
+        // 算子路由普查: 反量化成稠密矩阵后走 cuBLAS。
+        // 这是长 prefill 的实际路径(n > 8), 权重每个 chunk 都要重新展开一遍。
+        fastllm::KernelRouteHit(fastllm::KERNEL_ROUTE_GGUF_DEQUANT_FP16_GEMM, (int)weight.ggmlType, n, m, k);
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
         size_t wsBytes = 0;
@@ -2880,6 +2895,9 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
             }
         }
     } else if (!sm70Iq4XsDone) {
+        // 算子路由普查: DP4A MMVQ(逐 token 直接读量化权重)。
+        // 这是 decode 的实际路径: n <= MMVQ_MAX_BATCH_SIZE(8)。
+        fastllm::KernelRouteHit(fastllm::KERNEL_ROUTE_GGUF_MMVQ, (int)weight.ggmlType, n, m, k);
         q8Input = (block_q8_1*)FastllmCudaMalloc(n * m * sizeof(half));
         quantize_row_q8_1_cuda (
             cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, stream
@@ -2973,8 +2991,19 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
             weight.cudaData, cudaInput, cudaOutput,
             fastllm::DataType::FLOAT16, n, m, k, (void *)stream);
     }
+    // 算子路由普查: 记录 SM70 IQ4_XS DP4A MMQ 实际命中。
+    // 说明: MMQ 只接受 n in [8,64], 所以 decode(n=1..3) 和长 prefill
+    // (chunk 上千 token) 都不会出现在这一格里 —— 这是设计如此, 不是 bug:
+    // n<8 时 MMVQ 更快, n 很大时张量核 HGEMM 更快(V100 DP4A 约 62 TOPS,
+    // FP16 张量核约 125 TFLOPS)。这一格恒为 0 才是正常的生产观测结果。
+    if (sm70Iq4XsDone) {
+        fastllm::KernelRouteHit(fastllm::KERNEL_ROUTE_GGUF_SM70_IQ4XS_MMQ, (int)weight.ggmlType, n, m, k);
+    }
 
     if (!sm70Iq4XsDone && (n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequantFp32 != nullptr) {
+        // 算子路由普查: 反量化成稠密矩阵后走 cuBLAS。
+        // 这是长 prefill 的实际路径(n > 8), 权重每个 chunk 都要重新展开一遍。
+        fastllm::KernelRouteHit(fastllm::KERNEL_ROUTE_GGUF_DEQUANT_FP32_GEMM, (int)weight.ggmlType, n, m, k);
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
         size_t fp32WeightBytes = FastllmGGUFAlignBytes((size_t)k * m * sizeof(float));
@@ -3019,6 +3048,9 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
             FastllmCudaFree(workspace);
         }
     } else if (!sm70Iq4XsDone && (n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequant != nullptr) {
+        // 算子路由普查: 反量化成稠密矩阵后走 cuBLAS。
+        // 这是长 prefill 的实际路径(n > 8), 权重每个 chunk 都要重新展开一遍。
+        fastllm::KernelRouteHit(fastllm::KERNEL_ROUTE_GGUF_DEQUANT_FP16_GEMM, (int)weight.ggmlType, n, m, k);
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
         size_t needBytes = (size_t)k * m * sizeof(half);
@@ -3070,6 +3102,9 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
 
         FastllmReleaseDequantScratch(cudaFp16Weight, ownScratch);
     } else if (!sm70Iq4XsDone) {
+        // 算子路由普查: DP4A MMVQ(逐 token 直接读量化权重)。
+        // 这是 decode 的实际路径: n <= MMVQ_MAX_BATCH_SIZE(8)。
+        fastllm::KernelRouteHit(fastllm::KERNEL_ROUTE_GGUF_MMVQ, (int)weight.ggmlType, n, m, k);
         q8Input = (block_q8_1*)FastllmCudaMalloc(n * m * sizeof(half));
         quantize_row_q8_1_cuda (
             cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, stream
@@ -3160,6 +3195,14 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
             weight.cudaData, cudaInput, cudaOutput,
             fastllm::DataType::BFLOAT16, n, m, k, (void *)stream);
     }
+    // 算子路由普查: 记录 SM70 IQ4_XS DP4A MMQ 实际命中。
+    // 说明: MMQ 只接受 n in [8,64], 所以 decode(n=1..3) 和长 prefill
+    // (chunk 上千 token) 都不会出现在这一格里 —— 这是设计如此, 不是 bug:
+    // n<8 时 MMVQ 更快, n 很大时张量核 HGEMM 更快(V100 DP4A 约 62 TOPS,
+    // FP16 张量核约 125 TFLOPS)。这一格恒为 0 才是正常的生产观测结果。
+    if (sm70Iq4XsDone) {
+        fastllm::KernelRouteHit(fastllm::KERNEL_ROUTE_GGUF_SM70_IQ4XS_MMQ, (int)weight.ggmlType, n, m, k);
+    }
 
     int device = 0, major = 0;
     bool bf16GemmSupported =
@@ -3168,6 +3211,9 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
         major >= 8;
     if (!sm70Iq4XsDone && bf16GemmSupported &&
         (n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequant != nullptr) {
+        // 算子路由普查: 反量化成稠密矩阵后走 cuBLAS。
+        // 这是长 prefill 的实际路径(n > 8), 权重每个 chunk 都要重新展开一遍。
+        fastllm::KernelRouteHit(fastllm::KERNEL_ROUTE_GGUF_DEQUANT_FP16_GEMM, (int)weight.ggmlType, n, m, k);
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
         size_t needBytes = (size_t)k * m * sizeof(__nv_bfloat16);
@@ -3200,6 +3246,9 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
 
         FastllmReleaseDequantScratch(cudaBf16Weight, ownScratch);
     } else if (!sm70Iq4XsDone) {
+        // 算子路由普查: DP4A MMVQ(逐 token 直接读量化权重)。
+        // 这是 decode 的实际路径: n <= MMVQ_MAX_BATCH_SIZE(8)。
+        fastllm::KernelRouteHit(fastllm::KERNEL_ROUTE_GGUF_MMVQ, (int)weight.ggmlType, n, m, k);
         q8Input = (block_q8_1 *)FastllmCudaMalloc(n * m * sizeof(__nv_bfloat16));
         quantize_row_q8_1_cuda(
             cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, stream
