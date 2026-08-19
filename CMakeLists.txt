@@ -612,6 +612,12 @@ if (UNIT_TEST)
     add_executable(testToolCallGrammar test/toolcallGrammarTest.cpp)
     target_link_libraries(testToolCallGrammar fastllm)
 
+    # 采样路径正确性回归: temperature=0 除零、NaN logits 劫持采样、
+    # 含 NaN 的比较器让 sort 陷入 UB —— 这三个线上故障都是静默的,
+    # 必须固化成可执行断言, 不能靠"能编译+没崩"判断。
+    add_executable(testSamplingGuard test/samplingGuardTest.cpp)
+    target_link_libraries(testSamplingGuard fastllm)
+
     add_executable(optest test/ops/cppOps.cpp)
     target_link_libraries(optest fastllm)
     set_target_properties(optest PROPERTIES
