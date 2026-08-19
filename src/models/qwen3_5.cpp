@@ -532,6 +532,10 @@ namespace fastllm {
     static constexpr float QWEN35_MTP_TYPICAL_POSTERIOR_THRESHOLD = 0.09f;
     static constexpr float QWEN35_MTP_TYPICAL_POSTERIOR_ALPHA = 0.3f;
 
+    // 【上游BUMP勿回退】回退成"只用 typical acceptance"会让逐字抄写被偶发替换:
+    // 文件路径/函数名/commit hash/工具调用 JSON 这些只有一个 token 对的位置会被
+    // 换成"看着像"的邻近 token。上游没有 exact 分支, 合并时若看到本段与上游不同,
+    // 保留本段。
     // ---- MTP 接受判据 -------------------------------------------------------
     // typical acceptance (Medusa 系) 只要求"目标模型给这个 draft token 的概率
     // 超过阈值"就接受, **不做拒绝采样的残差修正, 因此不保持目标分布**。

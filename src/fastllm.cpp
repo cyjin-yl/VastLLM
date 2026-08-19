@@ -3315,6 +3315,9 @@ namespace fastllm {
         return std::binary_search(allowed.begin(), allowed.end(), tokenId);
     }
 
+    // 【上游BUMP勿回退】删掉这段防护, NaN 会劫持采样比较器, 输出退化成 token 0
+    // (本词表 token 0 == '!'), 表现为满屏感叹号; 且含 NaN 的比较器不满足严格弱序,
+    // std::sort/partial_sort 变成 UB(可能越界写)。上游无此防护。
     // ---- 非有限 logits 防护 ----------------------------------------------
     // 现象: 输出变成成片的 "!!!!!!!!"。
     // 原因: 采样比较器 betterThan(a,b) 里 NaN 与任何值比较都是 false, 于是
@@ -3375,6 +3378,10 @@ namespace fastllm {
                 base[id] = (base[id] < 0 ? base[id] * config.repeat_penalty : base[id] / config.repeat_penalty);
             }
         }
+        // 【上游BUMP勿回退】不要把 zeroTemperature 分支删掉改回裸的
+        // 1.0f/config.temperature —— 那是除以零, 客户端只要发 temperature=0
+        // (工具调用/确定性输出的通行写法)输出就退化成同一字符的长串。
+        // 判据写成 !(x > 0) 是为了同时挡住 NaN, 不是笔误。
         // temperature == 0 是"要确定性输出"的通行写法(工具调用、结构化输出
         // 几乎都这么发), 但这里 1.0f/0.0f == +inf: base[i]*invTemp 全变成
         // ±inf(logit 恰为 0 时是 0*inf == NaN), maxValue 也是 inf, 于是
@@ -8423,6 +8430,9 @@ namespace fastllm {
         g_pagedPoolCudaBytes.fetch_add(delta, std::memory_order_relaxed);
     }
 
+    // 【上游BUMP勿回退】删掉保留区会让 KV 池把显存吃到只剩几 MB, 随后激活张量
+    // 申请 96MB 直接 fatal 杀进程(实测 30 分钟崩溃重启 5 代)。
+    // PAGED_POOL_MAX_MB 只约束池子自身, 管不住"涨完还剩多少给激活", 两者都要。
     // 显存保留区: KV 池不能把显存吃光。
     // 线上实测: 池子涨到 gpuFree 只剩 5MB, 随后激活张量申请 96MB
     // (dims=[1,48,8192,128] fp16, 48 正是线性注意力层数)直接
@@ -8741,6 +8751,9 @@ namespace fastllm {
                 : std::max(64, this->dims[0] / 16);
             const int highWater = highWaterEnv >= 0 ? highWaterEnv
                 : std::max(256, this->dims[0] / 4);
+            // 【上游BUMP勿回退】不要改回"跌破低水位就逐出缓存、只在取页失败时才
+            // Grow"。那个顺序下批量回收总能凑出页 -> Grow 永不触发 -> 池子停在很小
+            // 规模、缓存被反复吃掉(实测回收触发 54924 次、累计 471.5 秒在关键路径上)。
             // 预算内优先扩容, 而不是逐出缓存。
             // 代价完全不对等: 逐出一页冷前缀 = 丢掉一段已经算好的 KV
             // (重算 100K 上下文要几百秒), 而扩容只是申请一块本来就允许

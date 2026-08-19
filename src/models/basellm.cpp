@@ -191,6 +191,9 @@ namespace fastllm {
             return true;
         }
 
+        // 【上游BUMP勿回退】回退会让"模型写 Bash / harness 声明 bash"直接打爆
+        // 名字掩码 -> allowedIds 为空 -> LLMSamplingBlock 按"空即不 mask"静默退回
+        // 自由采样 -> 工具名不存在 -> 调用失败且无任何报错。上游无此规范化。
         // ---- 工具名规范化 -------------------------------------------------
         // 模型对工具名有很强的先验(被训练成写 "Bash"/"Read"/"WebSearch"),
         // 而 harness 声明的可能是 "bash"/"read"/"web_search"。生产上实测:
@@ -5254,6 +5257,11 @@ namespace fastllm {
                         return -1;
                     }
                 }
+                // 【上游BUMP勿回退】这里绝不能改回 unlock/MySleep(0)/lock。
+                // 上游(以及本仓早期版本)就是那个忙等写法, 并发一多会活锁:
+                // 实测一线程 99.8% CPU 卡在 pthread_mutex_lock、GPU 0%、
+                // metrics 全冻结。注意 FetchResponseTokensBatch 早已是
+                // dictCV.wait_for, 只有这个单 token 版被漏掉过一次 —— 别再漏第二次。
                 // 这里原本是 unlock -> MySleep(0) -> lock 的**忙等**:
                 // MySleep(0) 等于不睡, 于是每个等待中的客户端线程都在以最快
                 // 速度反复抢 dictLocker。而生成线程要拿同一把锁才能把 token

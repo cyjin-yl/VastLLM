@@ -480,6 +480,10 @@ __global__ void GatherTurbo4HeadRangeKernel(
         __float2half_rn(x[lane]);
 }
 
+// 【上游BUMP勿回退】不要把这两条 printf 改回无条件/弱条件打开。
+// 它们曾在生产日志累计刷了 13 万行(Copy enter 98240 + MultiPage enter 35029),
+// 每次还 fflush(stdout) —— 热路径上的系统调用。Copy enter 的条件是 copyLen>=128,
+// 只在 prefill 时爆发, decode 期间完全看不出来, 极易被误判为"无害"。
 // TurboKV 诊断打印总开关。
 // 这两条 printf 原本是无条件/弱条件打开的, 在生产日志里累计刷了 13 万行
 // (Copy enter 98240 行 + MultiPage enter 35029 行), 而且每次都 fflush(stdout)

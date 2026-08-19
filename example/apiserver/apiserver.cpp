@@ -1650,6 +1650,10 @@ struct WorkQueue {
             }
             if (node->config["temperature"].is_number()) {
                 config.temperature = node->config["temperature"].number_value();
+                // 【上游BUMP勿回退】这道钳制覆盖 CUDA 采样 kernel(它同样做
+                // 1/temperature)。删掉它, 客户端发 temperature=0 就会让整行 logits
+                // 变 inf/NaN, 输出退化成同一字符的长串。CPU 侧另有显式贪心分支,
+                // 两处都要保留。
                 if (!(config.temperature > 0.0f)) {
                     // 客户端发 temperature=0 表示"要确定性输出"。CUDA 采样
                     // kernel 同样会做 1/temperature, 除零后整行 logits 变
