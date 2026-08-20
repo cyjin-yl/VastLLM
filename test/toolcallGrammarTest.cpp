@@ -33,7 +33,8 @@ static const std::vector<std::string> VOCAB = {
     " ", "  ", "hello", "1", "10", "txt", ".", "readme", "><",
     "List", "Dir", "dir", "Depth", "depth",
     "Bash", "bash", "ba", "sh", "ash", " sh",
-    "]", "+", ")", "span",
+    "]", "+", ")", "span", "op", "init", "done", "append",
+    "phase", "items", "task", "k",
 };
 
 static GenerationConfig MakeConfig() {
@@ -375,6 +376,69 @@ int main() {
           prunedRows.size() == 3 &&
           rowAllows(prunedRows[1], tokenId("bash")) &&
           rowAllows(prunedRows[2], tokenId("bash")));
+
+    GenerationConfig todoConfig = cfg;
+    todoConfig.tool_call_allowed_names = {"todo"};
+    todoConfig.tool_call_allowed_parameter_names = {
+        {"todo", {"op", "list", "task", "phase", "items"}}
+    };
+    todoConfig.tool_call_required_parameter_constraint_enabled = true;
+    ToolCallParameterSchemaBranch initBranch;
+    initBranch.constValues = {{"op", "init"}};
+    initBranch.allowedNames = {"op", "list"};
+    initBranch.requiredNames = {"op", "list"};
+    ToolCallParameterSchemaBranch doneTaskBranch;
+    doneTaskBranch.constValues = {{"op", "done"}};
+    doneTaskBranch.allowedNames = {"op", "task"};
+    doneTaskBranch.requiredNames = {"op", "task"};
+    ToolCallParameterSchemaBranch donePhaseBranch;
+    donePhaseBranch.constValues = {{"op", "done"}};
+    donePhaseBranch.allowedNames = {"op", "phase"};
+    donePhaseBranch.requiredNames = {"op", "phase"};
+    ToolCallParameterSchemaBranch appendBranch;
+    appendBranch.constValues = {{"op", "append"}};
+    appendBranch.allowedNames = {"op", "phase", "items"};
+    appendBranch.requiredNames = {"op", "phase", "items"};
+    todoConfig.tool_call_parameter_schema_branches["todo"] = {
+        initBranch, doneTaskBranch, donePhaseBranch, appendBranch};
+    const std::string todoStart =
+        "<tool_call>\n<function=todo>\n<parameter=";
+    Check("I6.8 union 未判别时先允许 op",
+          CanSpell(m, todoStart, "op>", todoConfig));
+    Check("I6.9 union 未判别时不提前允许 list",
+          !CanSpell(m, todoStart, "list>", todoConfig));
+    const std::string todoInit =
+        "<tool_call>\n<function=todo>\n"
+        "<parameter=op>init</parameter>\n";
+    Check("I6.10 init 分支只允许 list",
+          CanSpell(m, todoInit + "<parameter=", "list>", todoConfig) &&
+          !CanSpell(m, todoInit + "<parameter=", "task>", todoConfig));
+    Check("I6.11 init 缺 list 不可闭合",
+          !CanSpell(m, todoInit, "</function>", todoConfig));
+    Check("I6.12 init 有 list 后可闭合",
+          CanSpell(m, todoInit +
+              "<parameter=list>x</parameter>\n",
+              "</function>", todoConfig));
+    const std::string todoDone =
+        "<tool_call>\n<function=todo>\n"
+        "<parameter=op>done</parameter>\n";
+    Check("I6.13 done 允许 task 或 phase",
+          CanSpell(m, todoDone + "<parameter=", "task>", todoConfig) &&
+          CanSpell(m, todoDone + "<parameter=", "phase>", todoConfig));
+    Check("I6.14 done 任一替代参数满足即可闭合",
+          CanSpell(m, todoDone +
+              "<parameter=task>x</parameter>\n",
+              "</function>", todoConfig));
+    const std::string todoAppend =
+        "<tool_call>\n<function=todo>\n"
+        "<parameter=op>append</parameter>\n"
+        "<parameter=phase>x</parameter>\n";
+    Check("I6.15 append 缺 items 不可闭合",
+          !CanSpell(m, todoAppend, "</function>", todoConfig));
+    Check("I6.16 append 补 items 后可闭合",
+          CanSpell(m, todoAppend +
+              "<parameter=items>x</parameter>\n",
+              "</function>", todoConfig));
 
     // ---- I7: 回归场景(循环形态) ----
     std::string loop = "<tool_call>\n<function=list_dir>\n"

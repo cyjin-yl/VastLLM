@@ -354,55 +354,215 @@ namespace fastllm {
             return count;
         }
 
-        // 收集当前 <function=...> 块内(invokePos 之后)已闭合的
-        // <parameter=name>...</parameter> 的参数名集合。未闭合块不计。
-        static std::set <std::string> CollectClosedToolCallParameterNames(
+        static std::string TrimToolCallParameterValue(std::string value) {
+            size_t begin = 0;
+            while (begin < value.size() &&
+                   std::isspace((unsigned char)value[begin])) {
+                begin++;
+            }
+            size_t end = value.size();
+            while (end > begin &&
+                   std::isspace((unsigned char)value[end - 1])) {
+                end--;
+            }
+            return value.substr(begin, end - begin);
+        }
+
+        // 收集当前 function 块内已闭合的参数和值。后出现的同名参数
+        // 覆盖前值；schema branch 判别只使用已完整闭合的数据。
+        static std::map<std::string, std::string>
+        CollectClosedToolCallParameters(
                 const std::string &text,
                 const GenerationConfig &config,
                 std::string::size_type invokePos) {
-            std::set <std::string> closedNames;
+            std::map<std::string, std::string> closed;
             const std::string terminator =
-                    config.tool_call_name_terminator.empty() ? "\"" : config.tool_call_name_terminator;
+                    config.tool_call_name_terminator.empty() ?
+                    "\"" : config.tool_call_name_terminator;
             const std::string paramClose = "</parameter>";
-            for (const auto &prefix : config.tool_call_parameter_name_prefixes) {
+            for (const auto &prefix :
+                 config.tool_call_parameter_name_prefixes) {
                 if (prefix.empty()) {
                     continue;
                 }
                 auto pos = text.find(prefix, invokePos);
                 while (pos != std::string::npos) {
-                    auto nameStart = pos + prefix.size();
-                    auto termPos = text.find(terminator, nameStart);
+                    const auto nameStart = pos + prefix.size();
+                    const auto termPos = text.find(terminator, nameStart);
                     if (termPos == std::string::npos) {
-                        break;  // 参数名未写完(正在生成), 不算已闭合
+                        break;
                     }
-                    auto closePos = text.find(paramClose, termPos);
+                    const auto valueStart =
+                            termPos + terminator.size();
+                    const auto closePos =
+                            text.find(paramClose, valueStart);
                     if (closePos == std::string::npos) {
-                        break;  // 块未闭合
+                        break;
                     }
-                    closedNames.insert(text.substr(nameStart, termPos - nameStart));
-                    pos = text.find(prefix, closePos + paramClose.size());
+                    closed[text.substr(nameStart,
+                                       termPos - nameStart)] =
+                        TrimToolCallParameterValue(
+                            text.substr(valueStart,
+                                        closePos - valueStart));
+                    pos = text.find(
+                        prefix, closePos + paramClose.size());
                 }
             }
-            return closedNames;
+            return closed;
         }
 
-        // 计算当前 function 块内缺失的必填参数名集合; 工具无必填或
-        // 必填已齐时返回空。
-        static std::vector <std::string> MissingRequiredToolCallParameters(
+        static std::set<std::string>
+        CollectClosedToolCallParameterNames(
+                const std::string &text,
+                const GenerationConfig &config,
+                std::string::size_type invokePos) {
+            const auto closed =
+                CollectClosedToolCallParameters(
+                    text, config, invokePos);
+            std::set<std::string> names;
+            for (const auto &item : closed) {
+                names.insert(item.first);
+            }
+            return names;
+        }
+
+        static std::vector<const ToolCallParameterSchemaBranch *>
+        CompatibleToolCallParameterBranches(
+                const GenerationConfig &config,
+                const std::string &toolName,
+                const std::map<std::string, std::string> &closed) {
+            std::vector<const ToolCallParameterSchemaBranch *> result;
+            const auto found =
+                config.tool_call_parameter_schema_branches.find(
+                    toolName);
+            if (found ==
+                config.tool_call_parameter_schema_branches.end()) {
+                return result;
+            }
+            for (const auto &branch : found->second) {
+                bool compatible = true;
+                for (const auto &constant : branch.constValues) {
+                    const auto value = closed.find(constant.first);
+                    if (value != closed.end() &&
+                        value->second != constant.second) {
+                        compatible = false;
+                        break;
+                    }
+                }
+                if (compatible) {
+                    result.push_back(&branch);
+                }
+            }
+            return result;
+        }
+
+        static std::vector<std::string>
+        AllowedToolCallParametersForBranches(
+                const GenerationConfig &config,
+                const std::string &toolName,
+                const std::map<std::string, std::string> &closed) {
+            const auto branches =
+                CompatibleToolCallParameterBranches(
+                    config, toolName, closed);
+            std::vector<std::string> allowed;
+            for (const auto *branch : branches) {
+                for (const auto &name : branch->allowedNames) {
+                    if (std::find(allowed.begin(), allowed.end(),
+                                  name) == allowed.end()) {
+                        allowed.push_back(name);
+                    }
+                }
+            }
+            return allowed;
+        }
+
+        // 分支 schema: 任一兼容分支 required 已齐即可闭合。判别字段尚未
+        // 产出时只要求所有分支共同 required(通常是 op/i)；判别完成后
+        // 返回兼容分支缺失字段的并集，表达 task|phase 替代关系。
+        static std::vector<std::string>
+        MissingRequiredToolCallParameters(
                 const std::string &text,
                 const GenerationConfig &config,
                 const std::string &toolName,
                 std::string::size_type invokePos) {
-            std::vector <std::string> missing;
-            auto it = config.tool_call_required_parameter_names.find(toolName);
-            if (it == config.tool_call_required_parameter_names.end() ||
-                it->second.empty()) {
+            const auto closed =
+                CollectClosedToolCallParameters(
+                    text, config, invokePos);
+            const auto branches =
+                CompatibleToolCallParameterBranches(
+                    config, toolName, closed);
+            if (!branches.empty()) {
+                for (const auto *branch : branches) {
+                    bool complete = true;
+                    for (const auto &name : branch->requiredNames) {
+                        if (!closed.count(name)) {
+                            complete = false;
+                            break;
+                        }
+                    }
+                    if (complete) {
+                        return {};
+                    }
+                }
+                bool unresolvedDiscriminant = false;
+                for (const auto *branch : branches) {
+                    for (const auto &constant :
+                         branch->constValues) {
+                        if (!closed.count(constant.first)) {
+                            unresolvedDiscriminant = true;
+                        }
+                    }
+                }
+                std::vector<std::string> missing;
+                if (unresolvedDiscriminant) {
+                    std::set<std::string> common(
+                        branches.front()->requiredNames.begin(),
+                        branches.front()->requiredNames.end());
+                    for (size_t i = 1; i < branches.size(); i++) {
+                        std::set<std::string> current(
+                            branches[i]->requiredNames.begin(),
+                            branches[i]->requiredNames.end());
+                        for (auto it = common.begin();
+                             it != common.end();) {
+                            if (!current.count(*it)) {
+                                it = common.erase(it);
+                            } else {
+                                ++it;
+                            }
+                        }
+                    }
+                    for (const auto &name :
+                         branches.front()->requiredNames) {
+                        if (common.count(name) &&
+                            !closed.count(name)) {
+                            missing.push_back(name);
+                        }
+                    }
+                    if (!missing.empty()) {
+                        return missing;
+                    }
+                }
+                for (const auto *branch : branches) {
+                    for (const auto &name : branch->requiredNames) {
+                        if (!closed.count(name) &&
+                            std::find(missing.begin(), missing.end(),
+                                      name) == missing.end()) {
+                            missing.push_back(name);
+                        }
+                    }
+                }
                 return missing;
             }
-            std::set <std::string> closedNames =
-                CollectClosedToolCallParameterNames(text, config, invokePos);
-            for (const auto &name : it->second) {
-                if (!closedNames.count(name)) {
+            std::vector<std::string> missing;
+            const auto required =
+                config.tool_call_required_parameter_names.find(
+                    toolName);
+            if (required ==
+                    config.tool_call_required_parameter_names.end()) {
+                return missing;
+            }
+            for (const auto &name : required->second) {
+                if (!closed.count(name)) {
                     missing.push_back(name);
                 }
             }
@@ -417,7 +577,8 @@ namespace fastllm {
                 std::string &partial,
                 std::vector<std::string> &allowedValues) {
             if (!config.tool_call_required_parameter_constraint_enabled ||
-                config.tool_call_required_parameter_names.empty() ||
+                (config.tool_call_required_parameter_names.empty() &&
+                 config.tool_call_parameter_schema_branches.empty()) ||
                 config.tool_call_parameter_name_prefixes.empty()) {
                 return false;
             }
@@ -426,9 +587,19 @@ namespace fastllm {
             if (!FindActiveToolCallInvokeName(text, config, toolName, invokePos)) {
                 return false;
             }
-            auto it = config.tool_call_required_parameter_names.find(toolName);
-            if (it == config.tool_call_required_parameter_names.end() ||
-                it->second.empty()) {
+            const auto staticRequired =
+                config.tool_call_required_parameter_names.find(toolName);
+            const auto schemaBranches =
+                config.tool_call_parameter_schema_branches.find(toolName);
+            const bool hasStaticRequired =
+                staticRequired !=
+                    config.tool_call_required_parameter_names.end() &&
+                !staticRequired->second.empty();
+            const bool hasSchemaBranches =
+                schemaBranches !=
+                    config.tool_call_parameter_schema_branches.end() &&
+                !schemaBranches->second.empty();
+            if (!hasStaticRequired && !hasSchemaBranches) {
                 return false;
             }
             // 当前 function 块已闭合(模型在块外/下一块)则不干预
@@ -516,6 +687,15 @@ namespace fastllm {
             }
             partial = text.substr(nameStart);
             allowedNames = allowedIt->second;
+            const auto closedParameters =
+                CollectClosedToolCallParameters(
+                    text, config, invokePos);
+            std::vector<std::string> branchAllowed =
+                AllowedToolCallParametersForBranches(
+                    config, toolName, closedParameters);
+            if (!branchAllowed.empty()) {
+                allowedNames = std::move(branchAllowed);
+            }
             // required-first: 当前 function 块仍有缺失的必填参数名时,
             // 参数名位置只放行缺失的必填名(Qwen 官方模板不要求参数顺序,
             // 强制必填先出是安全的)。交集为空(schema 与 required 不一致)

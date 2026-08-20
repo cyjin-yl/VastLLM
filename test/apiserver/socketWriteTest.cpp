@@ -19,6 +19,7 @@
 #include "../../example/apiserver/tool_call_layout.h"
 #include "../../example/apiserver/utf8_stream_assembler.h"
 #include "../../example/apiserver/openai_multimodal_request.h"
+#include "../../example/apiserver/tool_schema_constraints.h"
 #include "../../include/utils/stop_token_matcher.h"
 #include "../../include/utils/stop_string_matcher.h"
 
@@ -117,6 +118,52 @@ int main() {
         "<tool_call>missing sentinels</tool_call>",
         compiledLayout, layoutError));
 
+    const json11::Json todoUnionSchema = json11::Json::object {
+        {"oneOf", json11::Json::array {
+            json11::Json::object {
+                {"type", "object"},
+                {"properties", json11::Json::object {
+                    {"op", json11::Json::object {{"const", "init"}}},
+                    {"list", json11::Json::object {{"type", "array"}}}}},
+                {"required", json11::Json::array {"op", "list"}}},
+            json11::Json::object {
+                {"type", "object"},
+                {"properties", json11::Json::object {
+                    {"op", json11::Json::object {{"const", "done"}}},
+                    {"task", json11::Json::object {{"type", "string"}}}}},
+                {"required", json11::Json::array {"op", "task"}}},
+            json11::Json::object {
+                {"type", "object"},
+                {"properties", json11::Json::object {
+                    {"op", json11::Json::object {{"const", "done"}}},
+                    {"phase", json11::Json::object {{"type", "string"}}}}},
+                {"required", json11::Json::array {"op", "phase"}}},
+            json11::Json::object {
+                {"type", "object"},
+                {"properties", json11::Json::object {
+                    {"op", json11::Json::object {{"const", "append"}}},
+                    {"phase", json11::Json::object {{"type", "string"}}},
+                    {"items", json11::Json::object {{"type", "array"}}}}},
+                {"required", json11::Json::array {
+                    "op", "phase", "items"}}}
+        }}
+    };
+    fastllm::GenerationConfig todoSchemaConfig;
+    CHECK(CompileOpenAIToolSchemaConstraints(
+        "todo", todoUnionSchema, todoSchemaConfig));
+    const auto &todoAllowed =
+        todoSchemaConfig.tool_call_allowed_parameter_names["todo"];
+    CHECK(std::set<std::string>(
+              todoAllowed.begin(), todoAllowed.end()) ==
+          std::set<std::string>(
+              {"op", "list", "task", "phase", "items"}));
+    CHECK(todoSchemaConfig.tool_call_parameter_schema_branches["todo"].size()
+          == 4);
+    CHECK(todoSchemaConfig.tool_call_parameter_schema_branches["todo"][0]
+              .constValues.at("op") == "init");
+    CHECK(todoSchemaConfig.tool_call_parameter_schema_branches["todo"][0]
+              .requiredNames ==
+          std::vector<std::string>({"op", "list"}));
     int selectedOutputLimit = 0;
     std::string outputLimitError;
     CHECK(ResolveOutputTokenLimit(json11::Json(), 16384,

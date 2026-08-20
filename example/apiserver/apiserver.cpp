@@ -144,6 +144,7 @@ using socket_t = int;
 #include "openai_output_parser.h"
 #include "utf8_stream_assembler.h"
 #include "tool_call_layout.h"
+#include "tool_schema_constraints.h"
 #include "output_token_limit.h"
 #include "stop_parser.h"
 #include "image_loader.h"
@@ -2078,40 +2079,11 @@ struct WorkQueue {
                     if (!name.empty() &&
                         (selectedToolName.empty() || name == selectedToolName)) {
                         config.tool_call_allowed_names.push_back(name);
-                        // 参数名约束: 从 JSON schema properties 提取该工具的合法参数名,
-                        // 生成 <parameter=...> 时只放行 schema 内的名字 token, 堵死
-                        // 量化损伤导致的参数名漂移(<path>/<prefix>/拼写变体)。
-                        std::vector<std::string> paramNames;
-                        const auto &params = tool["function"]["parameters"];
-                        if (params.is_object()) {
-                            const auto &props = params["properties"];
-                            if (props.is_object()) {
-                                for (const auto &kv : props.object_items()) {
-                                    if (!kv.first.empty()) {
-                                        paramNames.push_back(kv.first);
-                                    }
-                                }
-                            }
-                            // required 参数数: 用于强制 parameter 块约束,
-                            // 防止模型跳过参数块直接 </function> 出空调用
-                            const auto &required = params["required"];
-                            if (required.is_array()) {
-                                std::vector <std::string> requiredNames;
-                                for (const auto &r : required.array_items()) {
-                                    if (r.is_string() && !r.string_value().empty()) {
-                                        requiredNames.push_back(r.string_value());
-                                    }
-                                }
-                                if (!requiredNames.empty()) {
-                                    config.tool_call_required_parameter_names[name] =
-                                        std::move(requiredNames);
-                                }
-                            }
-                        }
-                        if (!paramNames.empty()) {
-                            config.tool_call_allowed_parameter_names[name] =
-                                std::move(paramNames);
-                        }
+                        // properties/required 和 oneOf/anyOf 分支统一编译。
+                        // 分支 const 判别值会在生成期动态选择 required 集，
+                        // 支持 todo(init:list, done:task|phase) 等关系。
+                        CompileOpenAIToolSchemaConstraints(
+                            name, tool["function"]["parameters"], config);
                     }
                 }
                 toolsEnabled = !config.tool_call_allowed_names.empty();
@@ -2152,9 +2124,11 @@ struct WorkQueue {
                         "<paramter="
                     };
                 }
-                if (!config.tool_call_required_parameter_names.empty() &&
+                if ((!config.tool_call_required_parameter_names.empty() ||
+                     !config.tool_call_parameter_schema_branches.empty()) &&
                     config.tool_call_parameter_name_constraint_enabled) {
-                    config.tool_call_required_parameter_constraint_enabled = true;
+                    config.tool_call_required_parameter_constraint_enabled =
+                        true;
                 }
             }
 

@@ -164,6 +164,12 @@ namespace fastllm {
         std::string toolCallClose;
     };
 
+    struct ToolCallParameterSchemaBranch {
+        std::map<std::string, std::string> constValues;
+        std::vector<std::string> allowedNames;
+        std::vector<std::string> requiredNames;
+    };
+
     struct GenerationConfig {
         int output_token_limit = -1; // 最多输出多少, <= 0代表无限制
         int output_token_least = 0; // 最低输出的多少
@@ -193,6 +199,12 @@ namespace fastllm {
         // 堵死量化损伤导致的"整块跳过参数"/"发可选漏必填"空调用。
         bool tool_call_required_parameter_constraint_enabled = false;
         std::map <std::string, std::vector <std::string> > tool_call_required_parameter_names;
+        // JSON Schema oneOf/anyOf 的条件分支。constValues 是判别字段，
+        // requiredNames 按仍兼容的分支动态求交/求并，支持 op=done 时
+        // task|phase 这类替代必填关系。
+        std::map<std::string,
+                 std::vector<ToolCallParameterSchemaBranch>>
+            tool_call_parameter_schema_branches;
         std::vector <int> tool_call_allowed_token_ids;
         // ROOT CAUSE #4: 黑名单通道 —— S4 空值时屏蔽 </parameter> 等闭合序列的
         // 起始 token(让空值不可表达)。与 allowed 独立判定, 两者可叠加。
