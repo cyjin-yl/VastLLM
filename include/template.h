@@ -6,6 +6,7 @@
 #define FASTLLM_TEMPLATE_H
 
 #include "utils/utils.h"
+#include "json11.hpp"
 #include <functional>
 
 namespace fastllm {
@@ -169,6 +170,19 @@ namespace fastllm {
 
         std::string Apply(const JinjaVar &var);
     };
+
+    struct ChatTemplateDryRunResult {
+        bool ok = false;
+        std::string rendered;
+        std::string error;
+    };
+
+    // 把 JSON payload 原样映射到生产 Jinja 求值器使用的值树。
+    JinjaVar JinjaVarFromJson(const json11::Json &value);
+
+    // 不加载 tokenizer/权重，只解析并渲染一份 template + context。
+    ChatTemplateDryRunResult DryRunChatTemplate(
+        const std::string &templateText, const JinjaVar &context);
 }
 
 #endif //FASTLLM_TEMPLATE_H

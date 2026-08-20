@@ -3,6 +3,8 @@
 //
 
 #include "template.h"
+#include <cmath>
+#include <limits>
 
 namespace fastllm {
     bool JinjaVar::BoolValue() const {
@@ -1283,5 +1285,56 @@ namespace fastllm {
         JinjaVar localVar = var;
         Parse(0, blocks.size(), localVar, ret);
         return ret;
+    }
+
+    JinjaVar JinjaVarFromJson(const json11::Json &value) {
+        if (value.is_null()) {
+            return JinjaVar();
+        }
+        if (value.is_bool()) {
+            return JinjaVar(value.bool_value() ? 1 : 0);
+        }
+        if (value.is_number()) {
+            const double number = value.number_value();
+            if (std::isfinite(number) && std::floor(number) == number &&
+                number >= (double)std::numeric_limits<long long>::min() &&
+                number <= (double)std::numeric_limits<long long>::max()) {
+                return JinjaVar((long long)number);
+            }
+            return JinjaVar((float)number);
+        }
+        if (value.is_string()) {
+            return JinjaVar(value.string_value());
+        }
+        if (value.is_array()) {
+            std::vector<JinjaVar> items;
+            items.reserve(value.array_items().size());
+            for (const auto &item : value.array_items()) {
+                items.push_back(JinjaVarFromJson(item));
+            }
+            return JinjaVar(items);
+        }
+        JinjaVar result;
+        result.type = JinjaVar::JinjaDict;
+        for (const auto &item : value.object_items()) {
+            result.dictValue.emplace(
+                item.first, JinjaVarFromJson(item.second));
+        }
+        return result;
+    }
+
+    ChatTemplateDryRunResult DryRunChatTemplate(
+            const std::string &templateText, const JinjaVar &context) {
+        ChatTemplateDryRunResult result;
+        try {
+            JinjaTemplate templ(templateText);
+            result.rendered = templ.Apply(context);
+            result.ok = true;
+        } catch (const std::exception &error) {
+            result.error = error.what();
+        } catch (...) {
+            result.error = "unknown Jinja template error";
+        }
+        return result;
     }
 }

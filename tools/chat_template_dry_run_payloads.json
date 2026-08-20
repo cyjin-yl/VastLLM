@@ -1,0 +1,120 @@
+[
+  {
+    "name": "plain_text_xhigh",
+    "context": {
+      "messages": [
+        {"role": "system", "content": "You are a precise coding assistant."},
+        {"role": "user", "content": "Summarize the change."}
+      ],
+      "tools": [],
+      "add_generation_prompt": true,
+      "enable_thinking": true,
+      "preserve_thinking": true,
+      "reasoning_effort": "xhigh",
+      "add_vision_id": false
+    }
+  },
+  {
+    "name": "tools_medium",
+    "context": {
+      "messages": [
+        {"role": "user", "content": "Read /tmp/input.txt."}
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read",
+            "description": "Read a local text file.",
+            "parameters": {
+              "type": "object",
+              "properties": {"path": {"type": "string"}},
+              "required": ["path"]
+            }
+          }
+        }
+      ],
+      "add_generation_prompt": true,
+      "enable_thinking": true,
+      "preserve_thinking": true,
+      "reasoning_effort": "medium",
+      "add_vision_id": false
+    }
+  },
+  {
+    "name": "vision_low",
+    "context": {
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            {"type": "text", "text": "Describe the image briefly."}
+          ]
+        }
+      ],
+      "tools": [],
+      "add_generation_prompt": true,
+      "enable_thinking": true,
+      "preserve_thinking": true,
+      "reasoning_effort": "low",
+      "add_vision_id": true
+    }
+  },
+  {
+    "name": "anthropic_normalized_tool_result",
+    "context": {
+      "messages": [
+        {"role": "user", "content": "Check the weather in Paris."},
+        {
+          "role": "assistant",
+          "reasoning_content": "I should use the weather tool.",
+          "content": "",
+          "tool_calls": [
+            {
+              "function": {
+                "name": "get_weather",
+                "arguments": {"city": "Paris"}
+              }
+            }
+          ]
+        },
+        {"role": "tool", "content": "{\"temperature_c\": 21}"},
+        {"role": "user", "content": "Give the result in one sentence."}
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Return current weather.",
+            "parameters": {
+              "type": "object",
+              "properties": {"city": {"type": "string"}},
+              "required": ["city"]
+            }
+          }
+        }
+      ],
+      "add_generation_prompt": true,
+      "enable_thinking": true,
+      "preserve_thinking": false,
+      "reasoning_effort": "medium",
+      "add_vision_id": false
+    }
+  },
+  {
+    "name": "thinking_disabled",
+    "context": {
+      "messages": [
+        {"role": "user", "content": "Reply OK."}
+      ],
+      "tools": [],
+      "add_generation_prompt": true,
+      "enable_thinking": false,
+      "preserve_thinking": false,
+      "reasoning_effort": "low",
+      "add_vision_id": false
+    }
+  }
+]

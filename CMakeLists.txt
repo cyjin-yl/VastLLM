@@ -609,6 +609,11 @@ target_link_libraries(main fastllm)
 add_executable(quant tools/src/quant.cpp)
 target_link_libraries(quant fastllm)
 
+add_executable(chat_template_dry_run
+    tools/src/chat_template_dry_run.cpp
+    src/template.cpp
+    third_party/json11/json11.cpp)
+
 if (UNIT_TEST)
     add_executable(testToolCallGrammar test/toolcallGrammarTest.cpp)
     target_link_libraries(testToolCallGrammar fastllm)
@@ -618,6 +623,11 @@ if (UNIT_TEST)
     # 必须固化成可执行断言, 不能靠"能编译+没崩"判断。
     add_executable(testSamplingGuard test/samplingGuardTest.cpp)
     target_link_libraries(testSamplingGuard fastllm)
+
+    # 不加载权重的 chat_template 真实解析/渲染回归。
+    add_executable(testChatTemplateValidation
+        test/chatTemplateValidationTest.cpp)
+    target_link_libraries(testChatTemplateValidation fastllm)
 
     # 【上游BUMP勿回退】预分词(pre-tokenizer)正则切分的回归。
     # 上游从来没读过 GGUF 的 tokenizer.ggml.pre, BPE 在整段文本上合并,
