@@ -24,16 +24,20 @@
 // short-query FP8-KV validation shape used by Qwen3.5/3.6 MTP on Volta.
 
 #include "devices/cuda/attention/fastllm-paged-attention-native.cuh"
+#include "devices/cuda/fastllm-cuda.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <mma.h>
 
+#include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace {
 
@@ -46,6 +50,9 @@ constexpr int kQHeads = 24;
 constexpr int kKvHeads = 4;
 constexpr int kGroup = 6;
 constexpr int kPageLen = 128;
+constexpr int kMaxBatch = 5;
+constexpr int kMaxQLen = 10;
+constexpr int kDefaultMaxKv = 512;
 
 struct alignas(128) Sm70FlashPrefillSmem {
     half q[kTile * kHeadDim];
@@ -77,7 +84,10 @@ __global__ void Sm70FlashAttentionFp8PrefillKernel(
     const int32_t *__restrict__ lastPageLens,
     int qStrideHead,
     int qStrideToken,
-    float softmaxScale) {
+    float softmaxScale,
+    int totalQTokens,
+    int totalPageSlots,
+    int maxPages) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
     extern __shared__ char rawSmem[];
     Sm70FlashPrefillSmem &smem =
@@ -87,13 +97,27 @@ __global__ void Sm70FlashAttentionFp8PrefillKernel(
     const int request = blockIdx.x;
     const int qHead = blockIdx.y;
     const int kvHead = qHead / kGroup;
+    // The launch decision is taken on the host against Data::cpuIntDatas, which is only a
+    // *mirror* of these buffers: several decode paths (fillLastPageLensOnDevice, external
+    // decode metadata, restored/swapped requests) update the device copy without refreshing
+    // the mirror -- see the note in fastllm-paged-attention-native.cu.  The kernel therefore
+    // must stay in bounds for *any* content of qSizes/pageSizes/lastPageLens: every value
+    // read below is range-checked before it is used as an index.
     const int qBegin = qSizes[request];
-    const int qLen = qSizes[request + 1] - qBegin;
+    const int qEnd = qSizes[request + 1];
     const int pageBegin = pageSizes[request];
-    const int pageCount = pageSizes[request + 1] - pageBegin;
-    const int kvLen = pageCount > 0
-        ? (pageCount - 1) * kPageLen + lastPageLens[request]
-        : 0;
+    const int pageEnd = pageSizes[request + 1];
+    if (qBegin < 0 || qEnd <= qBegin || qEnd > totalQTokens
+        || qEnd - qBegin > kTile
+        || pageBegin < 0 || pageEnd <= pageBegin || pageEnd > totalPageSlots) {
+        return;
+    }
+    const int qLen = qEnd - qBegin;
+    const int pageCount = pageEnd - pageBegin;
+    // Clamping lastPageLen to [0, kPageLen] bounds kvLen by pageCount * kPageLen, which is
+    // exactly what makes logicalPage < pageCount hold for every tile below.
+    const int lastPageLen = min(max(lastPageLens[request], 0), kPageLen);
+    const int kvLen = (pageCount - 1) * kPageLen + lastPageLen;
 
     for (int i = tid; i < kTile * kHeadDim; i += kThreads) {
         const int row = i / kHeadDim;
@@ -108,6 +132,14 @@ __global__ void Sm70FlashAttentionFp8PrefillKernel(
         smem.rowMax[tid] = -1.0e30f;
         smem.rowSum[tid] = 0.0f;
         smem.rescale[tid] = 0.0f;
+        // Rows >= qLen are never written by the softmax below but are still fed to the P*V
+        // WMMA tile, so zero them once here instead of reading stale shared memory.
+        if (tid >= qLen) {
+#pragma unroll
+            for (int col = 0; col < kTile; ++col) {
+                smem.probabilities[tid * kTile + col] = __float2half(0.0f);
+            }
+        }
     }
     __syncthreads();
 
@@ -123,7 +155,12 @@ __global__ void Sm70FlashAttentionFp8PrefillKernel(
                 const int logicalToken = tileStart + tokenInTile;
                 const int logicalPage = logicalToken / kPageLen;
                 const int pageOffset = logicalToken - logicalPage * kPageLen;
-                const int physicalPage = pageIndices[pageBegin + logicalPage];
+                // logicalToken < kvLen <= pageCount * kPageLen (see the clamp above), so
+                // logicalPage is always inside this request's slice of the page table.
+                // The physical page still comes from device memory, so clamp it into the
+                // pool: branchless, and it cannot turn a bad page id into a wild address.
+                const int rawPage = pageIndices[pageBegin + logicalPage];
+                const int physicalPage = min(max(rawPage, 0), maxPages - 1);
                 const int64_t cacheOffset =
                     (((int64_t)physicalPage * kPageLen + pageOffset) * kKvHeads
                         + kvHead) * kHeadDim + dim;
@@ -218,16 +255,118 @@ bool EnvEnabled(const char *name) {
     return value != nullptr && std::strcmp(value, "0") != 0;
 }
 
+// Not a safety bound -- the kernel is in-bounds for any KV length -- but a performance
+// one: this specialisation streams the whole KV range from a (batch x 24) grid, so its
+// cost is linear in kvLen and it is far slower than the chunked-cublas path past a few
+// hundred keys.  See reports/sm70-fa-longctx-fix.md for the measured curve.
 int MaxKvTokens() {
     const char *value = std::getenv("FASTLLM_CUDA_SM70_FLASH_ATTN_MAX_KV");
     if (value == nullptr) {
-        return 512;
+        return kDefaultMaxKv;
     }
     char *end = nullptr;
     const long parsed = std::strtol(value, &end, 10);
     return end != value && *end == '\0' && parsed > 0 && parsed <= INT_MAX
         ? static_cast<int>(parsed)
-        : 512;
+        : kDefaultMaxKv;
+}
+
+bool StrictDeviceCheckEnabled() {
+    const char *value = std::getenv("FASTLLM_CUDA_SM70_FLASH_ATTN_STRICT");
+    return value == nullptr || std::strcmp(value, "0") != 0;
+}
+
+// The values the kernel will actually index with.  Data::cpuIntDatas is only a host mirror of
+// these buffers and is allowed to lag them (fillLastPageLensOnDevice / externally supplied
+// decode metadata / restored requests), so the launch decision has to be taken against the
+// device copy -- otherwise a shape the guard never approved can reach the kernel.
+struct Sm70PagedMeta {
+    std::vector<int32_t> qSizes;
+    std::vector<int32_t> pageSizes;
+    std::vector<int32_t> lastPageLens;
+};
+
+bool FetchDeviceMeta(const fastllm::Data &qSizes, const fastllm::Data &pageSizes,
+                     const fastllm::Data &lastPageLens, int batch, Sm70PagedMeta &meta) {
+    meta.qSizes.assign((size_t)batch + 1, 0);
+    meta.pageSizes.assign((size_t)batch + 1, 0);
+    meta.lastPageLens.assign((size_t)batch, 0);
+    auto copy = [](void *dst, const void *src, size_t bytes) {
+        return cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost,
+                               cudaStreamPerThread) == cudaSuccess;
+    };
+    // Same stream as the appends that produced the metadata, so the copies see the
+    // post-append values rather than whatever was there at enqueue time.
+    if (!copy(meta.qSizes.data(), qSizes.cudaData,
+              (size_t)(batch + 1) * sizeof(int32_t))
+        || !copy(meta.pageSizes.data(), pageSizes.cudaData,
+                 (size_t)(batch + 1) * sizeof(int32_t))
+        || !copy(meta.lastPageLens.data(), lastPageLens.cudaData,
+                 (size_t)batch * sizeof(int32_t))
+        || cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+// Every constraint the kernel actually relies on, checked against one consistent snapshot.
+bool MetaWithinKernelLimits(const std::vector<int32_t> &qSizesHost,
+                            const std::vector<int32_t> &pageSizesHost,
+                            const std::vector<int32_t> &lastPageLensHost,
+                            int batch, int totalQTokens, int totalPageSlots,
+                            int maxKvTokens) {
+    if (qSizesHost.front() != 0 || pageSizesHost.front() != 0
+        || qSizesHost.back() != totalQTokens
+        || pageSizesHost.back() != totalPageSlots) {
+        return false;
+    }
+    for (int request = 0; request < batch; ++request) {
+        const int qBegin = qSizesHost[request];
+        const int qLen = qSizesHost[request + 1] - qBegin;
+        const int pageBegin = pageSizesHost[request];
+        const int pages = pageSizesHost[request + 1] - pageBegin;
+        const int lastPageLen = lastPageLensHost[request];
+        const int kvLen = pages > 0 ? (pages - 1) * kPageLen + lastPageLen : 0;
+        if (qBegin < 0 || pageBegin < 0
+            || qLen < 2 || qLen > kMaxQLen || qLen > kTile
+            || pages <= 0 || lastPageLen <= 0 || lastPageLen > kPageLen
+            || kvLen < qLen || kvLen > maxKvTokens) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Diagnostic only: report when Data::cpuIntDatas disagrees with the device buffers the
+// kernel reads.  This is the divergence that used to walk the prefill kernel off the page
+// table; keep it observable so a regression is noticed instead of crashing the process.
+void ReportMirrorSkew(const fastllm::Data &qSizes, const fastllm::Data &pageSizes,
+                      const fastllm::Data &lastPageLens, int batch,
+                      const Sm70PagedMeta &deviceMeta) {
+    const char *value = std::getenv("FASTLLM_CUDA_SM70_FLASH_ATTN_DEBUG");
+    if (value == nullptr || std::strcmp(value, "0") == 0) {
+        return;
+    }
+    static thread_local long long reported = 0;
+    for (int i = 0; i <= batch; ++i) {
+        const bool qBad = i < (int)qSizes.cpuIntDatas.size()
+            && qSizes.cpuIntDatas[i] != deviceMeta.qSizes[i];
+        const bool pBad = i < (int)pageSizes.cpuIntDatas.size()
+            && pageSizes.cpuIntDatas[i] != deviceMeta.pageSizes[i];
+        const bool lBad = i < batch && i < (int)lastPageLens.cpuIntDatas.size()
+            && lastPageLens.cpuIntDatas[i] != deviceMeta.lastPageLens[i];
+        if ((qBad || pBad || lBad) && reported < 64) {
+            ++reported;
+            std::printf("[FastLLM] SM70 prefill metadata mirror skew at index %d: "
+                        "qSizes host=%d dev=%d | pageSizes host=%d dev=%d | "
+                        "lastPageLens host=%d dev=%d\n",
+                        i, qSizes.cpuIntDatas[i], deviceMeta.qSizes[i],
+                        pageSizes.cpuIntDatas[i], deviceMeta.pageSizes[i],
+                        i < batch ? lastPageLens.cpuIntDatas[i] : -1,
+                        i < batch ? deviceMeta.lastPageLens[i] : -1);
+        }
+    }
 }
 
 bool IsCudaInt32Vector(const fastllm::Data &data) {
@@ -251,12 +390,13 @@ bool FastllmCudaTrySm70FlashAttentionPrefill(
         || output.dataDevice != fastllm::DataDevice::CUDA
         || q.cudaData == nullptr || output.cudaData == nullptr
         || q.dims.size() != 3 || output.dims != q.dims
-        || q.dims[0] != kQHeads || q.dims[1] < 2 || q.dims[1] > 50
+        || q.dims[0] != kQHeads || q.dims[1] < 2
+        || q.dims[1] > kMaxBatch * kMaxQLen
         || q.dims[2] != kHeadDim
         || q.strides.size() != 3 || output.strides.size() != 3
         || q.strides[2] != 1 || output.strides != q.strides
         || qSizes.dims.size() != 1 || qSizes.dims[0] < 2
-        || qSizes.dims[0] > 6
+        || qSizes.dims[0] > kMaxBatch + 1
         || pageSizes.dims.size() != 1
         || pageSizes.dims[0] != qSizes.dims[0]
         || lastPageLens.dims.size() != 1
@@ -281,6 +421,7 @@ bool FastllmCudaTrySm70FlashAttentionPrefill(
     }
 
     const int batch = qSizes.dims[0] - 1;
+    const int maxKvTokens = MaxKvTokens();
     if (!std::isfinite(scale) || scale <= 0.0f
         || (int)qSizes.cpuIntDatas.size() != batch + 1
         || (int)pageSizes.cpuIntDatas.size() != batch + 1
@@ -299,9 +440,9 @@ bool FastllmCudaTrySm70FlashAttentionPrefill(
             - pageSizes.cpuIntDatas[request];
         const int lastPageLen = lastPageLens.cpuIntDatas[request];
         const int kvLen = pages > 0 ? (pages - 1) * kPageLen + lastPageLen : 0;
-        if (qLen < 2 || qLen > 10 || pages <= 0
+        if (qLen < 2 || qLen > kMaxQLen || pages <= 0
             || lastPageLen <= 0 || lastPageLen > kPageLen
-            || kvLen < qLen || kvLen > MaxKvTokens()) {
+            || kvLen < qLen || kvLen > maxKvTokens) {
             return false;
         }
         for (int page = pageSizes.cpuIntDatas[request];
@@ -332,6 +473,22 @@ bool FastllmCudaTrySm70FlashAttentionPrefill(
         return false;
     }
 
+    // Re-run the shape contract against the buffers the kernel dereferences.  The checks
+    // above only prove that the *mirror* is in range; this is what stops a long-KV / long-qLen
+    // shape from reaching a kernel that the mirror said was short.
+    if (StrictDeviceCheckEnabled()) {
+        Sm70PagedMeta deviceMeta;
+        if (!FetchDeviceMeta(qSizes, pageSizes, lastPageLens, batch, deviceMeta)) {
+            return false;
+        }
+        ReportMirrorSkew(qSizes, pageSizes, lastPageLens, batch, deviceMeta);
+        if (!MetaWithinKernelLimits(deviceMeta.qSizes, deviceMeta.pageSizes,
+                                    deviceMeta.lastPageLens, batch, (int)q.dims[1],
+                                    (int)pageIndexs.dims[0], maxKvTokens)) {
+            return false;
+        }
+    }
+
     const size_t smemBytes = sizeof(Sm70FlashPrefillSmem);
     if (cudaFuncSetAttribute(Sm70FlashAttentionFp8PrefillKernel,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -350,7 +507,9 @@ bool FastllmCudaTrySm70FlashAttentionPrefill(
         reinterpret_cast<const int32_t *>(pageSizes.cudaData),
         reinterpret_cast<const int32_t *>(pageIndexs.cudaData),
         reinterpret_cast<const int32_t *>(lastPageLens.cudaData),
-        static_cast<int>(q.strides[0]), static_cast<int>(q.strides[1]), scale);
+        static_cast<int>(q.strides[0]), static_cast<int>(q.strides[1]), scale,
+        static_cast<int>(q.dims[1]), static_cast<int>(pageIndexs.dims[0]),
+        static_cast<int>(pagedK->dims[0]));
     if (cudaGetLastError() != cudaSuccess) {
         return false;
     }
@@ -358,8 +517,10 @@ bool FastllmCudaTrySm70FlashAttentionPrefill(
     static thread_local bool logged = false;
     if (!logged) {
         std::printf("[FastLLM] SM70 FlashAttention FP8 paged prefill enabled "
-                    "(Volta WMMA, page128, batch1..5, qLen2..10, "
-                    "KV<=%d, Q24/KV4 D256 GQA6).\n", MaxKvTokens());
+                    "(Volta WMMA, page128, batch1..%d, qLen2..%d, "
+                    "KV<=%d, Q24/KV4 D256 GQA6, device-meta check %s).\n",
+                    kMaxBatch, kMaxQLen, maxKvTokens,
+                    StrictDeviceCheckEnabled() ? "on" : "OFF");
         logged = true;
     }
     return true;
