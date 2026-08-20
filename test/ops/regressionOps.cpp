@@ -5045,6 +5045,23 @@ namespace {
                "ScaleQRatory optimized output should be BF16.");
         Expect(reference.Count(0) == actual.Count(0),
                "ScaleQRatory reference and optimized output sizes differ.");
+        if (memcmp(reference.cpuData, actual.cpuData,
+                   inputBits.size() * sizeof(uint16_t)) != 0) {
+            const uint16_t *referenceBits =
+                (const uint16_t*)reference.cpuData;
+            const uint16_t *actualBits =
+                (const uint16_t*)actual.cpuData;
+            for (size_t i = 0; i < inputBits.size(); i++) {
+                if (referenceBits[i] != actualBits[i]) {
+                    std::fprintf(
+                        stderr,
+                        "ScaleQRatory mismatch tokens=%d index=%zu "
+                        "reference=0x%04x actual=0x%04x\n",
+                        tokens, i, referenceBits[i], actualBits[i]);
+                    break;
+                }
+            }
+        }
         Expect(memcmp(reference.cpuData, actual.cpuData,
                       inputBits.size() * sizeof(uint16_t)) == 0,
                "DeepSeek-V4 CPU ScaleQRatory BF16 output is not bitwise aligned with the reference path.");

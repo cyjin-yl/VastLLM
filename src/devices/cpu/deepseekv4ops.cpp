@@ -415,8 +415,10 @@ namespace fastllm {
                         float c = cosValues[(uint64_t)s * pairs + i / 2];
                         float sn = sinValues[(uint64_t)s * pairs + i / 2];
                         float a = row[i], bb = row[i + 1];
-                        row[i] = a * c - bb * sn;
-                        row[i + 1] = a * sn + bb * c;
+                        const float bSin = bb * sn;
+                        const float bCos = bb * c;
+                        row[i] = std::fma(a, c, -bSin);
+                        row[i + 1] = std::fma(a, sn, bCos);
                     }
                 }
             }
@@ -742,10 +744,12 @@ namespace fastllm {
                         DeepSeekV4HcPreBFloat16ToFloat(row[d]) * scale;
                     float b =
                         DeepSeekV4HcPreBFloat16ToFloat(row[d + 1]) * scale;
+                    const float bSin = b * sinRow[pair];
+                    const float bCos = b * cosRow[pair];
                     float rotatedA =
-                        a * cosRow[pair] - b * sinRow[pair];
+                        std::fma(a, cosRow[pair], -bSin);
                     float rotatedB =
-                        a * sinRow[pair] + b * cosRow[pair];
+                        std::fma(a, sinRow[pair], bCos);
                     row[d] = DeepSeekV4HcPreFloatToBFloat16(rotatedA);
                     row[d + 1] =
                         DeepSeekV4HcPreFloatToBFloat16(rotatedB);
