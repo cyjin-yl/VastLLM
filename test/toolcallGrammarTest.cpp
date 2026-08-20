@@ -175,6 +175,17 @@ int main() {
                    "<]+)</span>", cfg));
     Check("I4.8 参数值允许以 HTML < 开头",
           CanSpell(m, P6, "<span", cfg));
+    std::string P8 = P6 + "\n/etc\n</parameter";
+    Check("I4.9 完整闭合名后进入精确 > 白名单",
+          !Eval(m, P8, cfg).allowed.empty());
+    Check("I4.10 完整闭合名后 > 可拼",
+          CanSpell(m, P8, ">", cfg));
+    Check("I4.11 完整闭合名后空格不可拼",
+          !CanSpell(m, P8, " >", cfg));
+    Check("I4.12 分 token 畸形 </parameter 空格不可拼",
+          !CanSpell(m, P6 + "\n/etc\n", "</parameter >", cfg));
+    Check("I4.13 普通 HTML 闭合标签仍可拼",
+          CanSpell(m, P6 + "\n<div>", "</span>", cfg));
 
     // ---- I5: 全流程逐步可生成 ----
     std::vector<std::string> seq = {

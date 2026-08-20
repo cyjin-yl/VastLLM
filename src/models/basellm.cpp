@@ -1068,6 +1068,19 @@ namespace fastllm {
                     const bool valueStillEmpty =
                             committedValue.find_first_not_of(" \t\r\n") ==
                             std::string::npos;
+                    // 裸 '<' 和较短前缀仍可能是正文；但完整标签名
+                    // "</parameter" 已无歧义，只允许精确的最终 '>'。
+                    // 这会屏蔽模型常见的 "</parameter >" 畸形闭合。
+                    if (!valueStillEmpty &&
+                        closePrefix + 1 == target.size() &&
+                        tail.compare(tail.size() - closePrefix,
+                                     closePrefix, target, 0,
+                                     closePrefix) == 0) {
+                        partial = tail.substr(tail.size() - closePrefix);
+                        allowedValues = {target};
+                        activeTerminator = "\x01";
+                        handled = true;
+                    }
                     if (valueStillEmpty && blockedIdsOut != nullptr) {
                         collectValueCloseBlocked = true;
                     }
