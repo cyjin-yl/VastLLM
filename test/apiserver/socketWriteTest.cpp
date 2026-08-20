@@ -16,6 +16,7 @@
 #include "../../example/apiserver/output_token_limit.h"
 #include "../../example/apiserver/stop_parser.h"
 #include "../../example/apiserver/image_loader.h"
+#include "../../example/apiserver/utf8_stream_assembler.h"
 #include "../../example/apiserver/openai_multimodal_request.h"
 #include "../../include/utils/stop_token_matcher.h"
 #include "../../include/utils/stop_string_matcher.h"
@@ -39,6 +40,59 @@ int main() {
     CHECK(ResolveOpenAIFinishReason(false, false, 256, 256) == "length");
     CHECK(ResolveOpenAIFinishReason(false, true, 256, 256) == "stop");
     CHECK(ResolveOpenAIFinishReason(true, false, 256, 256) == "tool_calls");
+
+    Utf8StreamAssembler utf8;
+    CHECK(utf8.Push("Hey! ") == "Hey! ");
+    CHECK(utf8.Push(std::string(1, static_cast<char>(0xF0))).empty());
+    CHECK(utf8.Push(std::string(1, static_cast<char>(0x9F))).empty());
+    CHECK(utf8.Push(std::string(1, static_cast<char>(0x91))).empty());
+    CHECK(utf8.Push(std::string(1, static_cast<char>(0x8B))) ==
+          std::string("\xF0\x9F\x91\x8B", 4));
+    CHECK(utf8.Flush().empty());
+
+    Utf8StreamAssembler invalidUtf8;
+    CHECK(invalidUtf8.Push(
+              std::string(1, static_cast<char>(0xFF))) ==
+          std::string("\xEF\xBF\xBD", 3));
+    CHECK(invalidUtf8.ReplacementCount() == 1);
+    CHECK(invalidUtf8.Push(
+              std::string(1, static_cast<char>(0xE4))).empty());
+    CHECK(invalidUtf8.Flush() == std::string("\xEF\xBF\xBD", 3));
+    CHECK(invalidUtf8.ReplacementCount() == 2);
+
+    const std::vector<std::string> validUtf8Cases = {
+        std::string("\xC2\xA9", 2),
+        std::string("\xE2\x82\xAC", 3),
+        std::string("\xE0\xA0\x80", 3),
+        std::string("\xED\x9F\xBF", 3),
+        std::string("\xF0\x90\x80\x80", 4),
+        std::string("\xF4\x8F\xBF\xBF", 4),
+    };
+    for (const std::string &value : validUtf8Cases) {
+        Utf8StreamAssembler bytewise;
+        std::string assembled;
+        for (unsigned char byte : value) {
+            assembled += bytewise.Push(
+                std::string(1, static_cast<char>(byte)));
+        }
+        assembled += bytewise.Flush();
+        CHECK(assembled == value);
+        CHECK(bytewise.ReplacementCount() == 0);
+    }
+
+    const std::vector<std::string> invalidUtf8Cases = {
+        std::string("\xC0\xAF", 2),       // overlong two-byte form
+        std::string("\xE0\x80\x80", 3),  // overlong three-byte form
+        std::string("\xED\xA0\x80", 3),  // UTF-16 surrogate
+        std::string("\xF4\x90\x80\x80", 4), // beyond U+10FFFF
+    };
+    for (const std::string &value : invalidUtf8Cases) {
+        Utf8StreamAssembler rejected;
+        const std::string sanitized =
+            rejected.Push(value) + rejected.Flush();
+        CHECK(!sanitized.empty());
+        CHECK(rejected.ReplacementCount() > 0);
+    }
 
     int selectedOutputLimit = 0;
     std::string outputLimitError;

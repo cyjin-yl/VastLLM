@@ -142,6 +142,7 @@ using socket_t = int;
 #include "http_response.h"
 #include "socket_writer.h"
 #include "openai_output_parser.h"
+#include "utf8_stream_assembler.h"
 #include "output_token_limit.h"
 #include "stop_parser.h"
 #include "image_loader.h"
@@ -2181,6 +2182,7 @@ struct WorkQueue {
                 std::vector<float> results;
                 std::string pendingStopText;
                 bool matchedStopString = false;
+                Utf8StreamAssembler utf8Assembler;
                 auto sendParsedDelta = [&](const OpenAIOutputDelta &parsed) {
                     if (parsed.Empty()) {
                         return true;
@@ -2220,6 +2222,23 @@ struct WorkQueue {
                     return WriteHttpChunk(
                         node->client, FormatSseData(compactJsonDump(partResult)));
                 };
+                auto sendDecodedText = [&](const std::string &decoded) {
+                    if (decoded.empty()) {
+                        return true;
+                    }
+                    std::string filtered;
+                    bool matchedStop = PushStopText(
+                        config.stop_strings, pendingStopText,
+                        decoded, filtered);
+                    matchedStopString =
+                        matchedStopString || matchedStop;
+                    if (matchedStop) {
+                        model->AbortResponse(handleId);
+                    }
+                    return sendParsedDelta(
+                        outputParser.Push(filtered));
+                };
+
 
                 while (true) {
                     while (!model->CanFetchResponse(handleId)) {
@@ -2232,6 +2251,16 @@ struct WorkQueue {
                     int result = model->FetchResponseTokens(handleId);
                     if (result == -1) {
                         recordMetrics(outputTokens);
+                        if (!sendDecodedText(utf8Assembler.Flush())) {
+                            CloseNodeClient(node);
+                            return;
+                        }
+                        if (utf8Assembler.ReplacementCount() > 0) {
+                            LogTs("[stream] invalid tokenizer UTF-8 replaced: "
+                                  "bytes=%zu request=%s\n",
+                                  utf8Assembler.ReplacementCount(),
+                                  curId.c_str());
+                        }
                         std::string trailingText;
                         FlushPendingStopText(pendingStopText, trailingText);
                         if (!sendParsedDelta(outputParser.Push(trailingText)) ||
@@ -2289,17 +2318,13 @@ struct WorkQueue {
                         fflush(stdout);
                     }
                     results.assign(1, static_cast<float>(result));
-                    std::string now = model->weight.tokenizer.Decode(
-                        fastllm::Data(fastllm::DataType::FLOAT32,
-                                      {(int)results.size()}, results));
-                    std::string filtered;
-                    bool matchedStop = PushStopText(
-                        config.stop_strings, pendingStopText, now, filtered);
-                    matchedStopString = matchedStopString || matchedStop;
-                    if (matchedStop) {
-                        model->AbortResponse(handleId);
-                    }
-                    if (!sendParsedDelta(outputParser.Push(filtered))) {
+                    std::string decoded =
+                        model->weight.tokenizer.Decode(
+                            fastllm::Data(
+                                fastllm::DataType::FLOAT32,
+                                {(int)results.size()}, results));
+                    if (!sendDecodedText(
+                            utf8Assembler.Push(decoded))) {
                         abortDisconnectedStream();
                         return;
                     }
