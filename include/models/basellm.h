@@ -634,6 +634,9 @@ namespace fastllm {
                                                     const GenerationConfig &generationConfig,
                                                     std::vector<int> &allowedIdsOut,
                                                     std::vector<int> *blockedIdsOut = nullptr);
+        std::string ResolveToolCallConstraintName(
+            const std::string &name,
+            const std::vector<std::string> &declared) const;
 
         // 为投机 verify 的每一行生成约束配置。row 0 使用当前文本状态；
         // 后续行先依次假设接受 proposedTokens 的前缀，再重新计算 mask。

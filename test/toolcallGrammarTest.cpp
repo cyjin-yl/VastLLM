@@ -31,6 +31,7 @@ static const std::vector<std::string> VOCAB = {
     "s", "l", "_", "th", "ath", ">", "/etc", "/", "etc", "2", "\n",
     " ", "  ", "hello", "1", "10", "txt", ".", "readme", "><",
     "List", "Dir", "dir", "Depth", "depth",
+    "Bash", "ba", "sh", " sh",
 };
 
 static GenerationConfig MakeConfig() {
@@ -258,6 +259,44 @@ int main() {
           !evalAllows(parameterAfterSeparator, tokenId("_")));
     Check("I0.17 S3 正确下划线后仍可完成参数名",
           evalAllows(parameterAfterSeparator, tokenId("depth")));
+    GenerationConfig bashConfig = cfg;
+    bashConfig.tool_call_allowed_names = {"bash"};
+    bashConfig.tool_call_allowed_parameter_names = {
+        {"bash", {"command", "timeout"}}
+    };
+    bashConfig.tool_call_required_parameter_names = {
+        {"bash", {"command"}}
+    };
+    const EvalResult bashStart =
+        Eval(m, "<tool_call><function=", bashConfig);
+    Check("I0.18 S1 允许 Bash 大小写别名",
+          evalAllows(bashStart, tokenId("Bash")));
+    const EvalResult bashPartial =
+        Eval(m, "<tool_call><function=ba", bashConfig);
+    Check("I0.19 S1 允许 bash 的真实后缀",
+          evalAllows(bashPartial, tokenId("sh")));
+    Check("I0.20 S1 拒绝声明外新增空格",
+          !evalAllows(bashPartial, tokenId(" sh")));
+    Check("I0.21 输出映射 Bash -> bash",
+          m.ResolveToolCallConstraintName(
+              "Bash", {"bash"}) == "bash");
+    Check("I0.22 输出映射 ListDir -> list_dir",
+          m.ResolveToolCallConstraintName(
+              "ListDir", {"list_dir"}) == "list_dir");
+    Check("I0.23 输出映射 list-dir -> list_dir",
+          m.ResolveToolCallConstraintName(
+              "list-dir", {"list_dir"}) == "list_dir");
+    Check("I0.24 输出拒绝新增分隔符 ba sh",
+          m.ResolveToolCallConstraintName(
+              "ba sh", {"bash"}) == "ba sh");
+    Check("I0.25 输出映射 MaxDepth -> max_depth",
+          m.ResolveToolCallConstraintName(
+              "MaxDepth", {"max_depth"}) == "max_depth");
+    Check("I0.26 歧义别名不猜",
+          m.ResolveToolCallConstraintName(
+              "READ", {"read", "Read"}) == "READ");
+
+
 
 
     std::vector<GenerationConfig> speculativeRows;

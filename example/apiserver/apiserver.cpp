@@ -2123,12 +2123,50 @@ struct WorkQueue {
                                          const std::string &id,
                                          int index,
                                          bool includeIndex) {
+                OpenAIParsedToolCall normalized = call;
+                normalized.name =
+                    model->ResolveToolCallConstraintName(
+                        normalized.name,
+                        config.tool_call_allowed_names);
+                auto parameterNames =
+                    config.tool_call_allowed_parameter_names.find(
+                        normalized.name);
+                if (parameterNames !=
+                        config.tool_call_allowed_parameter_names.end()) {
+                    std::string parseError;
+                    json11::Json parsedArguments =
+                        json11::Json::parse(
+                            normalized.arguments, parseError);
+                    if (parseError.empty() &&
+                        parsedArguments.is_object()) {
+                        json11::Json::object normalizedArguments;
+                        bool collision = false;
+                        for (const auto &item :
+                             parsedArguments.object_items()) {
+                            const std::string resolved =
+                                model->ResolveToolCallConstraintName(
+                                    item.first,
+                                    parameterNames->second);
+                            if (normalizedArguments.find(resolved) !=
+                                normalizedArguments.end()) {
+                                collision = true;
+                                break;
+                            }
+                            normalizedArguments[resolved] = item.second;
+                        }
+                        if (!collision) {
+                            normalized.arguments =
+                                compactJsonDump(json11::Json(
+                                    normalizedArguments));
+                        }
+                    }
+                }
                 json11::Json::object toolCall = {
                     {"id", id},
                     {"type", "function"},
                     {"function", json11::Json::object {
-                        {"name", call.name},
-                        {"arguments", call.arguments}
+                        {"name", normalized.name},
+                        {"arguments", normalized.arguments}
                     }}
                 };
                 if (includeIndex) {

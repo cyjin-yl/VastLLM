@@ -191,54 +191,79 @@ namespace fastllm {
             return true;
         }
 
-        // 【上游BUMP勿回退】回退会让"模型写 Bash / harness 声明 bash"直接打爆
-        // 名字掩码 -> allowedIds 为空 -> LLMSamplingBlock 按"空即不 mask"静默退回
-        // 自由采样 -> 工具名不存在 -> 调用失败且无任何报错。上游无此规范化。
-        // ---- 工具名规范化 -------------------------------------------------
-        // 模型对工具名有很强的先验(被训练成写 "Bash"/"Read"/"WebSearch"),
-        // 而 harness 声明的可能是 "bash"/"read"/"web_search"。生产上实测:
-        // omp 声明 12 个全小写工具, 模型一吐出 "B", 名字约束就找不到任何
-        // 合法后继 -> 掩码清空 -> 静默退回自由采样 -> 写出 "Bash" ->
-        // harness 收到不存在的工具名 -> 调用失败(日志里的 mask EXHAUSTED)。
-        //
-        // 规范化规则: 转小写 + 去掉 '-' '_' ' ' '.'。
-        // 这条规则**只依赖客户端自己在请求里声明的 tools 列表**, 不硬编码
-        // 任何 harness 的名字, 因此对 omp / OpenCode / Cherry Studio /
-        // 任意 OpenAI 或 Anthropic 客户端一视同仁。
-        static std::string ToolCallCanonicalKey(const std::string &s) {
-            std::string out;
-            out.reserve(s.size());
-            for (char c : s) {
-                if (c == '-' || c == '_' || c == ' ' || c == '.') {
-                    continue;
-                }
-                out.push_back((char)std::tolower((unsigned char)c));
-            }
-            return out;
+        // 【上游BUMP勿回退】schema 名字允许有限别名:
+        //   Bash -> bash, ListDir / list-dir -> list_dir。
+        // 只允许模型省略或替换**声明中已有**的分隔符；禁止凭空插入，
+        // 否则 "ba sh" 也会被误当成 "bash"，返回给 harness 后仍不可调用。
+        static bool IsToolCallNameSeparator(char c) {
+            return c == '-' || c == '_' || c == ' ' || c == '.';
         }
 
-        // 把模型写出的名字映射回声明列表里的那一个。
-        // 精确命中优先; 规范化后有且仅有一个候选才替换 —— 存在歧义时
-        // (比如同时声明了 "read" 和 "Read")宁可原样返回, 不猜。
+        static bool ToolCallNameAliasPrefix(
+                const std::string &declared,
+                const std::string &candidate,
+                bool requireComplete) {
+            size_t declaredIndex = 0;
+            size_t candidateIndex = 0;
+            while (candidateIndex < candidate.size()) {
+                if (declaredIndex >= declared.size()) {
+                    return false;
+                }
+                const char declaredChar = declared[declaredIndex];
+                const char candidateChar = candidate[candidateIndex];
+                const bool declaredSeparator =
+                    IsToolCallNameSeparator(declaredChar);
+                const bool candidateSeparator =
+                    IsToolCallNameSeparator(candidateChar);
+                if (declaredSeparator) {
+                    declaredIndex++;
+                    if (candidateSeparator) {
+                        candidateIndex++;
+                    }
+                    continue;
+                }
+                if (candidateSeparator) {
+                    return false;
+                }
+                if (std::tolower((unsigned char)declaredChar) !=
+                    std::tolower((unsigned char)candidateChar)) {
+                    return false;
+                }
+                declaredIndex++;
+                candidateIndex++;
+            }
+            if (!requireComplete) {
+                return true;
+            }
+            while (declaredIndex < declared.size() &&
+                   IsToolCallNameSeparator(
+                       declared[declaredIndex])) {
+                declaredIndex++;
+            }
+            return declaredIndex == declared.size();
+        }
+
+        // 把模型写出的有限别名映射回声明列表里的精确拼写。
+        // 精确命中优先；有多个别名候选时不猜。
         static std::string ResolveDeclaredToolName(
                 const std::string &name,
                 const std::vector<std::string> &declared) {
             if (name.empty() || declared.empty()) {
                 return name;
             }
-            for (const auto &d : declared) {
-                if (d == name) {
+            for (const auto &item : declared) {
+                if (item == name) {
                     return name;
                 }
             }
-            const std::string key = ToolCallCanonicalKey(name);
             const std::string *hit = nullptr;
-            for (const auto &d : declared) {
-                if (ToolCallCanonicalKey(d) == key) {
+            for (const auto &item : declared) {
+                if (ToolCallNameAliasPrefix(
+                        item, name, true)) {
                     if (hit != nullptr) {
-                        return name;   // 多个候选, 有歧义
+                        return name;
                     }
-                    hit = &d;
+                    hit = &item;
                 }
             }
             if (hit == nullptr) {
@@ -532,31 +557,20 @@ namespace fastllm {
             const std::string namePart =
                 terminatorPos == std::string::npos ?
                 combined : combined.substr(0, terminatorPos);
-            const std::string partialKey =
-                canonicalizeNames ?
-                ToolCallCanonicalKey(partial) : std::string();
-            const std::string namePartKey =
-                canonicalizeNames ?
-                ToolCallCanonicalKey(namePart) : std::string();
             for (const auto &name : allowedValues) {
                 if (terminatorPos != std::string::npos) {
                     if (namePart == name ||
                         (canonicalizeNames &&
-                         ToolCallCanonicalKey(name) == namePartKey)) {
+                         ToolCallNameAliasPrefix(
+                             name, namePart, true))) {
                         return true;
                     }
                     continue;
                 }
-                if (ToolCallConstraintStartsWith(name, namePart)) {
-                    return true;
-                }
-                // 大小写/分隔符兼容只属于 schema 名字。结构标签必须逐
-                // 字节匹配；且 "_"、空格、"." 这类规范化后零进度的
-                // token 不能被放行，否则可在 <tool_call> 后无限循环。
-                if (canonicalizeNames &&
-                    namePartKey.size() > partialKey.size() &&
-                    ToolCallConstraintStartsWith(
-                        ToolCallCanonicalKey(name), namePartKey)) {
+                if (ToolCallConstraintStartsWith(name, namePart) ||
+                    (canonicalizeNames &&
+                     ToolCallNameAliasPrefix(
+                         name, namePart, false))) {
                     return true;
                 }
             }
@@ -1197,6 +1211,12 @@ namespace fastllm {
             fflush(stdout);
         }
         allowedIdsOut = std::move(allowedIds);
+    }
+
+    std::string basellm::ResolveToolCallConstraintName(
+            const std::string &name,
+            const std::vector<std::string> &declared) const {
+        return ResolveDeclaredToolName(name, declared);
     }
 
     void basellm::AppendToolCallConstraintRowConfigs(
