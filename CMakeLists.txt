@@ -706,10 +706,10 @@ if (UNIT_TEST)
 
     add_executable(testApiServerSocket
         test/apiserver/socketWriteTest.cpp
-        example/apiserver/image_loader.cpp
-        third_party/json11/json11.cpp)
+        example/apiserver/image_loader.cpp)
     target_compile_definitions(testApiServerSocket PRIVATE ${FASTLLM_APISERVER_IMAGE_DEFINITIONS})
-    target_link_libraries(testApiServerSocket PRIVATE ${FASTLLM_APISERVER_IMAGE_LIBS})
+    target_link_libraries(
+        testApiServerSocket PRIVATE fastllm ${FASTLLM_APISERVER_IMAGE_LIBS})
 
     add_executable(testDeepSeekV4GGUFAdapter
         test/gguf/deepseek4AdapterTest.cpp)

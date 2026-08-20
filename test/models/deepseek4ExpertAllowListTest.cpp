@@ -383,7 +383,7 @@ namespace {
                 input, expertIndex, expertScore, weights, biass,
                 w1, w2, w3, tempInput, tempOutput, 0.0f, output,
                 0, fastllm::MoeGateSwiglu, false, 0.0f, false,
-                &allowedExpertMask);
+                nullptr, &allowedExpertMask);
         }
         const float *outputData = reinterpret_cast<const float*>(output.cpuData);
         assert(outputData != nullptr);
@@ -401,7 +401,7 @@ namespace {
                 input, expertIndex, expertScore, weights, biass,
                 w1, w2, w3, tempInput, tempOutput, 0.0f, output,
                 0, fastllm::MoeGateSwiglu, false, 0.0f, false,
-                &allowedExpertMask);
+                nullptr, &allowedExpertMask);
         }, "disallowed physical expert");
         std::filesystem::remove(validPath);
 

@@ -388,14 +388,18 @@ int main() {
         "before<tool_call><function=demo>");
     OpenAIToolCallDelta unfinishedToolTrailing = unfinishedToolParser.Flush();
     CHECK(unfinishedToolDelta.content + unfinishedToolTrailing.content ==
-          "before<tool_call><function=demo>");
+          "before");
     CHECK(unfinishedToolDelta.toolCalls.empty());
-    CHECK(unfinishedToolTrailing.toolCalls.empty());
+    CHECK(unfinishedToolTrailing.toolCalls.size() == 1);
+    CHECK(unfinishedToolTrailing.toolCalls[0].name == "demo");
+    CHECK(unfinishedToolTrailing.toolCalls[0].arguments == "{}");
 
     OpenAIParsedChatInput parsedChatInput;
     std::string multimodalError;
     const std::string imagePlaceholder =
         "<|vision_start|><|image_pad|><|vision_end|>";
+    const std::string videoPlaceholder =
+        "<|vision_start|><|video_pad|><|vision_end|>";
     const json11::Json multimodalMessages = json11::Json::array {
         json11::Json::object {
             {"role", "system"},
@@ -419,8 +423,9 @@ int main() {
             }}
         }
     };
-    CHECK(ParseOpenAIChatInput(multimodalMessages, imagePlaceholder,
-                               parsedChatInput, multimodalError));
+    CHECK(ParseOpenAIChatInput(
+        multimodalMessages, imagePlaceholder, videoPlaceholder,
+        parsedChatInput, multimodalError));
     CHECK(multimodalError.empty());
     CHECK(parsedChatInput.messages.size() == 2);
     CHECK(parsedChatInput.messages[1].first == "user");
@@ -440,8 +445,9 @@ int main() {
             }}
         }
     };
-    CHECK(!ParseOpenAIChatInput(malformedImageMessages, imagePlaceholder,
-                                parsedChatInput, multimodalError));
+    CHECK(!ParseOpenAIChatInput(
+        malformedImageMessages, imagePlaceholder, videoPlaceholder,
+        parsedChatInput, multimodalError));
     CHECK(multimodalError.find("image_url.url") != std::string::npos);
 
     const json11::Json assistantImageMessages = json11::Json::array {
@@ -457,8 +463,9 @@ int main() {
             }}
         }
     };
-    CHECK(!ParseOpenAIChatInput(assistantImageMessages, imagePlaceholder,
-                                parsedChatInput, multimodalError));
+    CHECK(!ParseOpenAIChatInput(
+        assistantImageMessages, imagePlaceholder, videoPlaceholder,
+        parsedChatInput, multimodalError));
     CHECK(multimodalError.find("user messages") != std::string::npos);
 
     OpenAIDecodedImage decodedImage;
