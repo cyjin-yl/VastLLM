@@ -1119,6 +1119,43 @@ namespace fastllm {
                 for (int id : generationConfig.stop_token_ids) {
                     blockedIdsOut->push_back(id);
                 }
+                if (cursor.state == TG_PARAM_VALUE) {
+                    std::call_once(
+                        toolCallMalformedCloseTokensOnce, [&]() {
+                            const std::string marker = "</parameter";
+                            for (const auto &item :
+                                 this->weight.tokenizer
+                                     .tokenToStringDict) {
+                                const std::string tokenText =
+                                    this->weight.tokenizer.DecodeTokens(
+                                        {item.first});
+                                size_t pos = tokenText.find(marker);
+                                bool malformed = false;
+                                while (pos != std::string::npos) {
+                                    const size_t after =
+                                        pos + marker.size();
+                                    if (after < tokenText.size() &&
+                                        tokenText[after] != '>') {
+                                        malformed = true;
+                                        break;
+                                    }
+                                    pos = tokenText.find(
+                                        marker, pos + 1);
+                                }
+                                if (malformed) {
+                                    toolCallMalformedCloseTokenIds
+                                        .push_back(item.first);
+                                }
+                            }
+                            std::sort(
+                                toolCallMalformedCloseTokenIds.begin(),
+                                toolCallMalformedCloseTokenIds.end());
+                        });
+                    blockedIdsOut->insert(
+                        blockedIdsOut->end(),
+                        toolCallMalformedCloseTokenIds.begin(),
+                        toolCallMalformedCloseTokenIds.end());
+                }
                 std::sort(blockedIdsOut->begin(), blockedIdsOut->end());
                 blockedIdsOut->erase(
                     std::unique(blockedIdsOut->begin(), blockedIdsOut->end()),

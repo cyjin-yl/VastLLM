@@ -1473,6 +1473,26 @@ namespace fastllm {
         float diff = config.repeat_penalty - 1.0f;
         return diff > 1e-6f || diff < -1e-6f;
     }
+    static bool Qwen35ToolConstraintAllowsTokenLists(
+            const std::vector<int> &allowed,
+            const std::vector<int> &blocked,
+            int token) {
+        if (!allowed.empty() &&
+            !std::binary_search(allowed.begin(), allowed.end(), token)) {
+            return false;
+        }
+        return blocked.empty() ||
+               !std::binary_search(
+                   blocked.begin(), blocked.end(), token);
+    }
+
+    bool Qwen35ToolConstraintAllowsToken(
+            const GenerationConfig &config, int token) {
+        return Qwen35ToolConstraintAllowsTokenLists(
+            config.tool_call_allowed_token_ids,
+            config.tool_call_blocked_token_ids,
+            token);
+    }
 
     bool Qwen35MtpSupportsGenerationConfig(
             const GenerationConfig &config) {
@@ -16942,11 +16962,12 @@ namespace fastllm {
                 if (constraintTracking) {
                     int draftToken = tokenAt(accepted + 1);
                     std::vector<int> allowedIds;
+                    std::vector<int> blockedIds;
                     EvaluateToolCallConstraintText(
-                        constraintText, generationConfigs[0], allowedIds);
-                    if (!allowedIds.empty() &&
-                        !std::binary_search(allowedIds.begin(),
-                                            allowedIds.end(), draftToken)) {
+                        constraintText, generationConfigs[0],
+                        allowedIds, &blockedIds);
+                    if (!Qwen35ToolConstraintAllowsTokenLists(
+                            allowedIds, blockedIds, draftToken)) {
                         break;
                     }
                 }
@@ -19070,11 +19091,12 @@ namespace fastllm {
                 int draftToken = (int)(inputPtr[row + 1] + 1.0e-3f);
                 if (constraintTracking) {
                     std::vector<int> allowedIds;
+                    std::vector<int> blockedIds;
                     EvaluateToolCallConstraintText(
-                        constraintText, generationConfigs[b], allowedIds);
-                    if (!allowedIds.empty() &&
-                        !std::binary_search(allowedIds.begin(),
-                                            allowedIds.end(), draftToken)) {
+                        constraintText, generationConfigs[b],
+                        allowedIds, &blockedIds);
+                    if (!Qwen35ToolConstraintAllowsTokenLists(
+                            allowedIds, blockedIds, draftToken)) {
                         break;
                     }
                 }

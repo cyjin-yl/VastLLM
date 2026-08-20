@@ -4528,6 +4528,18 @@ namespace {
         config.tool_call_blocked_token_ids = {2};
         Expect(fastllm::Qwen35MtpSupportsGenerationConfig(config),
                "MTP rejected a blocked-token tool constraint");
+        Expect(fastllm::Qwen35ToolConstraintAllowsToken(config, 3),
+               "MTP blocked-list rejected an unrelated token");
+        Expect(!fastllm::Qwen35ToolConstraintAllowsToken(config, 2),
+               "MTP blocked-list accepted a forbidden token");
+        config.tool_call_allowed_token_ids = {2, 3};
+        Expect(!fastllm::Qwen35ToolConstraintAllowsToken(config, 2),
+               "blocked token overrode the MTP block-list");
+        Expect(fastllm::Qwen35ToolConstraintAllowsToken(config, 3),
+               "MTP allow-list rejected an allowed token");
+        Expect(!fastllm::Qwen35ToolConstraintAllowsToken(config, 7),
+               "MTP allow-list accepted an undeclared token");
+        config.tool_call_allowed_token_ids.clear();
         config.output_logits = true;
         Expect(!fastllm::Qwen35MtpSupportsGenerationConfig(config),
                "MTP accepted output_logits collection");

@@ -34,7 +34,7 @@ static const std::vector<std::string> VOCAB = {
     "List", "Dir", "dir", "Depth", "depth",
     "Bash", "bash", "ba", "sh", "ash", " sh",
     "]", "+", ")", "span", "op", "init", "done", "append",
-    "phase", "items", "task", "k",
+    "phase", "items", "task", "k", "</parameter ",
 };
 
 static GenerationConfig MakeConfig() {

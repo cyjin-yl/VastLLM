@@ -754,6 +754,10 @@ namespace fastllm {
 
         WeightMap weight; // 权重
         ToolCallGrammarLayout toolCallGrammarLayout;
+        // S4 中单 token 携带 "</parameter " 可绕过跨 token 闭合状态。
+        // 按 tokenizer 实例懒计算一次，热路径只追加少量 blocked id。
+        std::once_flag toolCallMalformedCloseTokensOnce;
+        std::vector<int> toolCallMalformedCloseTokenIds;
 
         Data sinData, cosData;
         std::map <std::string, Data*> deviceSinDatas, deviceCosDatas; // deviceSinDatas[xxx]代表xxx设备上的sinData

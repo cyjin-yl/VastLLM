@@ -42,6 +42,8 @@ namespace fastllm {
             const std::string &layerPrefix);
     bool Qwen35MtpSupportsGenerationConfig(
             const GenerationConfig &config);
+    bool Qwen35ToolConstraintAllowsToken(
+            const GenerationConfig &config, int token);
     bool MergeQwen35TemporalPatchEmbeddings(
             const Data &firstFrameWeight,
             const Data &secondFrameWeight,
