@@ -1051,33 +1051,24 @@ namespace fastllm {
                     }
                     break;
                 case TG_PARAM_VALUE: {
-                    // S4: 值自由; 仅当尾部正在形成闭合标签前缀时
-                    // 收紧到 "</parameter>"(屏蔽 "</function>"/"</tool_call>")。
-                    // ROOT CAUSE #4(空值): 该参数块尚未产出非空白字符时,
-                    // 通过黑名单通道屏蔽三个闭合序列的起始 token,
-                    // 让 "<parameter=path></parameter>" 空值不可表达。
+                    // S4: 参数值必须能表示任意文本，包括代码中的裸 '<'。
+                    // 不能在看到闭合标签的前缀时切换成白名单："<" 同时
+                    // 可能是正文，提前收紧会把 r"[^<]" 强制改成闭合标签。
+                    //
+                    // committedValue 去掉尾部可能的 "</parameter>" 前缀。
+                    // 因此分 token 生成 "<"、"</pa" 时仍知道正文为空，
+                    // 只在完整空值闭合即将形成时通过黑名单阻止它。
                     const std::string tail =
                             generatedText.substr(cursor.segmentStart);
+                    const std::string target = "</parameter>";
+                    const size_t closePrefix =
+                            ToolCallTailPrefixOverlap(tail, target);
+                    const std::string committedValue =
+                            tail.substr(0, tail.size() - closePrefix);
                     const bool valueStillEmpty =
-                            tail.find_first_not_of(" \t\r\n") ==
+                            committedValue.find_first_not_of(" \t\r\n") ==
                             std::string::npos;
-                    const size_t lt = tail.rfind('<');
-                    if (lt != std::string::npos) {
-                        const std::string cand = tail.substr(lt);
-                        const std::string target = "</parameter>";
-                        if (cand.size() < target.size() &&
-                            target.compare(0, cand.size(), cand) == 0) {
-                            if (!valueStillEmpty) {
-                                partial = cand;
-                                allowedValues = {target};
-                                activeTerminator = "\x01";
-                                handled = true;
-                            }
-                            // 空值 + 已在闭合前缀: 约束全程生效时不可达
-                            // (入口拦截已屏蔽 '<' 起始), 防御性放行
-                        }
-                        // cand 非闭合前缀(值内含其它 '<' 文本): 自由
-                    } else if (valueStillEmpty && blockedIdsOut != nullptr) {
+                    if (valueStillEmpty && blockedIdsOut != nullptr) {
                         collectValueCloseBlocked = true;
                     }
                     break;
@@ -1111,16 +1102,12 @@ namespace fastllm {
                 fflush(stdout);
             }
             if (collectValueCloseBlocked && blockedIdsOut != nullptr) {
-                // 空值屏蔽: token 使 tail+token 尾部成为任一闭合序列的
-                // 非空前缀(含完整闭合串)则禁。
-                static const char *kValueClosers[] = {
-                    "</parameter>", "</function>", "</tool_call>"
-                };
-                // tail 只需保留最长闭合串-1 个字符参与前缀判定
-                const std::string tailFull =
+                // 只屏蔽会让全空白值形成完整 </parameter> 的 token。
+                // 闭合前缀本身必须可生成，否则以 '<' 开头的 HTML 和
+                // r"[^<]" 之类代码永远不可表达。
+                const std::string target = "</parameter>";
+                const std::string tail =
                         generatedText.substr(cursor.segmentStart);
-                const std::string tail = tailFull.size() > 12
-                        ? tailFull.substr(tailFull.size() - 12) : tailFull;
                 for (const auto &item :
                      this->weight.tokenizer.tokenToStringDict) {
                     const int tokenId = item.first;
@@ -1131,38 +1118,24 @@ namespace fastllm {
                         continue;
                     }
                     const std::string combined = tail + tokenText;
-                    bool blocked = false;
-                    for (const char *closer : kValueClosers) {
-                        const size_t clen = strlen(closer);
-                        const size_t maxLen =
-                                std::min(clen, combined.size());
-                        for (size_t len = 1; len <= maxLen; ++len) {
-                            if (combined.compare(combined.size() - len, len,
-                                                 closer, 0, len) == 0) {
-                                blocked = true;
-                                break;
-                            }
-                        }
-                        if (blocked) {
-                            break;
-                        }
-                    }
-                    if (blocked) {
+                    const size_t first =
+                            combined.find_first_not_of(" \t\r\n");
+                    if (first != std::string::npos &&
+                        combined.size() >= first + target.size() &&
+                        combined.compare(first, target.size(), target) == 0) {
                         blockedIdsOut->push_back(tokenId);
                     }
                 }
                 std::sort(blockedIdsOut->begin(), blockedIdsOut->end());
+                blockedIdsOut->erase(
+                    std::unique(blockedIdsOut->begin(),
+                                blockedIdsOut->end()),
+                    blockedIdsOut->end());
                 if (ToolCallTraceEnabled()) {
-                    printf("[ToolCallTrace] S4 empty-value: blocked=%zu\n",
-                           blockedIdsOut->size());
+                    printf("[ToolCallTrace] S4 empty-value complete-close "
+                           "blocked=%zu\n", blockedIdsOut->size());
                     fflush(stdout);
                 }
-                if (blockedIdsOut->empty()) {
-                    printf("[ToolCallTrace] S4 empty-value: no closer tokens "
-                           "found, mask skipped (fallback)\n");
-                    fflush(stdout);
-                }
-                // 空值屏蔽是纯黑名单, 不做 allowed 白名单
                 return;
             }
             if (!handled || allowedValues.empty()) {

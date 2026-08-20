@@ -33,6 +33,7 @@ static const std::vector<std::string> VOCAB = {
     " ", "  ", "hello", "1", "10", "txt", ".", "readme", "><",
     "List", "Dir", "dir", "Depth", "depth",
     "Bash", "bash", "ba", "sh", "ash", " sh",
+    "]", "+", ")", "span",
 };
 
 static GenerationConfig MakeConfig() {
@@ -166,6 +167,14 @@ int main() {
           CanSpell(m, P6, "\n/etc", cfg));
     Check("I4.5 非空值后 Jinja 闭合可拼",
           CanSpell(m, P6 + "\n/etc", "\n</parameter>", cfg));
+    Check("I4.6 非空值末尾裸 < 保持自由",
+          Eval(m, P6 + "\nitems = re.findall(r'itemtitle\">([^<", cfg)
+              .allowed.empty());
+    Check("I4.7 正则字符类中的 < 可逐 token 拼出",
+          CanSpell(m, P6 + "\nitems = re.findall(r'itemtitle\">([^",
+                   "<]+)</span>", cfg));
+    Check("I4.8 参数值允许以 HTML < 开头",
+          CanSpell(m, P6, "<span", cfg));
 
     // ---- I5: 全流程逐步可生成 ----
     std::vector<std::string> seq = {
