@@ -518,33 +518,45 @@ namespace fastllm {
             return true;
         }
 
-        static bool IsToolCallEnumTokenAllowed(const std::string &partial,
-                                               const std::string &tokenText,
-                                               const std::vector<std::string> &allowedValues,
-                                               const std::string &terminator) {
+        static bool IsToolCallEnumTokenAllowed(
+                const std::string &partial,
+                const std::string &tokenText,
+                const std::vector<std::string> &allowedValues,
+                const std::string &terminator,
+                bool canonicalizeNames) {
             if (tokenText.empty()) {
                 return false;
             }
-            std::string combined = partial + tokenText;
-            auto terminatorPos = combined.find(terminator);
-            std::string namePart = terminatorPos == std::string::npos ?
-                                   combined : combined.substr(0, terminatorPos);
-            // 用规范化后的形式比较: 模型写 "Bash" 也算命中声明的 "bash",
-            // 于是掩码不会在第一个 token 就被清空(清空 = 静默退回自由采样,
-            // 那才是工具调用真正坏掉的地方)。名字最终由
-            // ResolveDeclaredToolName 归一化回声明的拼写。
-            const std::string namePartKey = ToolCallCanonicalKey(namePart);
+            const std::string combined = partial + tokenText;
+            const auto terminatorPos = combined.find(terminator);
+            const std::string namePart =
+                terminatorPos == std::string::npos ?
+                combined : combined.substr(0, terminatorPos);
+            const std::string partialKey =
+                canonicalizeNames ?
+                ToolCallCanonicalKey(partial) : std::string();
+            const std::string namePartKey =
+                canonicalizeNames ?
+                ToolCallCanonicalKey(namePart) : std::string();
             for (const auto &name : allowedValues) {
                 if (terminatorPos != std::string::npos) {
                     if (namePart == name ||
-                        ToolCallCanonicalKey(name) == namePartKey) {
+                        (canonicalizeNames &&
+                         ToolCallCanonicalKey(name) == namePartKey)) {
                         return true;
                     }
                     continue;
                 }
-                if (ToolCallConstraintStartsWith(name, namePart) ||
-                    ToolCallConstraintStartsWith(ToolCallCanonicalKey(name),
-                                                 namePartKey)) {
+                if (ToolCallConstraintStartsWith(name, namePart)) {
+                    return true;
+                }
+                // 大小写/分隔符兼容只属于 schema 名字。结构标签必须逐
+                // 字节匹配；且 "_"、空格、"." 这类规范化后零进度的
+                // token 不能被放行，否则可在 <tool_call> 后无限循环。
+                if (canonicalizeNames &&
+                    namePartKey.size() > partialKey.size() &&
+                    ToolCallConstraintStartsWith(
+                        ToolCallCanonicalKey(name), namePartKey)) {
                     return true;
                 }
             }
@@ -879,6 +891,7 @@ namespace fastllm {
         std::string activeTerminator =
                 generationConfig.tool_call_name_terminator.empty()
                 ? "\"" : generationConfig.tool_call_name_terminator;
+        bool canonicalizeEnumNames = false;
         if (ToolCallGrammarEnabled()) {
             // ---- 完整状态机路径(默认) ----
             const ToolCallGrammarCursor cursor =
@@ -956,6 +969,7 @@ namespace fastllm {
                         allowedValues =
                                 generationConfig.tool_call_allowed_names;
                         handled = true;
+                        canonicalizeEnumNames = true;
                     }
                     break;
                 case TG_PARAM_GAP: {
@@ -1004,6 +1018,7 @@ namespace fastllm {
                                 generatedText, generationConfig, partial,
                                 allowedValues)) {
                         handled = true;
+                        canonicalizeEnumNames = true;
                     }
                     break;
                 case TG_PARAM_VALUE: {
@@ -1118,26 +1133,28 @@ namespace fastllm {
             if (!handled || allowedValues.empty()) {
                 return;
             }
-        } else if (!FindActiveToolCallParameterNamePartial(
-                    generatedText,
-                    generationConfig,
-                    partial,
-                    allowedValues)) {
-            if (!FindActiveToolCallNamePartial(
-                        generatedText,
-                        generationConfig,
-                        partial)) {
+        } else {
+            const bool parameterNameActive =
+                FindActiveToolCallParameterNamePartial(
+                    generatedText, generationConfig,
+                    partial, allowedValues);
+            if (parameterNameActive) {
+                canonicalizeEnumNames = true;
+            } else if (FindActiveToolCallNamePartial(
+                           generatedText, generationConfig,
+                           partial)) {
+                allowedValues =
+                    generationConfig.tool_call_allowed_names;
+                canonicalizeEnumNames = true;
+            } else {
                 if (!FindForcedToolCallParameterBlockStart(
-                            generatedText,
-                            generationConfig,
-                            partial,
-                            allowedValues)) {
+                        generatedText, generationConfig,
+                        partial, allowedValues)) {
                     return;
                 }
-                // "<parameter=" 目标串不含 ">", 用不可能字符避免提前命中终止逻辑
+                // "<parameter=" 目标串不含 ">", 用不可能字符避免
+                // 提前命中终止逻辑。结构前缀不做名字规范化。
                 activeTerminator = "\x01";
-            } else {
-                allowedValues = generationConfig.tool_call_allowed_names;
             }
         }
         if (allowedValues.empty()) {
@@ -1150,8 +1167,9 @@ namespace fastllm {
         for (const auto &item : this->weight.tokenizer.tokenToStringDict) {
             int tokenId = item.first;
             std::string tokenText = this->weight.tokenizer.DecodeTokens(std::vector<int>{tokenId});
-            if (IsToolCallEnumTokenAllowed(partial, tokenText,
-                                           allowedValues, terminator)) {
+            if (IsToolCallEnumTokenAllowed(
+                    partial, tokenText, allowedValues,
+                    terminator, canonicalizeEnumNames)) {
                 allowedIds.push_back(tokenId);
             }
         }

@@ -30,6 +30,7 @@ static const std::vector<std::string> VOCAB = {
     "ax_", "aax", "m", "a", "x", "t", "e", "r", "n", "d", "p", "i",
     "s", "l", "_", "th", "ath", ">", "/etc", "/", "etc", "2", "\n",
     " ", "  ", "hello", "1", "10", "txt", ".", "readme", "><",
+    "List", "Dir", "dir", "Depth", "depth",
 };
 
 static GenerationConfig MakeConfig() {
@@ -198,6 +199,67 @@ int main() {
                          row.tool_call_allowed_token_ids.end(), id) !=
                row.tool_call_allowed_token_ids.end();
     };
+    auto evalAllows = [](const EvalResult &result, int id) {
+        return std::find(result.allowed.begin(),
+                         result.allowed.end(), id) !=
+               result.allowed.end();
+    };
+    const EvalResult structuralPrefix =
+        Eval(m, "<tool_call>", cfg);
+    Check("I0.1 S0 允许真实 function 前缀",
+          evalAllows(structuralPrefix, tokenId("<function=")));
+    Check("I0.2 S0 不允许零进度下划线",
+          !evalAllows(structuralPrefix, tokenId("_")));
+    Check("I0.3 S0 不允许零进度空格",
+          !evalAllows(structuralPrefix, tokenId(" ")));
+    Check("I0.4 S0 不允许零进度点号",
+          !evalAllows(structuralPrefix, tokenId(".")));
+    const EvalResult functionName =
+        Eval(m, "<tool_call><function=", cfg);
+    Check("I0.5 S1 允许真实工具名",
+          evalAllows(functionName, tokenId("list")));
+    Check("I0.6 S1 不允许前导下划线",
+          !evalAllows(functionName, tokenId("_")));
+    Check("I0.7 S1 不允许前导点号",
+          !evalAllows(functionName, tokenId(".")));
+    Check("I0.8 S1 允许大小写规范化 List",
+          evalAllows(functionName, tokenId("List")));
+    const EvalResult camelToolName =
+        Eval(m, "<tool_call><function=List", cfg);
+    Check("I0.9 S1 允许无下划线 CamelCase 后缀",
+          evalAllows(camelToolName, tokenId("Dir")));
+    const EvalResult exactToolPrefix =
+        Eval(m, "<tool_call><function=list", cfg);
+    Check("I0.10 S1 保留声明内正确位置下划线",
+          evalAllows(exactToolPrefix, tokenId("_dir")));
+    Check("I0.11 S1 允许规范化后省略下划线",
+          evalAllows(exactToolPrefix, tokenId("Dir")));
+    const EvalResult toolAfterSeparator =
+        Eval(m, "<tool_call><function=list_", cfg);
+    Check("I0.12 S1 拒绝重复零进度下划线",
+          !evalAllows(toolAfterSeparator, tokenId("_")));
+    Check("I0.13 S1 正确下划线后仍可完成名字",
+          evalAllows(toolAfterSeparator, tokenId("dir")));
+    const EvalResult parameterPrefix = Eval(
+        m,
+        "<tool_call><function=list_dir><parameter=path>/etc</parameter>"
+        "<parameter=max",
+        cfg);
+    Check("I0.14 S3 允许 camelCase 参数后缀",
+          evalAllows(parameterPrefix, tokenId("Depth")));
+    Check("I0.15 S3 保留声明内正确位置下划线",
+          evalAllows(parameterPrefix, tokenId("_depth")));
+    const EvalResult parameterAfterSeparator = Eval(
+        m,
+        "<tool_call><function=list_dir><parameter=path>/etc</parameter>"
+        "<parameter=max_",
+        cfg);
+    Check("I0.16 S3 拒绝重复零进度下划线",
+          !evalAllows(parameterAfterSeparator, tokenId("_")));
+    Check("I0.17 S3 正确下划线后仍可完成参数名",
+          evalAllows(parameterAfterSeparator, tokenId("depth")));
+
+
     std::vector<GenerationConfig> speculativeRows;
     m.AppendToolCallConstraintRowConfigs(
         "<tool_call>\n<function=", cfg,
