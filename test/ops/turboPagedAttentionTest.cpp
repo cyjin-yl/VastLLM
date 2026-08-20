@@ -26,6 +26,7 @@
 //
 #include "fastllm.h"
 #include "model.h"
+#include "fastllm-kernel-route.h"
 
 #if defined(USE_CUDA) && !defined(USE_ROCM)
 #include <cuda_fp16.h>
@@ -507,7 +508,7 @@ void BuildBenchFixture(Fixture &f, int layerIdBase, int kvLen) {
     Data kDesc(DataType::Q8_0_KV);
     kDesc.Resize({f.numKvHeads, 1, f.headDim});
     kDesc.dataDevice = DataDevice::CUDA;
-    Data vDesc(DataType::TURBO3_KV);
+    Data vDesc(f.vType);
     vDesc.Resize({f.numKvHeads, 1, f.headDim});
     vDesc.dataDevice = DataDevice::CUDA;
 
@@ -548,14 +549,15 @@ void BuildBenchFixture(Fixture &f, int layerIdBase, int kvLen) {
                                      f.numKvHeads, f.headDim, DataType::Q8_0_KV,
                                      (uint8_t *)src.cudaData, DataType::FLOAT16,
                                      f.pageLen, 0, len, 0);
-        FastllmCudaPackedKVCacheCopy((uint8_t *)f.pagedV->cudaData, p, f.pageLen,
-                                     f.numKvHeads, f.headDim, DataType::TURBO3_KV,
-                                     (uint8_t *)src.cudaData, DataType::FLOAT16,
-                                     f.pageLen, 0, len, 0);
+        FastllmCudaPackedKVCacheCopy(
+            (uint8_t *)f.pagedV->cudaData, p, f.pageLen,
+            f.numKvHeads, f.headDim, f.vType,
+            (uint8_t *)src.cudaData, DataType::FLOAT16,
+            f.pageLen, 0, len, 0);
     }
     FastllmCudaSyncCurrentThreadStream();
     f.kCaches.dataType = DataType::Q8_0_KV;
-    f.vCaches.dataType = DataType::TURBO3_KV;
+    f.vCaches.dataType = f.vType;
     f.kCaches.Resize({f.numKvHeads, 1, f.headDim});
     f.vCaches.Resize({f.numKvHeads, 1, f.headDim});
     f.kCaches.isKVCache = f.vCaches.isKVCache = true;
@@ -686,15 +688,155 @@ void RunLargeCorrectness(int kvLen, int layerIdBase, const std::vector<int> &qoL
                " vs " + std::to_string(baseStats.rms) + ")");
     }
 }
+struct SelectedAttentionRow {
+    int token;
+    int head;
+};
+
+std::vector<double> ReferenceSelectedRows(
+    const Fixture &f, const std::vector<float> &qHost,
+    int qoLen, const std::vector<SelectedAttentionRow> &rows) {
+    std::vector<double> output(
+        (size_t)rows.size() * f.headDim, 0.0);
+    std::vector<double> scores(f.kvLen);
+    for (size_t r = 0; r < rows.size(); r++) {
+        const int t = rows[r].token;
+        const int h = rows[r].head;
+        const int kvh = h / f.group;
+        const int visibleEnd = f.kvLen - qoLen + t;
+        const float *qv = qHost.data() +
+            ((size_t)h * qoLen + t) * f.headDim;
+        double maxScore = -1e300;
+        for (int j = 0; j <= visibleEnd; j++) {
+            const double *kv = f.exactK.data() +
+                ((size_t)kvh * f.kvLen + j) * f.headDim;
+            double dot = 0.0;
+            for (int d = 0; d < f.headDim; d++) {
+                dot += (double)qv[d] * kv[d];
+            }
+            scores[j] = dot * (double)f.scale;
+            maxScore = std::max(maxScore, scores[j]);
+        }
+        double sum = 0.0;
+        for (int j = 0; j <= visibleEnd; j++) {
+            scores[j] = std::exp(scores[j] - maxScore);
+            sum += scores[j];
+        }
+        double *dst =
+            output.data() + r * f.headDim;
+        const double inv = sum > 0.0 ? 1.0 / sum : 0.0;
+        for (int j = 0; j <= visibleEnd; j++) {
+            const double *vv = f.exactV.data() +
+                ((size_t)kvh * f.kvLen + j) * f.headDim;
+            const double p = scores[j] * inv;
+            for (int d = 0; d < f.headDim; d++) {
+                dst[d] += p * vv[d];
+            }
+        }
+    }
+    return output;
+}
+
+ErrorStats CompareSelectedRows(
+    const std::vector<double> &reference,
+    const std::vector<float> &actual,
+    const std::vector<SelectedAttentionRow> &rows,
+    int H, int headDim) {
+    std::vector<float> selected(reference.size());
+    for (size_t r = 0; r < rows.size(); r++) {
+        const size_t src =
+            ((size_t)rows[r].token * H + rows[r].head) *
+                headDim;
+        std::copy_n(actual.data() + src, headDim,
+                    selected.data() + r * headDim);
+    }
+    return CompareToReference(reference, selected);
+}
+
+void RunSharedLongCorrectness(
+    const std::string &name, int layerId,
+    int qoLen, fastllm::DataType vType,
+    int requestedKvLen = 0) {
+    using namespace fastllm;
+    Fixture f;
+    f.vType = vType;
+    const int kvLen = requestedKvLen > 0 ?
+        requestedKvLen : qoLen + 257;
+    const int numPages =
+        (kvLen + f.pageLen - 1) / f.pageLen;
+    const int lastPageLen =
+        kvLen - (numPages - 1) * f.pageLen;
+    std::vector<int32_t> pages(numPages);
+    for (int i = 0; i < numPages; i++) {
+        pages[i] = numPages - 1 - i;
+    }
+    BuildPackedFixture(f, layerId, pages, lastPageLen);
+    Data q = MakeCudaTensor(
+        DataType::FLOAT16, {f.H, qoLen, f.headDim},
+        MakeValues((size_t)f.H * qoLen * f.headDim,
+                   9000.0 + qoLen, 1.0));
+    std::vector<float> qHost = ToFloatVector(q);
+    q.ToDevice(DataDevice::CUDA);
+    const std::vector<SelectedAttentionRow> rows = {
+        {0, 0}, {1, 5}, {qoLen / 2, 6},
+        {qoLen - 2, 12}, {qoLen - 1, 23},
+    };
+    const std::vector<double> reference =
+        ReferenceSelectedRows(f, qHost, qoLen, rows);
+    ResetKernelRouteCensus();
+    RunResult allHead = RunChunkedCublas(f, q, qoLen, true);
+    const auto routeTotals = GetKernelRouteTotals();
+    Expect(
+        routeTotals[
+            KERNEL_ROUTE_ATTN_SM70_TURBO_ALL_HEAD_GQA].calls > 0,
+        name + " all-head route counter did not increment");
+    RunResult old;
+    {
+        ScopedEnvVar disableAllHead(
+            "FASTLLM_CUDA_PAGED_CUBLAS_ALL_HEAD_BATCH", "0");
+        old = RunChunkedCublas(f, q, qoLen, true);
+    }
+    Expect(allHead.ok, name + " all-head path returned false");
+    Expect(old.ok, name + " old BATCH_GQA returned false");
+    if (!allHead.ok || !old.ok) return;
+    const ErrorStats allStats = CompareSelectedRows(
+        reference, allHead.output, rows, f.H, f.headDim);
+    const ErrorStats oldStats = CompareSelectedRows(
+        reference, old.output, rows, f.H, f.headDim);
+    std::cout << "  " << name << " qLen=" << qoLen << "\n";
+    ReportStats("packed all-head tensor path vs fp64", allStats);
+    ReportStats("old BATCH_GQA             vs fp64", oldStats);
+    Expect(allStats.MaxRel() < 5e-3,
+           name + " all-head relative error too large");
+    Expect(allStats.rms <= oldStats.rms * 1.05 + 1e-7,
+           name + " all-head RMS regressed");
+}
+
 
 void RunBench(int kvLen, int layerIdBase, const std::vector<int> &qoLens) {
     using namespace fastllm;
     Fixture f;
+    const char *vTypeText =
+        std::getenv("FASTLLM_TURBO_BENCH_V");
+    if (vTypeText != nullptr && std::atoi(vTypeText) == 4) {
+        f.vType = DataType::TURBO4_KV;
+    }
     BuildBenchFixture(f, layerIdBase, kvLen);
     const int numPages = (int)f.physicalPages.size();
     const int lastPageLen = kvLen - (numPages - 1) * f.pageLen;
+    const char *onlyQText =
+        std::getenv("FASTLLM_TURBO_BENCH_Q");
+    const int onlyQ = onlyQText == nullptr ?
+        0 : std::atoi(onlyQText);
+    const bool profile =
+        std::getenv("FASTLLM_TURBO_BENCH_PROFILE") != nullptr;
+    const int warmup = profile ? 1 : 3;
+    const int iters = profile ? 1 : 20;
 
     for (int qoLen : qoLens) {
+        if (onlyQ > 0 && qoLen != onlyQ) {
+            continue;
+        }
         Data q = MakeCudaTensor(DataType::FLOAT16, {f.H, qoLen, f.headDim},
                                 MakeValues((size_t)f.H * qoLen * f.headDim, 31.0, 1.0));
         Data qSizes = MakeIntTensor({2}, {0, qoLen});
@@ -737,16 +879,16 @@ void RunBench(int kvLen, int layerIdBase, const std::vector<int> &qoLens) {
             ScopedEnvVar noFusedPrefill(
                 "FASTLLM_CUDA_SM70_TURBO_PREFILL", "0");
             ScopedEnvVar gate("FASTLLM_CUDA_PAGED_CUBLAS_BATCH_GQA", "0");
-            base = TimeMs(viaDispatch, 3, 20);
+            base = TimeMs(viaDispatch, warmup, iters);
         }
         {
             ScopedEnvVar noFused("FASTLLM_CUDA_SM70_TURBO_XQA", "0");
             ScopedEnvVar noFusedPrefill(
                 "FASTLLM_CUDA_SM70_TURBO_PREFILL", "0");
             ScopedEnvVar gate("FASTLLM_CUDA_PAGED_CUBLAS_BATCH_GQA", "1");
-            gqa = TimeMs(viaDispatch, 3, 20);
+            gqa = TimeMs(viaDispatch, warmup, iters);
         }
-        fused = TimeMs(viaFused, 3, 20);
+        fused = TimeMs(viaFused, warmup, iters);
 
         // 每 (token, kvHead) 行的等效访存量, 用于和 372 B/行 的理论下限对照。
         const double rows = (double)kvLen * f.numKvHeads;
@@ -869,6 +1011,7 @@ int main(int argc, char **argv) {
     // 免得真拿到独占窗口时才发现 harness 崩了。
     bool benchMode = false;
     bool largeMode = false;
+    bool sharedLongMode = false;
     std::vector<int> benchKvLens;
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -876,12 +1019,42 @@ int main(int argc, char **argv) {
             benchMode = true;
         } else if (arg == "--large") {
             largeMode = true;
+        } else if (arg == "--shared-long") {
+            sharedLongMode = true;
         } else if (benchMode || largeMode) {
             int v = std::atoi(arg.c_str());
             if (v > 0) {
                 benchKvLens.push_back(v);
             }
         }
+    }
+    if (sharedLongMode) {
+        std::cout << "packed all-head qLen 512/2048 fp64 抽样对拍\n";
+        try {
+            RunSharedLongCorrectness(
+                "turbo3", 60400, 512,
+                fastllm::DataType::TURBO3_KV);
+            RunSharedLongCorrectness(
+                "turbo4", 60410, 512,
+                fastllm::DataType::TURBO4_KV);
+            RunSharedLongCorrectness(
+                "turbo3", 60420, 2048,
+                fastllm::DataType::TURBO3_KV);
+            RunSharedLongCorrectness(
+                "turbo4", 60430, 2048,
+                fastllm::DataType::TURBO4_KV);
+            RunSharedLongCorrectness(
+                "turbo3-partial-multichunk", 60440, 512,
+                fastllm::DataType::TURBO3_KV, 10003);
+        } catch (const std::exception &ex) {
+            std::cout << "  [FAIL] 异常: " << ex.what() << "\n";
+            gFailures++;
+        }
+        fastllm::ClearAllPagedCacheManagers();
+        std::cout << (gFailures == 0 ? "ALL PASS" : "FAILED")
+                  << "  (" << (gChecks - gFailures) << "/"
+                  << gChecks << ")\n";
+        return gFailures == 0 ? 0 : 1;
     }
     if (largeMode) {
         if (benchKvLens.empty()) {
@@ -911,7 +1084,7 @@ int main(int argc, char **argv) {
         try {
             int layerId = 60200;
             for (int kvLen : benchKvLens) {
-                RunBench(kvLen, layerId, {1, 3, 8, 16, 32});
+                RunBench(kvLen, layerId, {1, 3, 8, 16, 32, 64, 512, 2048});
                 layerId += 4;
             }
         } catch (const std::exception &ex) {
@@ -924,7 +1097,8 @@ int main(int argc, char **argv) {
     try {
         RunFixture("单页尾部 40", 60100, {2}, 40, {1, 2, 3, 4});
         RunFixture("turbo4 三页乱序", 60106, {3, 1, 4}, 29,
-                   {8, 16, 32}, fastllm::DataType::TURBO4_KV);
+                   {1, 2, 3, 4, 8, 16, 32},
+                   fastllm::DataType::TURBO4_KV);
         RunFixture("三页乱序尾部 17", 60102, {2, 0, 3}, 17,
                    {1, 2, 3, 4, 8, 16, 32});
         RunFixture("两页整页", 60104, {1, 4}, 128, {1, 3});

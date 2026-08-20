@@ -224,6 +224,46 @@ __global__ void FastllmPagedStoreHeadFromFloatKernel(
         FastllmAttentionFloatToValue<DstT>(srcData[idx]);
 }
 
+__global__ void FastllmPagedFillAllHeadBatchPointers(
+    half *kAll, half *vAll, const half *qData,
+    half *qk, float *outFloat,
+    void **qkA, void **qkB, void **qkC,
+    void **pvA, void **pvB, void **pvC,
+    int H, int group, int qoLen, int headDim,
+    int maxChunk, int qkChunk, int qHeadStride) {
+    const int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= H) return;
+    const int kvh = h / group;
+    qkA[h] = kAll +
+        (size_t)kvh * maxChunk * headDim;
+    qkB[h] = const_cast<half *>(
+        qData + (size_t)h * qHeadStride);
+    qkC[h] = qk + (size_t)h * qoLen * qkChunk;
+    pvA[h] = vAll +
+        (size_t)kvh * maxChunk * headDim;
+    pvB[h] = qk + (size_t)h * qoLen * qkChunk;
+    pvC[h] = outFloat +
+        (size_t)h * qoLen * headDim;
+}
+
+template <typename DstT>
+__global__ void FastllmPagedStoreAllHeadsFromFloatKernel(
+    const float *srcData, DstT *outData,
+    int H, int qoLen, int headDim,
+    int outHeadStride, int outTokenStride) {
+    const int total = H * qoLen * headDim;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const int headArea = qoLen * headDim;
+    const int h = idx / headArea;
+    const int withinHead = idx - h * headArea;
+    const int token = withinHead / headDim;
+    const int dim = withinHead - token * headDim;
+    outData[(size_t)token * outTokenStride +
+            (size_t)h * outHeadStride + dim] =
+        FastllmAttentionFloatToValue<DstT>(srcData[idx]);
+}
+
 __global__ void FastllmPagedCublasInitBlockAtten(float *sum0, float *max0, float *sum1, float *max1, int len) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     if (i < len) {
@@ -390,6 +430,173 @@ static bool FastllmPagedCublasBatchGqaEnabled() {
     return env != nullptr && env[0] == '1';
 }
 
+static bool FastllmPagedCublasAllHeadBatchEnabled() {
+    const char *env = std::getenv(
+        "FASTLLM_CUDA_PAGED_CUBLAS_ALL_HEAD_BATCH");
+    return env == nullptr || (env[0] != '0' &&
+        strcmp(env, "false") != 0 && strcmp(env, "off") != 0);
+}
+
+static bool FastllmCudaPagedAttentionPackedAllHeadBatchGqa(
+    void *qData, int H, int qoLen, int qHeadStride,
+    int qTokenStride, const int32_t *pageIndicesGpu,
+    int kvLen, fastllm::Data *pagedKVCacheK,
+    fastllm::Data *pagedKVCacheV, int pageLen,
+    int numKvHeads, int headDim, void *outData,
+    int outHeadStride, int outTokenStride,
+    int group, float scale) {
+    const int targetChunk = std::min(
+        kvLen, FastllmPagedCublasChunkSizeFromEnv(8192));
+    if (targetChunk <= 0) return false;
+    const int stateLen = H * qoLen;
+    const size_t kBytes = FastllmPagedAlignWorkspaceOffset(
+        (size_t)numKvHeads * targetChunk * headDim *
+        sizeof(half));
+    const size_t vBytes = kBytes;
+    const size_t qkBytes = FastllmPagedAlignWorkspaceOffset(
+        (size_t)H * qoLen * targetChunk * sizeof(half));
+    const size_t stateBytes = FastllmPagedAlignWorkspaceOffset(
+        (size_t)stateLen * sizeof(float));
+    const size_t outBytes = FastllmPagedAlignWorkspaceOffset(
+        (size_t)H * qoLen * headDim * sizeof(float));
+    const size_t ptrBytes = FastllmPagedAlignWorkspaceOffset(
+        (size_t)H * sizeof(void *));
+    const size_t needBytes =
+        kBytes + vBytes + qkBytes + stateBytes * 4 +
+        outBytes + ptrBytes * 6 + 1024;
+    size_t workspaceBytes = 0;
+    bool workspaceOwn = false;
+    uint8_t *workspace = (uint8_t *)FastllmBorrowCudaTempBuffer(
+        needBytes, &workspaceBytes, &workspaceOwn);
+    if (workspace == nullptr || workspaceBytes < needBytes) {
+        FastllmReleaseCudaTempBuffer(workspace, workspaceOwn);
+        return false;
+    }
+
+    size_t offset = 0;
+    half *kAll = (half *)(workspace + offset);
+    offset += kBytes;
+    half *vAll = (half *)(workspace + offset);
+    offset += vBytes;
+    half *qk = (half *)(workspace + offset);
+    offset += qkBytes;
+    float *lastSum = (float *)(workspace + offset);
+    offset += stateBytes;
+    float *lastMax = (float *)(workspace + offset);
+    offset += stateBytes;
+    float *currentSum = (float *)(workspace + offset);
+    offset += stateBytes;
+    float *currentMax = (float *)(workspace + offset);
+    offset += stateBytes;
+    float *outFloat = (float *)(workspace + offset);
+    offset += outBytes;
+    void **qkA = (void **)(workspace + offset);
+    offset += ptrBytes;
+    void **qkB = (void **)(workspace + offset);
+    offset += ptrBytes;
+    void **qkC = (void **)(workspace + offset);
+    offset += ptrBytes;
+    void **pvA = (void **)(workspace + offset);
+    offset += ptrBytes;
+    void **pvB = (void **)(workspace + offset);
+    offset += ptrBytes;
+    void **pvC = (void **)(workspace + offset);
+
+    FastllmPagedCublasInitBlockAtten<<<
+        (stateLen + 255) / 256, 256>>>(
+            lastSum, lastMax, currentSum, currentMax,
+            stateLen);
+
+    const half beta = __float2half_rn(0.0f);
+    const half hscale = __float2half_rn(scale);
+    const float oneFloat = 1.0f;
+    auto handle = getFastllmCublasHandle();
+    bool ok = true;
+    for (int kvStart = 0;
+         kvStart < kvLen && ok;
+         kvStart += targetChunk) {
+        const int chunkLen =
+            std::min(targetChunk, kvLen - kvStart);
+        for (int kvh = 0; kvh < numKvHeads; kvh++) {
+            ok = FastllmCudaPagedCacheGatherHeadRangeToHalf(
+                pagedKVCacheK, pageIndicesGpu, kvStart,
+                chunkLen, pageLen, numKvHeads, headDim,
+                kvh, kAll +
+                    (size_t)kvh * targetChunk * headDim);
+            ok = ok &&
+                FastllmCudaPagedCacheGatherHeadRangeToHalf(
+                    pagedKVCacheV, pageIndicesGpu, kvStart,
+                    chunkLen, pageLen, numKvHeads, headDim,
+                    kvh, vAll +
+                        (size_t)kvh * targetChunk * headDim);
+        }
+        if (!ok) break;
+        FastllmPagedFillAllHeadBatchPointers<<<1, 32>>>(
+            kAll, vAll, (const half *)qData, qk, outFloat,
+            qkA, qkB, qkC, pvA, pvB, pvC,
+            H, group, qoLen, headDim,
+            targetChunk, chunkLen, qHeadStride);
+
+        cublasStatus_t status = cublasHgemmBatched(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            chunkLen, qoLen, headDim, &hscale,
+            (const half **)qkA, headDim,
+            (const half **)qkB, qTokenStride,
+            &beta, (half **)qkC, chunkLen, H);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("[Fastllm][packed-all-head] QK failed, "
+                   "status=%d\n", (int)status);
+            ok = false;
+            break;
+        }
+
+        FastllmPagedCublasSoftmaxWithCausalMaskBatchGqa<
+            256><<<stateLen, 256>>>(
+                qk, qk, stateLen, qoLen, chunkLen,
+                kvLen - qoLen - kvStart,
+                currentMax, currentSum);
+        if (kvStart > 0) {
+            FastllmPagedCublasAttnBlockUpdateFloat<<<
+                stateLen, 128>>>(
+                    outFloat, headDim, headDim,
+                    lastMax, lastSum, currentMax, currentSum);
+        } else {
+            FastllmPagedCublasCommitBlockState<<<
+                (stateLen + 255) / 256, 256>>>(
+                    lastMax, lastSum,
+                    currentMax, currentSum, stateLen);
+        }
+
+        const float currentScale =
+            kvStart > 0 ? 1.0f : 0.0f;
+        status = cublasGemmBatchedEx(
+            handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            headDim, qoLen, chunkLen, &oneFloat,
+            (const void **)pvA, CUDA_R_16F, headDim,
+            (const void **)pvB, CUDA_R_16F, chunkLen,
+            &currentScale,
+            pvC, CUDA_R_32F, headDim, H,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("[Fastllm][packed-all-head] PV failed, "
+                   "status=%d\n", (int)status);
+            ok = false;
+        }
+    }
+
+    if (ok) {
+        const int total = H * qoLen * headDim;
+        FastllmPagedStoreAllHeadsFromFloatKernel<half><<<
+            (total + 255) / 256, 256>>>(
+                outFloat, (half *)outData,
+                H, qoLen, headDim,
+                outHeadStride, outTokenStride);
+    }
+    FastllmReleaseCudaTempBuffer(workspace, workspaceOwn);
+    return ok && cudaGetLastError() == cudaSuccess;
+}
+
 static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
     void *qData,
     fastllm::DataType qType,
@@ -476,7 +683,9 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
     }
 
     bool batchGqa = qIsHalf && outIsHalf && group > 1 &&
-        FastllmPagedCublasBatchGqaEnabled();
+        (FastllmPagedCublasBatchGqaEnabled() ||
+         (qoLen >= 64 &&
+          FastllmPagedCublasAllHeadBatchEnabled()));
 
     bool ownPageIndices = false;
     int32_t *pageIndicesGpu = (int32_t*)pageIndicesGpuIn;
@@ -484,6 +693,33 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
         pageIndicesGpu = (int32_t*)FastllmCudaMalloc((size_t)numPages * sizeof(int32_t));
         cudaMemcpy(pageIndicesGpu, pageIndices.data(), (size_t)numPages * sizeof(int32_t), cudaMemcpyHostToDevice);
         ownPageIndices = true;
+    }
+    if (batchGqa && qoLen >= 64 &&
+        FastllmPagedCublasAllHeadBatchEnabled() &&
+        pagedKVCacheK->dataType ==
+            fastllm::DataType::Q8_0_KV &&
+        (pagedKVCacheV->dataType ==
+             fastllm::DataType::TURBO3_KV ||
+         pagedKVCacheV->dataType ==
+             fastllm::DataType::TURBO4_KV)) {
+        const bool allHeadOk =
+            FastllmCudaPagedAttentionPackedAllHeadBatchGqa(
+                qData, H, qoLen, qHeadStride, qTokenStride,
+                pageIndicesGpu, kvLen,
+                pagedKVCacheK, pagedKVCacheV, pageLen,
+                numKvHeads, headDim, outData,
+                outHeadStride, outTokenStride,
+                group, scale);
+        if (allHeadOk) {
+            fastllm::KernelRouteHit(
+                fastllm::
+                    KERNEL_ROUTE_ATTN_SM70_TURBO_ALL_HEAD_GQA,
+                -1, qoLen, kvLen, H);
+            if (ownPageIndices) {
+                FastllmCudaFree(pageIndicesGpu);
+            }
+            return true;
+        }
     }
 
     const int targetChunk = FastllmPagedCublasChunkSizeFromEnv(8192);

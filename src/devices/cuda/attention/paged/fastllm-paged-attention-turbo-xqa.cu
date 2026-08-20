@@ -140,7 +140,7 @@ __device__ __forceinline__ void TurboInverseWht128(float *x, int lane) {
 // -------------------------------------------------------------------------
 // phase1: 每个 block 负责 (kvHead, groupChunk, split), 输出 u 域的部分 softmax 状态。
 // -------------------------------------------------------------------------
-template <int QO_LEN, int GROUP_CHUNK>
+template <bool TURBO4, int QO_LEN, int GROUP_CHUNK>
 __global__ void __launch_bounds__(kTurboThreads, 4)
 FastllmSm70PagedTurboXqaSplitKernel(
     const half   * __restrict__ qd,
@@ -169,7 +169,7 @@ FastllmSm70PagedTurboXqaSplitKernel(
     const int kvEnd = min(kvStart + chunkSize, kvLen);
 
     __shared__ float sQ[kSets * kTurboHeadDim];
-    __shared__ float sLut[8];
+    __shared__ float sLut[16];
     __shared__ float sAcc[kTurboWarps * kTurboHeadDim];
     __shared__ float sM[kSets * kTurboWarps];
     __shared__ float sL[kSets * kTurboWarps];
@@ -184,8 +184,10 @@ FastllmSm70PagedTurboXqaSplitKernel(
         const int h = kvHead * group + chunkId * GROUP_CHUNK + c;
         sQ[idx] = __half2float(qd[(size_t)h * qStrideH + (size_t)t * qStrideN + d]) * scaleLog2;
     }
-    if (tid < 8) {
-        sLut[tid] = kTurboXqaCentroids[tid];
+    for (int i = tid; i < (TURBO4 ? 16 : 8);
+         i += kTurboThreads) {
+        sLut[i] = TURBO4 ?
+            kTurbo4XqaCentroids[i] : kTurboXqaCentroids[i];
     }
     __syncthreads();
 
@@ -207,8 +209,8 @@ FastllmSm70PagedTurboXqaSplitKernel(
     const int d0 = lane * kTurboDimsLane;
     const int q8Block = lane >> 2;
     const int q8Off = (lane & 3) * 8;
-    const int t3Block = lane >> 4;
-    const int t3Grp = lane & 15;
+    const int valueBlock = lane >> 4;
+    const int valueGroup = lane & 15;
 
     for (int j = kvStart + warp; j < kvEnd; j += kTurboWarps) {
         const int pageSlot = j >> pageLenShift;
@@ -226,18 +228,43 @@ FastllmSm70PagedTurboXqaSplitKernel(
             kreg[i] = kScale * (float)kQs[i];
         }
 
-        // ---- V: turbo3, **只解码到 u 域, 不做逆 WHT**(见文件头) ----
-        const uint8_t *vBlk = pagedV + row * kTurboT3Row + (size_t)t3Block * kTurbo3BlockBytes;
-        const float vNorm = __half2float(__ldg(reinterpret_cast<const half *>(vBlk)));
-        // low2 的 2 字节小端拼成 uint16 后, 第 i 个值的 2 bit 正好在 bit 2*i 处
-        // (i<4 来自低字节 bit 0/2/4/6, i>=4 来自高字节 -> bit 8/10/12/14)。
-        const uint32_t low2 = __ldg(reinterpret_cast<const uint16_t *>(vBlk + 2 + 2 * t3Grp));
-        const uint32_t high1 = __ldg(vBlk + 2 + 32 + t3Grp);
         float vreg[kTurboDimsLane];
-        #pragma unroll
-        for (int i = 0; i < kTurboDimsLane; i++) {
-            const int idx = (int)(((low2 >> (2 * i)) & 3u) | (((high1 >> i) & 1u) << 2));
-            vreg[i] = vNorm * sLut[idx];
+        if constexpr (TURBO4) {
+            const uint8_t *vBlk =
+                pagedV + row * kTurboT4Row +
+                (size_t)valueBlock * kTurbo4BlockBytes;
+            const float norm = __half2float(
+                __ldg(reinterpret_cast<const half *>(vBlk)));
+            const uint8_t *packedBytes =
+                vBlk + 2 + 4 * valueGroup;
+            const uint32_t packed =
+                (uint32_t)__ldg(packedBytes) |
+                ((uint32_t)__ldg(packedBytes + 1) << 8) |
+                ((uint32_t)__ldg(packedBytes + 2) << 16) |
+                ((uint32_t)__ldg(packedBytes + 3) << 24);
+            #pragma unroll
+            for (int i = 0; i < kTurboDimsLane; i++) {
+                vreg[i] = norm *
+                    sLut[(packed >> (4 * i)) & 15u];
+            }
+        } else {
+            const uint8_t *vBlk =
+                pagedV + row * kTurboT3Row +
+                (size_t)valueBlock * kTurbo3BlockBytes;
+            const float norm = __half2float(
+                __ldg(reinterpret_cast<const half *>(vBlk)));
+            const uint32_t low2 = __ldg(
+                reinterpret_cast<const uint16_t *>(
+                    vBlk + 2 + 2 * valueGroup));
+            const uint32_t high1 =
+                __ldg(vBlk + 2 + 32 + valueGroup);
+            #pragma unroll
+            for (int i = 0; i < kTurboDimsLane; i++) {
+                const int idx =
+                    (int)(((low2 >> (2 * i)) & 3u) |
+                    (((high1 >> i) & 1u) << 2));
+                vreg[i] = norm * sLut[idx];
+            }
         }
 
         float partial[kSets];
@@ -532,6 +559,7 @@ FastllmSm70PagedTurboPrefillSplitKernel(
     }
 }
 
+
 __global__ void FastllmSm70PagedTurboPrefillCombineKernel(
     const float * __restrict__ scratch, half * __restrict__ od,
     int qoLen, int group, int splits,
@@ -606,7 +634,7 @@ bool TurboXqaEnabled() {
            strcmp(value, "off") != 0 && strcmp(value, "OFF") != 0;
 }
 
-template <int QO_LEN, int GROUP_CHUNK>
+template <bool TURBO4, int QO_LEN, int GROUP_CHUNK>
 void LaunchTurboXqa(const half *qd, const uint8_t *pagedK, const uint8_t *pagedV,
                     float *scratch, const int32_t *pageIndices,
                     int numPages, int lastPageLen, int pageLenShift, int pageLenMask,
@@ -614,7 +642,7 @@ void LaunchTurboXqa(const half *qd, const uint8_t *pagedK, const uint8_t *pagedV
                     float scale, int splits, half *od,
                     int outHeadStride, int outTokenStride) {
     dim3 grid1((unsigned)(numKvHeads * groupChunks), (unsigned)splits, 1);
-    FastllmSm70PagedTurboXqaSplitKernel<QO_LEN, GROUP_CHUNK>
+    FastllmSm70PagedTurboXqaSplitKernel<TURBO4, QO_LEN, GROUP_CHUNK>
         <<<grid1, kTurboThreads, 0, cudaStreamPerThread>>>(
             qd, pagedK, pagedV, scratch, pageIndices, numPages, lastPageLen,
             pageLenShift, pageLenMask, numKvHeads, groupChunks,
@@ -624,6 +652,50 @@ void LaunchTurboXqa(const half *qd, const uint8_t *pagedK, const uint8_t *pagedV
         <<<grid2, kTurboHeadDim, 0, cudaStreamPerThread>>>(
             scratch, od, GROUP_CHUNK * groupChunks, splits,
             outHeadStride, outTokenStride);
+}
+
+template <bool TURBO4>
+bool DispatchTurboXqa(
+    int qoLen, const half *qd,
+    const uint8_t *pagedK, const uint8_t *pagedV,
+    float *scratch, const int32_t *pageIndices,
+    int numPages, int lastPageLen,
+    int pageLenShift, int pageLenMask,
+    int numKvHeads, int groupChunks,
+    int qStrideH, int qStrideN, float scale, int splits,
+    half *od, int outHeadStride, int outTokenStride) {
+    switch (qoLen) {
+        case 1:
+            LaunchTurboXqa<TURBO4, 1, 6>(
+                qd, pagedK, pagedV, scratch, pageIndices,
+                numPages, lastPageLen, pageLenShift, pageLenMask,
+                numKvHeads, groupChunks, qStrideH, qStrideN,
+                scale, splits, od, outHeadStride, outTokenStride);
+            return true;
+        case 2:
+            LaunchTurboXqa<TURBO4, 2, 3>(
+                qd, pagedK, pagedV, scratch, pageIndices,
+                numPages, lastPageLen, pageLenShift, pageLenMask,
+                numKvHeads, groupChunks, qStrideH, qStrideN,
+                scale, splits, od, outHeadStride, outTokenStride);
+            return true;
+        case 3:
+            LaunchTurboXqa<TURBO4, 3, 2>(
+                qd, pagedK, pagedV, scratch, pageIndices,
+                numPages, lastPageLen, pageLenShift, pageLenMask,
+                numKvHeads, groupChunks, qStrideH, qStrideN,
+                scale, splits, od, outHeadStride, outTokenStride);
+            return true;
+        case 4:
+            LaunchTurboXqa<TURBO4, 4, 1>(
+                qd, pagedK, pagedV, scratch, pageIndices,
+                numPages, lastPageLen, pageLenShift, pageLenMask,
+                numKvHeads, groupChunks, qStrideH, qStrideN,
+                scale, splits, od, outHeadStride, outTokenStride);
+            return true;
+        default:
+            return false;
+    }
 }
 
 
@@ -662,6 +734,7 @@ int TurboPrefillMaxQoLen() {
     if (value == nullptr || value[0] == '\0') return 32;
     return std::max(5, std::min(1024, std::atoi(value)));
 }
+
 }  // namespace
 
 bool FastllmCudaTrySm70PagedTurboXqa(
@@ -676,7 +749,8 @@ bool FastllmCudaTrySm70PagedTurboXqa(
     if (!TurboXqaEnabled()) {
         return false;
     }
-    if (qData == nullptr || outData == nullptr || pageIndicesGpu == nullptr ||
+    if (qData == nullptr || outData == nullptr ||
+        pageIndicesGpu == nullptr ||
         pagedKVCacheK == nullptr || pagedKVCacheV == nullptr) {
         return false;
     }
@@ -684,7 +758,8 @@ bool FastllmCudaTrySm70PagedTurboXqa(
         return false;
     }
     if (pagedKVCacheK->dataType != fastllm::DataType::Q8_0_KV ||
-        pagedKVCacheV->dataType != fastllm::DataType::TURBO3_KV) {
+        (pagedKVCacheV->dataType != fastllm::DataType::TURBO3_KV &&
+         pagedKVCacheV->dataType != fastllm::DataType::TURBO4_KV)) {
         return false;
     }
     if (pagedKVCacheK->cudaData == nullptr || pagedKVCacheV->cudaData == nullptr) {
@@ -738,33 +813,25 @@ bool FastllmCudaTrySm70PagedTurboXqa(
     const uint8_t *pagedK = (const uint8_t *)pagedKVCacheK->cudaData;
     const uint8_t *pagedV = (const uint8_t *)pagedKVCacheV->cudaData;
 
-    switch (qoLen) {
-        case 1:
-            LaunchTurboXqa<1, 6>(qd, pagedK, pagedV, scratch, pageIndicesGpu, numPages,
-                                 lastPageLen, pageLenShift, pageLen - 1, numKvHeads,
-                                 groupChunks, qHeadStride, qTokenStride, scale, splits,
-                                 od, outHeadStride, outTokenStride);
-            break;
-        case 2:
-            LaunchTurboXqa<2, 3>(qd, pagedK, pagedV, scratch, pageIndicesGpu, numPages,
-                                 lastPageLen, pageLenShift, pageLen - 1, numKvHeads,
-                                 groupChunks, qHeadStride, qTokenStride, scale, splits,
-                                 od, outHeadStride, outTokenStride);
-            break;
-        case 3:
-            LaunchTurboXqa<3, 2>(qd, pagedK, pagedV, scratch, pageIndicesGpu, numPages,
-                                 lastPageLen, pageLenShift, pageLen - 1, numKvHeads,
-                                 groupChunks, qHeadStride, qTokenStride, scale, splits,
-                                 od, outHeadStride, outTokenStride);
-            break;
-        case 4:
-            LaunchTurboXqa<4, 1>(qd, pagedK, pagedV, scratch, pageIndicesGpu, numPages,
-                                 lastPageLen, pageLenShift, pageLen - 1, numKvHeads,
-                                 groupChunks, qHeadStride, qTokenStride, scale, splits,
-                                 od, outHeadStride, outTokenStride);
-            break;
-        default:
-            return false;
+    const bool launched =
+        pagedKVCacheV->dataType ==
+            fastllm::DataType::TURBO4_KV ?
+        DispatchTurboXqa<true>(
+            qoLen, qd, pagedK, pagedV, scratch,
+            pageIndicesGpu, numPages, lastPageLen,
+            pageLenShift, pageLen - 1, numKvHeads,
+            groupChunks, qHeadStride, qTokenStride,
+            scale, splits, od,
+            outHeadStride, outTokenStride) :
+        DispatchTurboXqa<false>(
+            qoLen, qd, pagedK, pagedV, scratch,
+            pageIndicesGpu, numPages, lastPageLen,
+            pageLenShift, pageLen - 1, numKvHeads,
+            groupChunks, qHeadStride, qTokenStride,
+            scale, splits, od,
+            outHeadStride, outTokenStride);
+    if (!launched) {
+        return false;
     }
     if (cudaGetLastError() != cudaSuccess) {
         return false;
@@ -782,7 +849,8 @@ bool FastllmCudaTrySm70PagedTurboPrefill(
     int outHeadStride, int outTokenStride, int group, float scale) {
     if (!TurboPrefillEnabled() || qoLen <= kTurboMaxQoLen ||
         qoLen > TurboPrefillMaxQoLen() ||
-        qData == nullptr || outData == nullptr || pageIndicesGpu == nullptr ||
+        qData == nullptr || outData == nullptr ||
+        pageIndicesGpu == nullptr ||
         pagedKVCacheK == nullptr || pagedKVCacheV == nullptr ||
         qType != fastllm::DataType::FLOAT16 ||
         outType != fastllm::DataType::FLOAT16 ||
@@ -814,30 +882,41 @@ bool FastllmCudaTrySm70PagedTurboPrefill(
     }
     const int parallel = H * qoLen;
     const int splits = std::max(
-        1, std::min(8, (kTurboSplitTargetBlocks + parallel - 1) / parallel));
+        1, std::min(8,
+            (kTurboSplitTargetBlocks + parallel - 1) / parallel));
     const size_t needSlots = (size_t)H * qoLen * splits;
     size_t capacity = 0;
     float *scratch = TurboPrefillScratch(device, needSlots, capacity);
     if (scratch == nullptr || capacity < needSlots) return false;
     int pageLenShift = 0;
     while ((1 << pageLenShift) < pageLen) pageLenShift++;
-    dim3 splitGrid((unsigned)H, (unsigned)qoLen, (unsigned)splits);
     const half *qd = (const half *)qData;
-    const uint8_t *pagedK = (const uint8_t *)pagedKVCacheK->cudaData;
-    const uint8_t *pagedV = (const uint8_t *)pagedKVCacheV->cudaData;
-    if (pagedKVCacheV->dataType == fastllm::DataType::TURBO4_KV) {
+    const uint8_t *pagedK =
+        (const uint8_t *)pagedKVCacheK->cudaData;
+    const uint8_t *pagedV =
+        (const uint8_t *)pagedKVCacheV->cudaData;
+    const bool turbo4 =
+        pagedKVCacheV->dataType ==
+        fastllm::DataType::TURBO4_KV;
+    dim3 splitGrid(
+        (unsigned)H, (unsigned)qoLen, (unsigned)splits);
+    if (turbo4) {
         FastllmSm70PagedTurboPrefillSplitKernel<true>
-            <<<splitGrid, kTurboThreads, 0, cudaStreamPerThread>>>(
-                qd, pagedK, pagedV, scratch, pageIndicesGpu,
-                numPages, lastPageLen, pageLenShift, pageLen - 1,
-                numKvHeads, qoLen, group, qHeadStride, qTokenStride,
+            <<<splitGrid, kTurboThreads, 0,
+               cudaStreamPerThread>>>(
+                qd, pagedK, pagedV, scratch,
+                pageIndicesGpu, numPages, lastPageLen,
+                pageLenShift, pageLen - 1, numKvHeads,
+                qoLen, group, qHeadStride, qTokenStride,
                 scale, splits);
     } else {
         FastllmSm70PagedTurboPrefillSplitKernel<false>
-            <<<splitGrid, kTurboThreads, 0, cudaStreamPerThread>>>(
-                qd, pagedK, pagedV, scratch, pageIndicesGpu,
-                numPages, lastPageLen, pageLenShift, pageLen - 1,
-                numKvHeads, qoLen, group, qHeadStride, qTokenStride,
+            <<<splitGrid, kTurboThreads, 0,
+               cudaStreamPerThread>>>(
+                qd, pagedK, pagedV, scratch,
+                pageIndicesGpu, numPages, lastPageLen,
+                pageLenShift, pageLen - 1, numKvHeads,
+                qoLen, group, qHeadStride, qTokenStride,
                 scale, splits);
     }
     dim3 combineGrid((unsigned)numKvHeads, (unsigned)qoLen, 1);

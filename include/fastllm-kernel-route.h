@@ -53,6 +53,7 @@ namespace fastllm {
         // 不要看 native_fallback 是否归零。
         KERNEL_ROUTE_ATTN_SM70_TURBO_XQA,
         KERNEL_ROUTE_ATTN_SM70_TURBO_PREFILL,
+        KERNEL_ROUTE_ATTN_SM70_TURBO_ALL_HEAD_GQA,
         KERNEL_ROUTE_COUNT
     };
 
