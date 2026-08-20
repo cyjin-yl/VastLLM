@@ -3392,6 +3392,8 @@ namespace fastllm {
     // 处理: 把非有限值统一压到 -1e30f, 让它们必然排在最后, 真正的 top token
     //   得以胜出; 同时把这件事打进日志, 不再静默降智。
     static std::atomic<long long> g_nonFiniteLogitSteps(0);
+    // 两条采样路径都可能清空工具约束；共用计数避免只看一条路径得出假阴性。
+    static std::atomic<long long> g_toolCallMaskEmptied(0);
 
     int SanitizeLogitsForSampling(float *base, int count, const char *where) {
         int bad = 0, firstBad = -1;
@@ -3418,6 +3420,9 @@ namespace fastllm {
 
     long long GetNonFiniteLogitSteps() {
         return g_nonFiniteLogitSteps.load();
+    }
+    long long GetToolCallMaskEmptiedCount() {
+        return g_toolCallMaskEmptied.load();
     }
 
     int LLMSampling(Data &logits, int outerOffset,
@@ -3507,6 +3512,7 @@ namespace fastllm {
             }
         }
         if (v.empty() && hasToolNameMask) {
+            ++g_toolCallMaskEmptied;
             GenerationConfig fallbackConfig = config;
             fallbackConfig.tool_call_allowed_token_ids.clear();
             fallbackConfig.tool_call_blocked_token_ids.clear();
@@ -3580,6 +3586,7 @@ namespace fastllm {
             }
         }
         if (candidateOffsets.empty() && !config.tool_call_allowed_token_ids.empty()) {
+            ++g_toolCallMaskEmptied;
             GenerationConfig fallbackConfig = config;
             fallbackConfig.tool_call_allowed_token_ids.clear();
             fallbackConfig.tool_call_blocked_token_ids.clear();

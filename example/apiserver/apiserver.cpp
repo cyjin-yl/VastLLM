@@ -1594,6 +1594,8 @@ struct WorkQueue {
                 {"toolcall_constraint_masked_tokens",
                     (double)fastllm::GetToolCallGrammarStatsSnapshot()
                             .maskedTokens},
+                {"toolcall_mask_emptied",
+                    (double)fastllm::GetToolCallMaskEmptiedCount()},
                 {"backend", "fastllm"}
             });
             return;

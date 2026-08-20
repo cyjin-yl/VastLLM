@@ -215,7 +215,51 @@ void TestNormalSamplingStillWorks() {
     Check(allInTopK, "64 次采样全部落在 top-3 集合内");
 }
 
+void TestFullLogitsToolCallMaskEmptyFallbackIsCounted() {
+    printf("[8] 全词表工具调用候选为空时回退可观测\n");
+    const int vocab = 64;
+    const int peak = 37;
+    const std::vector<float> values = MakeLogits(vocab, peak);
+    fastllm::Data logits(
+        fastllm::DataType::FLOAT32, {1, vocab}, values);
+    fastllm::GenerationConfig cfg = NonGreedyConfig(/*topK=*/3);
+    cfg.temperature = 0.0f;
+    cfg.tool_call_allowed_token_ids = {999};
+    fastllm::LastTokensUnit unit;
+
+    const long long before = fastllm::GetToolCallMaskEmptiedCount();
+    const int tok = fastllm::LLMSampling(logits, 0, cfg, unit);
+    const long long after = fastllm::GetToolCallMaskEmptiedCount();
+
+    Check(tok == peak, "全词表候选全被排除时仍返回无约束最佳候选");
+    Check(after - before == 1, "全词表掩码为空时计数器恰好增加 1");
+}
+
+void TestToolCallMaskEmptyFallbackIsCounted() {
+    printf("[9] top-k 工具调用候选为空时回退可观测\n");
+    // LLMSamplingOnly 接受已经按分数降序排列的 (tokenId, logit) 交错 top-k 张量。
+    const std::vector<float> interleaved = {
+        41.0f, 9.0f,
+        42.0f, 8.0f,
+        43.0f, 7.0f
+    };
+    fastllm::Data logits(
+        fastllm::DataType::FLOAT32, {1, (int)interleaved.size()}, interleaved);
+    fastllm::GenerationConfig cfg;
+    cfg.top_k = 3;
+    cfg.temperature = 0.0f;
+    cfg.tool_call_allowed_token_ids = {999};
+
+    const long long before = fastllm::GetToolCallMaskEmptiedCount();
+    const int tok = fastllm::LLMSamplingOnly(logits, 0, cfg);
+    const long long after = fastllm::GetToolCallMaskEmptiedCount();
+
+    Check(tok == 41, "候选全被 allow-list 排除时仍返回无约束最佳候选");
+    Check(after - before == 1, "候选掩码为空时计数器恰好增加 1");
+}
+
 }  // namespace
+
 
 int main() {
     printf("== 采样路径正确性回归 ==\n");
@@ -226,6 +270,9 @@ int main() {
     TestNanLogitsDoNotCollapseToTokenZero();
     TestLargeTopKPathAlsoGuarded();
     TestNormalSamplingStillWorks();
+    TestFullLogitsToolCallMaskEmptyFallbackIsCounted();
+
+    TestToolCallMaskEmptyFallbackIsCounted();
 
     printf("\n%d/%d 通过\n", g_checks - g_failures, g_checks);
     if (g_failures > 0) {

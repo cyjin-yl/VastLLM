@@ -1433,6 +1433,7 @@ namespace fastllm {
 
     int SanitizeLogitsForSampling(float *base, int count, const char *where);
     long long GetNonFiniteLogitSteps();
+    long long GetToolCallMaskEmptiedCount();
 
     int LLMSamplingOnly(Data &logits, int outerOffset, const GenerationConfig &config);
 
