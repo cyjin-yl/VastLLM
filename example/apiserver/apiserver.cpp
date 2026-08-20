@@ -227,6 +227,77 @@ struct APIConfig {
 };
 APIConfig config;
 
+struct ChatTemplateStartupStatus {
+    bool valid = true;
+    std::string error;
+};
+
+std::mutex chatTemplateStartupStatusMutex;
+ChatTemplateStartupStatus chatTemplateStartupStatus;
+
+ChatTemplateStartupStatus GetChatTemplateStartupStatus() {
+    std::lock_guard<std::mutex> guard(chatTemplateStartupStatusMutex);
+    return chatTemplateStartupStatus;
+}
+
+void CheckLoadedChatTemplate(
+        fastllm::basellm *model, const char *loadStage) {
+    ChatTemplateStartupStatus status;
+    if (model == nullptr) {
+        status.valid = false;
+        status.error = "model is null";
+    } else if (model->weight.tokenizer.chatTemplate.empty()) {
+        status.valid = true;
+    } else {
+        const fastllm::JinjaVar context = {
+            {"messages", fastllm::JinjaArray {
+                fastllm::JinjaVar {
+                    {"role", "system"},
+                    {"content", "chat template startup self-check"}
+                },
+                fastllm::JinjaVar {
+                    {"role", "user"},
+                    {"content", "Reply OK."}
+                }
+            }},
+            {"tools", fastllm::JinjaArray {}},
+            {"add_generation_prompt", 1},
+            {"enable_thinking", 1},
+            {"preserve_thinking", 1},
+            {"reasoning_effort", "xhigh"},
+            {"add_vision_id", 0}
+        };
+        const fastllm::ChatTemplateDryRunResult result =
+            fastllm::DryRunChatTemplate(
+                model->weight.tokenizer.chatTemplate, context);
+        status.valid = result.ok;
+        status.error = result.error;
+    }
+    {
+        std::lock_guard<std::mutex> guard(
+            chatTemplateStartupStatusMutex);
+        chatTemplateStartupStatus = status;
+    }
+    if (!status.valid) {
+        LogTs(
+            "[Load][CHAT_TEMPLATE_INVALID] stage=%s error=%s\n",
+            loadStage == nullptr ? "unknown" : loadStage,
+            status.error.empty() ? "unknown error" : status.error.c_str());
+        LogTs(
+            "[Load][CHAT_TEMPLATE_INVALID] direct non-raw requests will be "
+            "rejected; MakeInput fallback is disabled because non-canonical "
+            "prompts can break tool calls and output quality.\n");
+    } else if (model != nullptr &&
+               !model->weight.tokenizer.chatTemplate.empty()) {
+        LogTs("[Load] chat_template self-check passed (%s)\n",
+              loadStage == nullptr ? "unknown" : loadStage);
+    } else {
+        LogTs("[Load] no embedded chat_template; model-specific prompt "
+              "builder remains in use (%s)\n",
+              loadStage == nullptr ? "unknown" : loadStage);
+    }
+}
+
 // vLLM 风格的滚动窗口吞吐统计:prefill 在首 token 时入账,decode 每 token
 // 实时入账(长请求不遮罩),metrics 线程每 15s 读清。
 // decode tok/s 口径 = 窗口 tokens / 窗口墙钟秒(同 vLLM Avg throughput)。
@@ -1064,6 +1135,8 @@ struct WorkQueue {
                         model = fastllm::CreateLLMModelFromFile(
                             ::config.path,
                             ::config.multimodalProjectorPath);
+                        CheckLoadedChatTemplate(
+                            model.get(), "resume-disk-fallback");
                         model->SetTokenLimit(::config.tokens);
                         if (::config.chunkedPrefillSize > 0) {
                             model->SetChunkedPrefillSize(
@@ -1085,6 +1158,8 @@ struct WorkQueue {
                     model = fastllm::CreateLLMModelFromFile(
                         ::config.path,
                         ::config.multimodalProjectorPath);
+                    CheckLoadedChatTemplate(
+                        model.get(), "resume-disk");
                     model->SetTokenLimit(::config.tokens);
                     if (::config.chunkedPrefillSize > 0) {
                         model->SetChunkedPrefillSize(
@@ -1315,6 +1390,8 @@ struct WorkQueue {
                 fastllm::GetPersistentPrefixCacheStatus();
             const auto prefixStats =
                 fastllm::GetPrefixCacheStatsSnapshot();
+            const auto templateStatus =
+                GetChatTemplateStartupStatus();
             // 算子路由普查: 每类算子实际命中了哪条 kernel。
             // 判断标准(本模型 Qwen3.8-27B / V100 / turbo3 KV 下的预期):
             //   gguf.mmvq                 decode 主力(n<=8), 应占绝大多数调用
@@ -1596,6 +1673,15 @@ struct WorkQueue {
                             .maskedTokens},
                 {"toolcall_mask_emptied",
                     (double)fastllm::GetToolCallMaskEmptiedCount()},
+                {"chat_template_startup_valid",
+                    templateStatus.valid},
+                {"chat_template_startup_error",
+                    templateStatus.error},
+                {"chat_template_render_errors",
+                    (double)fastllm::
+                        GetChatTemplateRenderErrorCount()},
+                {"chat_template_fallback_count", 0.0},
+                {"chat_template_makeinput_fallback_on_error", false},
                 {"backend", "fastllm"}
             });
             return;
@@ -2530,6 +2616,8 @@ int main(int argc, char** argv) {
         : fastllm::CreateLLMModelFromFile(
               config.path, config.multimodalProjectorPath);
     workQueue.model->SetTokenLimit(config.tokens);
+    CheckLoadedChatTemplate(
+        workQueue.model.get(), "initial-load");
     if (config.chunkedPrefillSize > 0) {
         workQueue.model->SetChunkedPrefillSize(
             config.chunkedPrefillSize);

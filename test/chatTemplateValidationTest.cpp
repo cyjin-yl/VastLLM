@@ -1,4 +1,5 @@
 #include "template.h"
+#include "models/basellm.h"
 
 #include <cstdio>
 #include <string>
@@ -17,6 +18,22 @@ void Check(bool ok, const char *message) {
         failures++;
     }
 }
+
+struct TemplateProbeModel : fastllm::basellm {
+    int makeInputCalls = 0;
+
+    std::string MakeInput(const std::string &, int,
+                          const std::string &) override {
+        makeInputCalls++;
+        return "legacy-fallback";
+    }
+
+    std::string MakeHistory(const std::string &, int,
+                            const std::string &,
+                            const std::string &) override {
+        return "";
+    }
+};
 
 json11::Json ParseJson(const std::string &text) {
     std::string error;
@@ -94,6 +111,43 @@ void TestContextsStayIsolated() {
           "each render sees only its own context");
 }
 
+
+void TestRuntimeTemplateErrorNeverFallsBack() {
+    std::printf("[4] runtime Jinja failure is explicit and never calls MakeInput\n");
+    TemplateProbeModel model;
+    model.weight.tokenizer.chatTemplate = "{{ messages[0].content ";
+    const fastllm::ChatMessages messages = {{"user", "hello"}};
+    const long long before = fastllm::GetChatTemplateRenderErrorCount();
+    bool threw = false;
+    std::string error;
+    try {
+        (void)model.ApplyChatTemplate(messages);
+    } catch (const std::exception &caught) {
+        threw = true;
+        error = caught.what();
+    }
+    const long long after = fastllm::GetChatTemplateRenderErrorCount();
+    Check(threw, "invalid configured template throws to the request boundary");
+    Check(error.find("chat_template") != std::string::npos,
+          "exception names chat_template explicitly");
+    Check(model.makeInputCalls == 0,
+          "invalid configured template never calls MakeInput");
+    Check(after - before == 1,
+          "runtime template error counter increases exactly once");
+}
+
+void TestAbsentTemplateKeepsLegacyModelPath() {
+    std::printf("[5] models without a configured template keep MakeInput behavior\n");
+    TemplateProbeModel model;
+    model.weight.tokenizer.chatTemplate.clear();
+    const fastllm::ChatMessages messages = {{"user", "hello"}};
+    const std::string rendered =
+        model.ApplyChatTemplate(messages);
+    Check(rendered == "legacy-fallback",
+          "absent template uses the model-specific prompt builder");
+    Check(model.makeInputCalls == 1,
+          "absent template calls MakeInput exactly once");
+}
 }  // namespace
 
 int main() {
@@ -101,6 +155,8 @@ int main() {
     TestNestedJsonConversionAndRender();
     TestInvalidTemplateIsExplicit();
     TestContextsStayIsolated();
+    TestRuntimeTemplateErrorNeverFallsBack();
+    TestAbsentTemplateKeepsLegacyModelPath();
     std::printf("== %d/%d passed ==\n", checks - failures, checks);
     return failures == 0 ? 0 : 1;
 }

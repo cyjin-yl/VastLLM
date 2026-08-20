@@ -5846,6 +5846,12 @@ namespace fastllm {
         *cosDataPtr = this->deviceCosDatas[device];
     }
 
+    static std::atomic<long long> chatTemplateRenderErrorCount{0};
+
+    long long GetChatTemplateRenderErrorCount() {
+        return chatTemplateRenderErrorCount.load();
+    }
+
     JinjaVar ChatMessagesToJinjaVar(const ChatMessages &messages) {
         JinjaVar ret = {{"messages", fastllm::JinjaArray {}}};
         for (auto &message : messages) {
@@ -5883,23 +5889,7 @@ namespace fastllm {
             ret = MakeInput(ret, round, user);
             return ret;
         }
-        try {
-            return ApplyChatTemplate(ChatMessagesToJinjaVar(messages));
-        } catch (const std::exception &e) {
-            printf("[FastLLM] Jinja chat_template failed (%s), using MakeInput fallback.\n", e.what());
-            std::string ret = "";
-            std::string user = "";
-            int round = 0;
-            for (auto &message : messages) {
-                if (message.first == "user") {
-                    user = message.second;
-                } else if (message.first == "assistant") {
-                    ret = MakeHistory(ret, round++, user, message.second);
-                }
-            }
-            ret = MakeInput(ret, round, user);
-            return ret;
-        }
+        return ApplyChatTemplate(ChatMessagesToJinjaVar(messages));
     }
 
     std::vector <int> basellm::ApplyChatTemplateToTokens(const ChatMessages &messages) {
@@ -5923,8 +5913,35 @@ namespace fastllm {
                 local[it.first] = it.second["content"].string_value();
             }
         }
-        JinjaTemplate temp = JinjaTemplate(this->weight.tokenizer.chatTemplate);
-        return temp.Apply(local);
+        try {
+            JinjaTemplate temp(this->weight.tokenizer.chatTemplate);
+            return temp.Apply(local);
+        } catch (const std::exception &error) {
+            chatTemplateRenderErrorCount.fetch_add(
+                1, std::memory_order_relaxed);
+            const std::string message =
+                std::string("chat_template render failed; MakeInput fallback "
+                            "is disabled to prevent non-canonical prompts: ") +
+                error.what();
+            std::fprintf(
+                stderr,
+                "[FastLLM][CHAT_TEMPLATE_ERROR] %s\n"
+                "[FastLLM][CHAT_TEMPLATE_ERROR] request rejected; tool calls "
+                "and output quality would be unreliable after fallback.\n",
+                message.c_str());
+            std::fflush(stderr);
+            throw std::runtime_error(message);
+        } catch (...) {
+            chatTemplateRenderErrorCount.fetch_add(
+                1, std::memory_order_relaxed);
+            const std::string message =
+                "chat_template render failed with an unknown error; "
+                "MakeInput fallback is disabled";
+            std::fprintf(stderr, "[FastLLM][CHAT_TEMPLATE_ERROR] %s\n",
+                         message.c_str());
+            std::fflush(stderr);
+            throw std::runtime_error(message);
+        }
     }
 
     std::vector <int> basellm::ApplyChatTemplateToTokens(const JinjaVar &var) {
