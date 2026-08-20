@@ -1257,6 +1257,7 @@ namespace fastllm {
                 generationConfig.tool_call_parameter_name_constraint_enabled ||
                 generationConfig.tool_call_required_parameter_constraint_enabled;
         std::string constraintText = generatedText;
+        bool speculativePathValid = true;
         for (size_t row = 0; row <= proposedTokens.size(); row++) {
             GenerationConfig rowConfig = generationConfig;
             if (dynamicConstraint) {
@@ -1267,8 +1268,30 @@ namespace fastllm {
                         rowConfig.tool_call_allowed_token_ids,
                         &rowConfig.tool_call_blocked_token_ids);
             }
+            bool proposalAllowed = speculativePathValid;
+            if (proposalAllowed &&
+                row < proposedTokens.size()) {
+                const int proposal = proposedTokens[row];
+                if (!rowConfig.tool_call_allowed_token_ids.empty() &&
+                    !std::binary_search(
+                        rowConfig.tool_call_allowed_token_ids.begin(),
+                        rowConfig.tool_call_allowed_token_ids.end(),
+                        proposal)) {
+                    proposalAllowed = false;
+                }
+                if (std::binary_search(
+                        rowConfig.tool_call_blocked_token_ids.begin(),
+                        rowConfig.tool_call_blocked_token_ids.end(),
+                        proposal)) {
+                    proposalAllowed = false;
+                }
+            }
             rows.push_back(std::move(rowConfig));
             if (row == proposedTokens.size()) {
+                continue;
+            }
+            if (!proposalAllowed) {
+                speculativePathValid = false;
                 continue;
             }
             constraintText += weight.tokenizer.DecodeTokens(

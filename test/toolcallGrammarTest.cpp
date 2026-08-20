@@ -32,7 +32,7 @@ static const std::vector<std::string> VOCAB = {
     "s", "l", "_", "th", "ath", ">", "/etc", "/", "etc", "2", "\n",
     " ", "  ", "hello", "1", "10", "txt", ".", "readme", "><",
     "List", "Dir", "dir", "Depth", "depth",
-    "Bash", "ba", "sh", " sh",
+    "Bash", "bash", "ba", "sh", "ash", " sh",
 };
 
 static GenerationConfig MakeConfig() {
@@ -346,6 +346,15 @@ int main() {
     Check("I6.6 row4 换行后进入参数起点",
           speculativeRows.size() == 5 &&
           rowAllows(speculativeRows[4], tokenId("<parameter=")));
+
+    std::vector<GenerationConfig> prunedRows;
+    m.AppendToolCallConstraintRowConfigs(
+        "<tool_call>\n<function=", bashConfig,
+        {tokenId("ash"), tokenId(">")}, prunedRows);
+    Check("I6.7 非法 draft 后续行继承最后合法状态",
+          prunedRows.size() == 3 &&
+          rowAllows(prunedRows[1], tokenId("bash")) &&
+          rowAllows(prunedRows[2], tokenId("bash")));
 
     // ---- I7: 回归场景(循环形态) ----
     std::string loop = "<tool_call>\n<function=list_dir>\n"
