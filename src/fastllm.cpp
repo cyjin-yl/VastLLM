@@ -7574,6 +7574,8 @@ namespace fastllm {
         std::atomic<uint64_t> pcStatMissSinglePage{0};
         std::atomic<uint64_t> pcStatMissExtraMissing{0};
         std::atomic<uint64_t> pcStatMissMultimodalDisabled{0};
+        std::atomic<uint64_t> pcStatMissRemainderHasImage{0};
+        std::atomic<uint64_t> pcStatMissMmDeltaUnavailable{0};
         std::atomic<uint64_t> pcStatRecordAccepted{0};
         std::atomic<uint64_t> pcStatRecordRejectedMinHitsTokens{0};
         std::atomic<uint64_t> pcStatRecordRejectedCapacity{0};
@@ -7664,6 +7666,10 @@ namespace fastllm {
                 pcStatMissExtraMissing.fetch_add(1);
             } else if (std::strcmp(missReason, "multimodal-disabled") == 0) {
                 pcStatMissMultimodalDisabled.fetch_add(1);
+            } else if (std::strcmp(missReason, "remainder-has-image") == 0) {
+                pcStatMissRemainderHasImage.fetch_add(1);
+            } else if (std::strcmp(missReason, "mm-delta-unavailable") == 0) {
+                pcStatMissMmDeltaUnavailable.fetch_add(1);
             } else {
                 pcStatMissOther.fetch_add(1);
             }
@@ -7722,7 +7728,7 @@ namespace fastllm {
                    "hitTok=%llu/%llu (mem=%llu cpu=%llu disk=%llu) "
                    "miss{no-record=%llu probe-empty=%llu layer-min=%llu "
                    "single-page=%llu extra-missing=%llu mm-disabled=%llu "
-                   "evicted=%llu "
+                   "mm-remainder-img=%llu mm-no-delta=%llu evicted=%llu "
                    "below-thresh=%llu gen=%llu restore-fail=%llu other=%llu} "
                    "record{ok=%llu rej-min=%llu rej-cap=%llu rej-space=%llu rej-other=%llu} "
                    "evict{trie-nodes=%llu cpu-calls=%llu cpu-bytes=%llu} "
@@ -7740,6 +7746,8 @@ namespace fastllm {
                    (unsigned long long)s.missSinglePage,
                    (unsigned long long)s.missExtraMissing,
                    (unsigned long long)s.missMultimodalDisabled,
+                   (unsigned long long)s.missRemainderHasImage,
+                   (unsigned long long)s.missMmDeltaUnavailable,
                    (unsigned long long)s.missEvicted,
                    (unsigned long long)s.missBelowThreshold,
                    (unsigned long long)s.missGenerationMismatch,
@@ -7892,6 +7900,8 @@ namespace fastllm {
         s.missSinglePage = pcStatMissSinglePage.load();
         s.missExtraMissing = pcStatMissExtraMissing.load();
         s.missMultimodalDisabled = pcStatMissMultimodalDisabled.load();
+        s.missRemainderHasImage = pcStatMissRemainderHasImage.load();
+        s.missMmDeltaUnavailable = pcStatMissMmDeltaUnavailable.load();
         s.recordAccepted = pcStatRecordAccepted.load();
         s.recordRejectedMinHitsTokens = pcStatRecordRejectedMinHitsTokens.load();
         s.recordRejectedCapacity = pcStatRecordRejectedCapacity.load();

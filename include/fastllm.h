@@ -1021,6 +1021,10 @@ namespace fastllm {
         uint64_t missSinglePage = 0;      // 命中长度 >= 请求长度, 退一页后为 0
         uint64_t missExtraMissing = 0;    // paged 命中了, 但 GDN/linear 快照查不到
         uint64_t missMultimodalDisabled = 0;  // FASTLLM_PREFIX_CACHE_MULTIMODAL=0 主动跳过
+        // 【上游BUMP勿回退】带图请求被**主动拒绝复用**的两种情形。必须单独记,
+        // 不能静默退回全量 prefill —— 否则"命中率没到预期"查不出是这儿挡的。
+        uint64_t missRemainderHasImage = 0;   // 残段仍含 image/video token
+        uint64_t missMmDeltaUnavailable = 0;  // mRoPE 位置偏移补算不出来
         // 记录被拒原因分布(PageOutTrieNode / Record 路径)
         uint64_t recordAccepted = 0;
         uint64_t recordRejectedMinHitsTokens = 0;  // accessCount<minHits && tokens<minTokens

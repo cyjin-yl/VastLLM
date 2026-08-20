@@ -19317,6 +19317,32 @@ namespace fastllm {
 #endif
     }
 
+    // 【F9】读出这个请求的 mRoPE 位置偏移(ForwardMultimodal 的视觉分支写入)。
+    // 取不到就返回 false —— 调用方必须据此**退回旧路径**, 而不是当作 0 继续,
+    // 因为含图 prompt 的 delta 一般非 0, 当成 0 就是静默的位置错位。
+    static bool Qwen35MultimodalPositionDelta(const ResponseContext *context,
+                                              float &delta) {
+        if (context == nullptr) {
+            return false;
+        }
+        auto it = context->multimodalInput.find("mrope_position_delta");
+        if (it == context->multimodalInput.end() || it->second.empty() ||
+            it->second[0] == nullptr || it->second[0]->dims.empty()) {
+            return false;
+        }
+        Data cpu(*it->second[0]);
+        cpu.ToDevice(DataDevice::CPU);
+        if (cpu.dataType != DataType::FLOAT32) {
+            ToDataType(cpu, DataType::FLOAT32);
+            cpu.ToDevice(DataDevice::CPU);
+        }
+        if (cpu.cpuData == nullptr || cpu.Count(0) < 1) {
+            return false;
+        }
+        delta = ((float*)cpu.cpuData)[0];
+        return true;
+    }
+
     void Qwen3_5Model::Qwen35MTPLoop() {
 #ifndef USE_CUDA
         NewMainLoop();
@@ -19862,36 +19888,117 @@ namespace fastllm {
         //
         // 【默认关闭, 需要显式 FASTLLM_PREFIX_CACHE_MULTIMODAL=1 才开】
         //
-        // 除了上面那条"图像内容不进 key"的风险, 还有一条**当前尚未验证**的:
-        // 带图请求命中前缀后, ForwardMultimodal 会走它开头那个"续算"分支
-        //     if (pastKeyValues.size() > 0 && pastKeyValues[0].second.dims.size() > 0)
-        // (命中恢复时 RestorePagedPrefixCacheExtra 会给线性层(含 layer 0)写上
-        //  dims, 所以这个条件成立)。该分支**不做**视觉编码, 也不重算
-        // mm_token_type_ids / mrope_position_ids, 而是直接
-        //     AdjustPositionIdsWithDelta(positionIds, mrope_position_delta, ...)
-        // 然后调用普通 Forward。它的注释本来就写着"续 prefill(典型为前缀缓存
-        // HIT 之后)", 也就是说这条路是**被设计过**的 —— 因此**不会**触发
-        // BuildMultimodalPositionData 里的 imageGridThwList 断言, 不会 500。
+        // 曾经挡着这个开关的两个洞已经修了(见本文件 prepareMultimodalRestore
+        // 与 test/qwen35MultimodalPrefixPositionTest.cpp 的逐元素对拍):
+        //   (a) 命中后 mrope_position_delta 取不到 -> 位置整体偏移恰好 |delta|
+        //       (夹具 24; 生产约 3700 个图像 token 时是数千量级)。
+        //       现在在恢复点用完整 token 序列 + image_grid_thw 在 CPU 上补算。
+        //       用例结果: 24.000 -> 0.000。
+        //   (b) 残段仍含 image/video token 时整体平移根本修不回来(图像块内
+        //       mRoPE 三行互不相同, 实测残差 18.0) -> 现在直接拒绝复用,
+        //       记 miss=remainder-has-image, 退回全量 prefill。
         //
-        // 但读代码看有两个洞(均为静默, 都还**没有**在运行时复现过):
-        //   (a) mrope_position_delta 只在 ForwardMultimodal 的**视觉分支**里
-        //       写进 multimodalInput; PrepareMultimodalImageInputs 并不产出它。
-        //       前缀命中时该请求的视觉分支从未执行 -> delta 缺失 ->
-        //       走 else 分支 adjustedPositionIds.CopyFrom(positionIds), 即
-        //       纯顺序位置, 没有 mRoPE 修正。含图 prompt 的 delta 通常非 0。
-        //   (b) 落在**未命中残段**里的图片, 这条路上不会被 EncodeVisualItems
-        //       编码 -> 模型看到的是 <|image_pad|> 的普通 embedding, 不是图。
+        // 仍然默认关闭的原因只剩一个: **线上还没验过**。判据是
+        // vision 请求出现 hit>0 且 mgr-lookup-mismatch 保持 0。验过之后
+        // 可以把默认改成开启。
         //
-        // 纯文本路径没有这两个问题(FillLLMInputs 用
-        // intParams["promptLen"] = cacheLen + currentTokens.size() 接着算位置,
-        // 也没有视觉特征要合并)。
-        //
-        // 结论: 在 (a)(b) 被实测证伪或修好之前, 这个开关保持默认关闭。
-        // 见 EzraVastLLM/TODO.md 的 F10。
+        // 另有一条**已知并被接受**的风险(与上面无关): trie 的 key 是 token id,
+        // 图片在序列里只是重复的 <|image_pad|>, **图像内容不进 key**。
+        // 因此"同一会话内换图但周围文本不变 + 新旧图分辨率相同"会静默复用
+        // 上一张图的 KV。本机 agent 负载不触发(每轮原样重发历史图像)。
+        // 通用解见 EzraVastLLM/TODO.md 的 F8(把图像内容哈希折进页哈希)。
         static const bool multimodalPrefixRestoreEnabled = []() {
             const char *env = std::getenv("FASTLLM_PREFIX_CACHE_MULTIMODAL");
             return env != nullptr && env[0] != 0 && std::strcmp(env, "0") != 0;
         }();
+        // 【F10】带图请求命中前缀时必须先补两件事。判据来自
+        // test/qwen35MultimodalPrefixPositionTest.cpp 的逐元素对拍(纯 CPU):
+        //
+        //  (a) mrope_position_delta 只在 ForwardMultimodal 的**视觉分支**里产生,
+        //      而命中之后走的是开头那个"续算"分支, 视觉分支根本不跑 -> 取不到
+        //      delta -> AdjustPositionIdsWithDelta 退化成纯顺序位置, 整段偏移
+        //      **恰好 |delta|**(夹具 32 个图像 token -> 24; 生产约 3700 个图像
+        //      token -> 数千量级)。这里用完整 currentTokens + image_grid_thw
+        //      在 **CPU 上补算**出来存回去 —— 不需要视觉塔:
+        //      BuildMultimodalPositionData 只吃 token id 和 grid, 而
+        //      EncodeVisualItems 的 grid 也正是直接读 image_grid_thw 并断言尺寸
+        //      一致, 两边同源。
+        //
+        //  (b) 残段里若还含 image/video token, 续算分支既不会给它们视觉特征,
+        //      位置也修不回来 —— 图像块内 mRoPE 的三行 (t,h,w) 互不相同, 而
+        //      整体平移只能给出三行相同的值(实测残差 18.0)。这种情况**拒绝
+        //      复用**, 退回全量 prefill, 并且**显式记数**(remainder-has-image),
+        //      不要静默退回: 否则以后有人看到"命中率没到预期"会不知道是这儿挡的。
+        //
+        // 返回 nullptr = 可以复用; 否则返回该记的 miss 原因。
+        auto prepareMultimodalRestore =
+                [&](ResponseContext *ctx, int cachedLen) -> const char* {
+            if (ctx == nullptr || ctx->multimodalInput.empty() || cachedLen <= 0) {
+                return nullptr;
+            }
+            const int total = (int)ctx->currentTokens.size();
+            for (int i = cachedLen; i < total; i++) {
+                const int id = ctx->currentTokens[i];
+                if (id == model->image_token_id || id == model->video_token_id) {
+                    return "remainder-has-image";
+                }
+            }
+            auto deltaIt = ctx->multimodalInput.find("mrope_position_delta");
+            if (deltaIt != ctx->multimodalInput.end() &&
+                !deltaIt->second.empty() && deltaIt->second[0] != nullptr &&
+                !deltaIt->second[0]->dims.empty()) {
+                return nullptr;
+            }
+            auto gridList = [&](const char *key) {
+                std::vector<std::vector<int> > out;
+                auto it = ctx->multimodalInput.find(key);
+                if (it == ctx->multimodalInput.end() || it->second.empty() ||
+                    it->second[0] == nullptr) {
+                    return out;
+                }
+                Data cpu(*it->second[0]);
+                cpu.ToDevice(DataDevice::CPU);
+                if (cpu.dims.size() != 2 || cpu.dims[1] != 3 ||
+                    cpu.cpuData == nullptr) {
+                    return out;
+                }
+                const int32_t *v = (const int32_t*)cpu.cpuData;
+                for (int i = 0; i < cpu.dims[0]; i++) {
+                    out.push_back({v[i * 3], v[i * 3 + 1], v[i * 3 + 2]});
+                }
+                return out;
+            };
+            std::vector<std::vector<int> > imageGrids = gridList("image_grid_thw");
+            std::vector<std::vector<int> > videoGrids = gridList("video_grid_thw");
+            if (total <= 0) {
+                return "mm-delta-unavailable";
+            }
+            std::vector<float> idsFloat(ctx->currentTokens.begin(),
+                                        ctx->currentTokens.end());
+            Data fullIds(DataType::FLOAT32, {1, (int)idsFloat.size()}, idsFloat);
+            Data mmTypes, mrope, delta;
+            try {
+                model->BuildMultimodalPositionData(
+                    fullIds, imageGrids, videoGrids, mmTypes, mrope, delta);
+            } catch (...) {
+                // grid 与 token 序列对不上就别复用 —— 宁可全量 prefill,
+                // 也不要拿一个算错的 delta 去平移位置。
+                return "mm-delta-unavailable";
+            }
+            if (delta.dims.empty()) {
+                return "mm-delta-unavailable";
+            }
+            Data *stored = new Data();
+            stored->CopyFrom(delta);
+            auto &slot = ctx->multimodalInput["mrope_position_delta"];
+            for (Data *old : slot) {
+                delete old;
+            }
+            slot.clear();
+            slot.push_back(stored);
+            return nullptr;
+        };
+
         auto tryRestorePrefixCache = [&](ResponseContext *ctx) -> int {
             if (ctx == nullptr || ctx->cacheLen != 0 || ctx->currentTokens.empty()) {
                 return 0;
@@ -20034,6 +20141,17 @@ namespace fastllm {
                 return 0;
             }
             cachedLen = minCachedPages * probeManager->pageLen;
+            if (const char *mmRefuse = prepareMultimodalRestore(ctx, cachedLen)) {
+                if (PrefixCacheStatsEnabled()) {
+                    printf("[PrefixCache] miss-detail: multimodal restore refused "
+                           "(%s) at cachedLen=%d/%d\n",
+                           mmRefuse, cachedLen, prefixQueryTotalTokens);
+                    fflush(stdout);
+                }
+                PrefixCacheStatsObserveRequest(
+                    prefixQueryTotalTokens, 0, nullptr, mmRefuse);
+                return 0;
+            }
             if (!model->RestorePagedPrefixCacheExtra(ctx, cachedLen)) {
                 PrefixCacheStatsObserveRequest(
                     prefixQueryTotalTokens, 0, nullptr, "restore-failed");
@@ -21110,7 +21228,21 @@ namespace fastllm {
                         continue;
                     }
 
-                    bool isMultimodal = !ctx->multimodalInput.empty();
+                    // 【F9】prefill 做完之后, 带图请求回到**普通 decode 路径**,
+                    // 这样才吃得到 MTP 草稿。改之前: multimodalInput 只在
+                    // ~ResponseContext 里清除 -> isMultimodal 整个生命周期为真 ->
+                    // 每个 decode token 都走 ForwardMultimodal 的通用前向,
+                    // 绕过 ForwardGPU 与 MTP。实测(生产日志按 start->done 窗口
+                    // 归因): vision 窗口 19 个 / decode 8734 token /
+                    // pos_accept_rate 行 **0**; text 窗口 47 个 / 11404 token /
+                    // 21 行。即 MTP 对带图流量从未生效, 而本机 agent 流量 100% 带图。
+                    //
+                    // 【前置依赖, 回退会变成静默数据损坏】两条前向路径挂的分页 KV
+                    // manager 必须是同一批, 否则同一个请求的 KV 会被劈进两个页池。
+                    // 这由 PagedCacheLayerBase() 保证(见它上面的长注释)。**如果有人
+                    // 回退了那处修复, 这里的中途切换就会静默损坏缓存。**
+                    bool isMultimodal = !ctx->multimodalInput.empty() &&
+                                        !ctx->multimodalPrefillDone;
                     if (selectedMultimodal && !isMultimodal) {
                         continue;
                     }
@@ -21287,13 +21419,32 @@ namespace fastllm {
                             } else {
                                 float position = ctx->allTokens.empty() ?
                                     0.0f : (float)((int)ctx->allTokens.size() - 1);
-                                decodePositionValues.push_back(position);
-                                decodePositionIds.emplace_back(
-                                    DataType::FLOAT32, decodeScalarDims,
-                                    DataDevice::CPU,
-                                    (void*)&decodePositionValues.back());
-                                positionIds.push_back(
-                                    &decodePositionIds.back());
+                                // 【F9】带图请求的位置不是纯顺序的: 图片块在 mRoPE 下
+                                // 压缩了位置步进, 差值记在 mrope_position_delta 里
+                                // (原来由 ForwardMultimodal 的续算分支
+                                //  AdjustPositionIdsWithDelta 施加)。既然 decode 改走
+                                // 普通路径, 这里必须自己把 delta 加回去, 并按 {3,1}
+                                // 交给 GPU —— Qwen35CudaApplyRotary 看到 dims[0]==3
+                                // 才会走 Qwen35InterleavedRope。漏掉就是**静默**的
+                                // 位置错位。
+                                float mropeDelta = 0.0f;
+                                if (!ctx->multimodalInput.empty() &&
+                                    Qwen35MultimodalPositionDelta(ctx, mropeDelta)) {
+                                    Data *mropePos = new Data();
+                                    ownedPositionIds.push_back(mropePos);
+                                    mropePos->CopyFrom(Data(
+                                        DataType::FLOAT32, {3, 1},
+                                        std::vector<float>(3, position + mropeDelta)));
+                                    positionIds.push_back(mropePos);
+                                } else {
+                                    decodePositionValues.push_back(position);
+                                    decodePositionIds.emplace_back(
+                                        DataType::FLOAT32, decodeScalarDims,
+                                        DataDevice::CPU,
+                                        (void*)&decodePositionValues.back());
+                                    positionIds.push_back(
+                                        &decodePositionIds.back());
+                                }
                             }
                             ctx->preTokens += 1;
                         } else {
@@ -21304,6 +21455,25 @@ namespace fastllm {
                             }
                             seqLens.push_back(seqLen);
 
+                            // 【F9】同上: 带图请求要 {3, seqLen} 的 mRoPE 位置。
+                            // MTP 验证一次喂多个 token 走的就是这一支。
+                            float mropeDeltaMulti = 0.0f;
+                            const bool useMropeMulti =
+                                !ctx->multimodalInput.empty() &&
+                                Qwen35MultimodalPositionDelta(ctx, mropeDeltaMulti);
+                            if (useMropeMulti) {
+                                std::vector<float> vMrope(3 * seqLen, 0.0f);
+                                for (int row = 0; row < 3; row++) {
+                                    for (int i = 0; i < seqLen; i++) {
+                                        vMrope[row * seqLen + i] =
+                                            (float)(startPosition + i) + mropeDeltaMulti;
+                                    }
+                                }
+                                positionIds.push_back(new Data());
+                                ownedPositionIds.push_back(positionIds.back());
+                                positionIds.back()->CopyFrom(
+                                    Data(DataType::FLOAT32, {3, seqLen}, vMrope));
+                            } else {
                             std::vector<float> vPositionIds(seqLen, 0.0f);
                             for (int i = 0; i < seqLen; i++) {
                                 vPositionIds[i] = (float)(startPosition + i);
@@ -21312,6 +21482,7 @@ namespace fastllm {
                             ownedPositionIds.push_back(positionIds.back());
                             positionIds.back()->CopyFrom(
                                 Data(DataType::FLOAT32, {1, seqLen}, vPositionIds));
+                            }
 
                             if (model->NeedAttentionMask(seqLen, keyLen)) {
                                 std::vector<float> vmask(seqLen * keyLen, 0.0f);
@@ -21763,6 +21934,16 @@ namespace fastllm {
                         singleContext->generationConfig,
                         tokensManager,
                         &logits);
+                    // 【F9】这一轮 prompt 前向做完 = 视觉分支已经跑过, 也就已经把
+                    // mrope_position_delta 写进 multimodalInput。之后的 decode 交给
+                    // 普通路径(能吃 MTP), 位置由 delta 续算。
+                    // **拿不到 delta 就不切**: 宁可维持改前的慢路径, 也不要让 decode
+                    // 用纯顺序位置去跑一个含图的序列(那是静默错误)。
+                    float mropeDeltaProbe = 0.0f;
+                    if (selectedIsPrompt &&
+                        Qwen35MultimodalPositionDelta(singleContext, mropeDeltaProbe)) {
+                        singleContext->multimodalPrefillDone = true;
+                    }
                 } else if (seqLens.size() == 1 && selectedIsPrompt &&
                            seqLens[0] > prefillChunkSize && singleContext != nullptr) {
                     int len = seqLens[0];

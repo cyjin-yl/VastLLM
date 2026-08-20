@@ -73,6 +73,13 @@ namespace fastllm {
         std::vector <std::pair <Data, Data> > pastKeyValues;
         std::vector <int> currentTokens;
         std::map <std::string, std::vector <Data*> > multimodalInput;
+        // 【上游BUMP勿回退】"多模态 prefill 已经做完了"。
+        // **不要**改成"清空 multimodalInput"来表达这件事: 视觉元数据在整个请求
+        // 生命周期里都还要用 —— decode 的位置要靠 mrope_position_delta 续算,
+        // abort / 重试 / 投机验证回滚也都可能回到需要它们的状态。
+        // 这个标记只回答一个问题: **这一轮前向要不要走 ForwardMultimodal**。
+        // 见 qwen3_5.cpp Qwen35MTPLoop 里 isMultimodal 的算法。
+        bool multimodalPrefillDone = false;
         std::queue <int> resultTokenQueue;
         std::queue <std::vector <float>*> resultLogits;
         GenerationConfig generationConfig;

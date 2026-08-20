@@ -644,6 +644,12 @@ if (UNIT_TEST)
     add_executable(testPrefixCacheRouting test/prefixCacheRoutingTest.cpp)
     target_link_libraries(testPrefixCacheRouting fastllm)
 
+    # 多模态请求命中前缀之后的 mRoPE 位置逐元素对拍。端到端"输出看着通顺"
+    # 证明不了位置没有小幅整体错位, 只有对拍能判定。纯 CPU, 不需要权重/GPU。
+    add_executable(testQwen35MultimodalPrefixPosition
+        test/qwen35MultimodalPrefixPositionTest.cpp)
+    target_link_libraries(testQwen35MultimodalPrefixPosition fastllm)
+
     # 算子路由普查 + SM70 IQ4_XS MMQ 形状资格。
     # 这两件事的共同点是"数字边界决定整块代码有没有被用到", 而且走错路
     # **完全静默**(结果对, 只是慢)。已经因此误判过两次: 把恒不生效的
