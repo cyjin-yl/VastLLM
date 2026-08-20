@@ -1474,23 +1474,24 @@ namespace fastllm {
         return diff > 1e-6f || diff < -1e-6f;
     }
 
-    static bool Qwen35MtpSupportsGenerationConfig(
+    bool Qwen35MtpSupportsGenerationConfig(
             const GenerationConfig &config) {
-        // mask(工具调用约束)仍禁用 MTP: verify 采样的 mask 需要 GPU kernel 支持,
-        // 工具调用窗口很短, 走非投机路径更简单可靠。
-        // repeat_penalty 已支持: verify 前向携带 LastTokensManager,
-        // typical/greedy 采样 kernel 会对 verify 分布应用惩罚。
-        if (config.output_logits ||
-            !config.tool_call_allowed_token_ids.empty() ||
-            !config.tool_call_blocked_token_ids.empty()) {
+        // 动态工具约束由 speculative verify 的逐行配置和 GPU logits mask
+        // 精确处理；不能再因为 allowed/blocked 非空退回普通 decode。
+        // repeat_penalty 同样由 verify 前向的 LastTokensManager 处理。
+        if (config.output_logits) {
             return false;
         }
         if (config.IsSimpleGreedy()) {
             return true;
         }
-        return config.top_k > 1 &&
+        return config.top_k >= 1 && config.top_k <= 50 &&
+               std::isfinite(config.temperature) &&
                config.temperature > 0.0f &&
-               config.top_p > 0.0f && config.top_p <= 1.0f;
+               std::isfinite(config.top_p) &&
+               config.top_p > 0.0f && config.top_p <= 1.0f &&
+               std::isfinite(config.repeat_penalty) &&
+               config.repeat_penalty > 0.0f;
     }
 
     static bool Qwen35GpuTokenHandoffSupportsGenerationConfig(
@@ -2122,6 +2123,23 @@ namespace fastllm {
 
         static thread_local Qwen35GpuTokenHandoffControl
             *qwen35GpuTokenHandoffControl = nullptr;
+
+        static thread_local const std::vector<GenerationConfig>
+            *qwen35SpeculativeRowConfigs = nullptr;
+
+        struct Qwen35ScopedSpeculativeRowConfigs {
+            const std::vector<GenerationConfig> *previous = nullptr;
+
+            explicit Qwen35ScopedSpeculativeRowConfigs(
+                    const std::vector<GenerationConfig> *configs) {
+                previous = qwen35SpeculativeRowConfigs;
+                qwen35SpeculativeRowConfigs = configs;
+            }
+
+            ~Qwen35ScopedSpeculativeRowConfigs() {
+                qwen35SpeculativeRowConfigs = previous;
+            }
+        };
 
         struct Qwen35ScopedGpuTokenHandoffControl {
             Qwen35GpuTokenHandoffControl *previous = nullptr;
@@ -6821,6 +6839,68 @@ namespace fastllm {
             return ret;
         }
 
+        static bool Qwen35ApplyCudaTokenConstraints(
+                Data &fullLogits,
+                int batch,
+                const std::vector<GenerationConfig> &generationConfigs) {
+            const int vocabSize = fullLogits.dims.empty() ?
+                0 : fullLogits.dims.back();
+            if (batch <= 0 || vocabSize <= 0 ||
+                (int)generationConfigs.size() < batch) {
+                return false;
+            }
+            bool needsMask = false;
+            for (int b = 0; b < batch; b++) {
+                if (!generationConfigs[b].
+                        tool_call_allowed_token_ids.empty() ||
+                    !generationConfigs[b].
+                        tool_call_blocked_token_ids.empty()) {
+                    needsMask = true;
+                    break;
+                }
+            }
+            if (!needsMask) {
+                return true;
+            }
+
+            static thread_local std::vector<uint8_t> mask;
+            mask.assign((size_t)batch * vocabSize, 1);
+            for (int b = 0; b < batch; b++) {
+                const GenerationConfig &config =
+                    generationConfigs[b];
+                uint8_t *row =
+                    mask.data() + (size_t)b * vocabSize;
+                if (!config.tool_call_allowed_token_ids.empty()) {
+                    std::memset(row, 0, vocabSize);
+                    for (int token :
+                         config.tool_call_allowed_token_ids) {
+                        if (token >= 0 && token < vocabSize) {
+                            row[token] = 1;
+                        }
+                    }
+                }
+                for (int token :
+                     config.tool_call_blocked_token_ids) {
+                    if (token >= 0 && token < vocabSize) {
+                        row[token] = 0;
+                    }
+                }
+                bool anyAllowed = false;
+                for (int token = 0; token < vocabSize; token++) {
+                    if (row[token] != 0) {
+                        anyAllowed = true;
+                        break;
+                    }
+                }
+                if (!anyAllowed) {
+                    std::memset(row, 1, vocabSize);
+                }
+            }
+            return FastllmCudaApplyTokenMask(
+                (float*)fullLogits.cudaData,
+                mask.data(), batch, vocabSize);
+        }
+
         static std::vector<int> Qwen35SampleFromRootCudaLogits(
                 int rootDevice,
                 Data &fullLogits,
@@ -6835,6 +6915,10 @@ namespace fastllm {
                 std::vector<int> *typicalRecoveredIds = nullptr,
                 const std::vector<std::vector<std::pair<int, float> > > *rowPenalties = nullptr) {
             FastllmCudaSetDevice(rootDevice);
+            AssertInFastLLM(
+                Qwen35ApplyCudaTokenConstraints(
+                    fullLogits, batch, generationConfigs),
+                "Qwen3.5 CUDA token-constraint mask failed.\n");
             std::vector<int> lastRet;
             lastRet.reserve(batch);
             if (!allSimple) {
@@ -15432,7 +15516,13 @@ namespace fastllm {
                         }
                     }
                     for (int token = 0; token < seqLens[b]; token++) {
-                        rowConfigs.push_back(generationConfigs[b]);
+                        const bool hasRowConfigOverride =
+                            qwen35SpeculativeRowConfigs != nullptr &&
+                            (int)qwen35SpeculativeRowConfigs->size() ==
+                                logitRows;
+                        rowConfigs.push_back(hasRowConfigOverride ?
+                            (*qwen35SpeculativeRowConfigs)[rowCursor] :
+                            generationConfigs[b]);
                         rowPenalties[rowCursor] = unitPenalty;
                         rowCursor++;
                     }
@@ -16730,6 +16820,8 @@ namespace fastllm {
             context != nullptr) {
             mtpLastTokens.units.push_back(context->tokens);
         }
+        std::vector<GenerationConfig>
+            speculativeConstraintRowConfigs;
         auto runTargetWithPast = [&](const Data &curInputIds,
                                      const std::vector<Data*> &curAttentionMask,
                                      const std::vector<Data*> &curPositionIds,
@@ -16742,6 +16834,11 @@ namespace fastllm {
             speculativeHiddenStates.strides.clear();
             speculativeHiddenStates.expansionDims.clear();
             std::vector<int> ret;
+            const std::vector<GenerationConfig> *rowConfigs =
+                speculativeConstraintRowConfigs.empty() ?
+                nullptr : &speculativeConstraintRowConfigs;
+            Qwen35ScopedSpeculativeRowConfigs rowConfigScope(
+                rowConfigs);
             try {
                 ret = ForwardGPU(1, curInputIds, curAttentionMask,
                                  curPositionIds, curSeqLens,
@@ -16992,6 +17089,33 @@ namespace fastllm {
         bool isSpeculativeValidation =
             seqLen >= 2 && seqLen <= mtpDraftsPerStep + 1 &&
             mtpCache.tokens > 0 && context->preTokens > seqLen;
+        if (isSpeculativeValidation &&
+            (generationConfigs[0].
+                 tool_call_name_constraint_enabled ||
+             generationConfigs[0].
+                 tool_call_parameter_name_constraint_enabled ||
+             generationConfigs[0].
+                 tool_call_required_parameter_constraint_enabled)) {
+            std::vector<int> proposedTokens;
+            proposedTokens.reserve(seqLen - 1);
+            for (int row = 1; row < seqLen; row++) {
+                proposedTokens.push_back(tokenAt(row));
+            }
+            speculativeConstraintRowConfigs.reserve(seqLen);
+            AppendToolCallConstraintRowConfigs(
+                context->toolCallConstraintGeneratedText,
+                generationConfigs[0], proposedTokens,
+                speculativeConstraintRowConfigs);
+            const size_t constrainedRows = std::count_if(
+                speculativeConstraintRowConfigs.begin(),
+                speculativeConstraintRowConfigs.end(),
+                [](const GenerationConfig &config) {
+                    return !config.tool_call_allowed_token_ids.empty() ||
+                           !config.tool_call_blocked_token_ids.empty();
+                });
+            MtpAttributionObserveConstrainedVerifyRows(
+                constrainedRows);
+        }
         if (!isSpeculativeValidation) {
             targetRet = runTargetSeed(inputIds, attentionMask, positionIds, seqLens);
             mtpProfileMark(mtpProfileTargetUs);
@@ -18845,8 +18969,50 @@ namespace fastllm {
                 mtpLastTokens.units.push_back(LastTokensUnit());
             }
         }
+        Data inputCpu;
+        inputCpu.CopyFrom(inputIds);
+        inputCpu.ToDevice(DataDevice::CPU);
+        if (inputCpu.dataType != DataType::FLOAT32) {
+            ToDataType(inputCpu, DataType::FLOAT32);
+            inputCpu.ToDevice(DataDevice::CPU);
+        }
+        float *inputPtr = (float*)inputCpu.cpuData;
+        std::vector<int> tokenOffsets(batch, 0);
+        std::vector<int> captureOffsets(batch, 0);
+        for (int b = 1; b < batch; b++) {
+            tokenOffsets[b] = tokenOffsets[b - 1] + seqLens[b - 1];
+            captureOffsets[b] = captureOffsets[b - 1] + seqLens[b - 1] - 1;
+        }
+        std::vector<GenerationConfig> constraintRowConfigs;
+        constraintRowConfigs.reserve(totalTokens);
+        for (int b = 0; b < batch; b++) {
+            std::vector<int> proposedTokens;
+            proposedTokens.reserve(
+                std::max(0, seqLens[b] - 1));
+            for (int row = 1; row < seqLens[b]; row++) {
+                proposedTokens.push_back((int)(
+                    inputPtr[tokenOffsets[b] + row] +
+                    1.0e-3f));
+            }
+            AppendToolCallConstraintRowConfigs(
+                contexts[b] == nullptr ? std::string() :
+                    contexts[b]->toolCallConstraintGeneratedText,
+                generationConfigs[b], proposedTokens,
+                constraintRowConfigs);
+        }
+        const size_t constrainedRows = std::count_if(
+            constraintRowConfigs.begin(),
+            constraintRowConfigs.end(),
+            [](const GenerationConfig &config) {
+                return !config.tool_call_allowed_token_ids.empty() ||
+                       !config.tool_call_blocked_token_ids.empty();
+            });
+        MtpAttributionObserveConstrainedVerifyRows(
+            constrainedRows);
         std::vector<int> targetRet;
         try {
+            Qwen35ScopedSpeculativeRowConfigs
+                rowConfigScope(&constraintRowConfigs);
             targetRet = ForwardGPU(batch, inputIds, attentionMask, positionIds,
                                    seqLens, pastKeyValues, generationConfigs,
                                    mtpLastTokens, nullptr);
@@ -18870,20 +19036,6 @@ namespace fastllm {
             return false;
         }
 
-        Data inputCpu;
-        inputCpu.CopyFrom(inputIds);
-        inputCpu.ToDevice(DataDevice::CPU);
-        if (inputCpu.dataType != DataType::FLOAT32) {
-            ToDataType(inputCpu, DataType::FLOAT32);
-            inputCpu.ToDevice(DataDevice::CPU);
-        }
-        float *inputPtr = (float*)inputCpu.cpuData;
-        std::vector<int> tokenOffsets(batch, 0);
-        std::vector<int> captureOffsets(batch, 0);
-        for (int b = 1; b < batch; b++) {
-            tokenOffsets[b] = tokenOffsets[b - 1] + seqLens[b - 1];
-            captureOffsets[b] = captureOffsets[b - 1] + seqLens[b - 1] - 1;
-        }
         bool needsTypicalAcceptance = false;
         if (!Qwen35MtpExactAcceptance()) {
             for (int b = 0; b < batch; b++) {

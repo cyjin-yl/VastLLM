@@ -3119,9 +3119,13 @@ static void FastllmReportSm70AttentionRouteOnce(const fastllm::Data &kCaches,
     }
     const char *xqaEnv = std::getenv("FASTLLM_CUDA_SM70_PAGED_XQA");
     const char *flashEnv = std::getenv("FASTLLM_CUDA_SM70_FLASH_ATTN");
+    const char *turboXqaEnv =
+        std::getenv("FASTLLM_CUDA_SM70_TURBO_XQA");
     const bool xqaSet = xqaEnv != nullptr && xqaEnv[0] != '\0';
     const bool flashSet = flashEnv != nullptr && flashEnv[0] != '\0';
-    if (!xqaSet && !flashSet) {
+    const bool turboXqaSet =
+        turboXqaEnv != nullptr && turboXqaEnv[0] != '\0';
+    if (!xqaSet && !flashSet && !turboXqaSet) {
         return;
     }
     const fastllm::Data *pagedK = kCaches.pagedKVCacheData;
@@ -3136,17 +3140,32 @@ static void FastllmReportSm70AttentionRouteOnce(const fastllm::Data &kCaches,
     const bool flashReachable = pagedK != nullptr && pagedV != nullptr &&
         pagedK->dataType == fastllm::DataType::FP8_E4M3 &&
         pagedV->dataType == fastllm::DataType::FP8_E4M3;
+    const bool turbo3XqaReachable =
+        pagedK != nullptr && pagedV != nullptr &&
+        pagedK->dataType == fastllm::DataType::Q8_0_KV &&
+        pagedV->dataType == fastllm::DataType::TURBO3_KV;
     printf("[Fastllm][sm70-attn] 分页 KV dtype: K=%s V=%s\n",
            kName.c_str(), vName.c_str());
+    if (turboXqaSet && turbo3XqaReachable) {
+        printf("[Fastllm][sm70-attn] FASTLLM_CUDA_SM70_TURBO_XQA=%s: "
+               "打包 turbo3 融合 XQA 对 qLen=1..4 可达；实际命中看 "
+               "/props 的 attn.sm70_turbo_xqa。\n", turboXqaEnv);
+    } else if (turboXqaSet &&
+               pagedV != nullptr &&
+               pagedV->dataType == fastllm::DataType::TURBO4_KV) {
+        printf("[Fastllm][sm70-attn] FASTLLM_CUDA_SM70_TURBO_XQA=%s 不可达: "
+               "当前融合 kernel 只支持 V=turbo3，turbo4 尚未移植。\n",
+               turboXqaEnv);
+    }
     if (xqaSet && !xqaReachable) {
         printf("[Fastllm][sm70-attn] FASTLLM_CUDA_SM70_PAGED_XQA=%s 不起作用: "
-               "该路径要求分页 K/V 均为 float16, 当前不是 -> 开关取任何值结果都一样。\n",
-               xqaEnv);
+               "这是旧 FP16-KV XQA 路径，要求分页 K/V 均为 float16；"
+               "不影响上面的打包 turbo3 XQA。\n", xqaEnv);
     }
     if (flashSet && !flashReachable) {
         printf("[Fastllm][sm70-attn] FASTLLM_CUDA_SM70_FLASH_ATTN=%s 不起作用: "
-               "该路径要求分页 K/V 均为 fp8_e4m3, 当前不是 -> 开关取任何值结果都一样。\n",
-               flashEnv);
+               "这是旧 FP8-KV 短 prefill 路径，要求分页 K/V 均为 fp8_e4m3；"
+               "packed turbo3/4 prefill 尚未移植。\n", flashEnv);
     }
     fflush(stdout);
 }

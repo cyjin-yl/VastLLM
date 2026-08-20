@@ -1101,6 +1101,9 @@ bool FastllmCudaQwen35QGateKVPrefill(
 bool FastllmCudaAdvanceDecodeMeta(
     int32_t *insertPositions, int32_t *lastPageLens, int batch);
 bool FastllmCudaRepeatPenalty (fastllm::Data &input, fastllm::Data &penalty, fastllm::Data &penaltyScale);
+bool FastllmCudaApplyTokenMask(
+    float *logits, const uint8_t *hostMask,
+    int batch, int vocabSize);
 bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
                                   int *topKArr, float *topPArr,
                                   int *output,

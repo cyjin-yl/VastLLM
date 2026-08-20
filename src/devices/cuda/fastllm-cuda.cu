@@ -13755,6 +13755,48 @@ __global__ void FastllmTypicalAcceptanceKernel(
     }
 }
 
+
+__global__ void FastllmApplyTokenMaskKernel(
+        float *logits, const uint8_t *mask, size_t count) {
+    size_t index =
+        (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < count && mask[index] == 0) {
+        logits[index] = -1.0e30f;
+    }
+}
+
+bool FastllmCudaApplyTokenMask(
+        float *logits, const uint8_t *hostMask,
+        int batch, int vocabSize) {
+    if (batch <= 0) {
+        return true;
+    }
+    if (logits == nullptr || hostMask == nullptr ||
+        vocabSize <= 0) {
+        return false;
+    }
+    const size_t count = (size_t)batch * vocabSize;
+    uint8_t *cudaMask =
+        (uint8_t*)FastllmCudaMalloc(count);
+    if (cudaMask == nullptr) {
+        return false;
+    }
+    FastllmCudaCopyFromHostToDevice(
+        cudaMask, (void*)hostMask, count);
+    constexpr int threads = 256;
+    const int blocks =
+        (int)((count + threads - 1) / threads);
+    FastllmApplyTokenMaskKernel<<<blocks, threads>>>(
+        logits, cudaMask, count);
+    cudaError_t status = cudaGetLastError();
+    if (status == cudaSuccess) {
+        // cudaMask comes from FastLLM's reusable pool. Do not make it
+        // available to another worker until this kernel has consumed it.
+        status = cudaDeviceSynchronize();
+    }
+    FastllmCudaFree(cudaMask);
+    return status == cudaSuccess;
+}
 // 前置声明: 定义在本文件后部, FastllmCudaTopKTopPSamplingWithTypicalAcceptance 要用
 template <int BLOCK_THREADS>
 __global__ void FastllmRepeatPenaltyFactorsKernel(

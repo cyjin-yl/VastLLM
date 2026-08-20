@@ -1181,6 +1181,39 @@ namespace fastllm {
         allowedIdsOut = std::move(allowedIds);
     }
 
+    void basellm::AppendToolCallConstraintRowConfigs(
+            const std::string &generatedText,
+            const GenerationConfig &generationConfig,
+            const std::vector<int> &proposedTokens,
+            std::vector<GenerationConfig> &rows) {
+        const bool dynamicConstraint =
+                generationConfig.tool_call_name_constraint_enabled ||
+                generationConfig.tool_call_parameter_name_constraint_enabled ||
+                generationConfig.tool_call_required_parameter_constraint_enabled;
+        std::string constraintText = generatedText;
+        for (size_t row = 0; row <= proposedTokens.size(); row++) {
+            GenerationConfig rowConfig = generationConfig;
+            if (dynamicConstraint) {
+                rowConfig.tool_call_allowed_token_ids.clear();
+                rowConfig.tool_call_blocked_token_ids.clear();
+                EvaluateToolCallConstraintText(
+                        constraintText, rowConfig,
+                        rowConfig.tool_call_allowed_token_ids,
+                        &rowConfig.tool_call_blocked_token_ids);
+            }
+            rows.push_back(std::move(rowConfig));
+            if (row == proposedTokens.size()) {
+                continue;
+            }
+            constraintText += weight.tokenizer.DecodeTokens(
+                    {proposedTokens[row]});
+            if (constraintText.size() > 8192) {
+                constraintText.erase(
+                        0, constraintText.size() - 8192);
+            }
+        }
+    }
+
     void basellm::PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig) {
         generationConfig.tool_call_allowed_token_ids.clear();
         generationConfig.tool_call_blocked_token_ids.clear();

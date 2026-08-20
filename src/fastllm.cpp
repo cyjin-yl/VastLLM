@@ -7898,6 +7898,8 @@ namespace fastllm {
         std::atomic<uint64_t> mtpAttrStepsMultimodal{0};
         std::atomic<uint64_t> mtpAttrPrefillDoneFlips{0};
         std::atomic<uint64_t> mtpAttrDecodeStepsMultimodal{0};
+        std::atomic<uint64_t> mtpAttrConstrainedVerifySteps{0};
+        std::atomic<uint64_t> mtpAttrConstrainedVerifyRows{0};
     }
 
     void MtpAttributionObserve(const char *event) {
@@ -7910,12 +7912,24 @@ namespace fastllm {
         else if (!std::strcmp(event, "decode-mm")) mtpAttrDecodeStepsMultimodal++;
     }
 
+    void MtpAttributionObserveConstrainedVerifyRows(size_t rows) {
+        if (rows == 0) {
+            return;
+        }
+        mtpAttrConstrainedVerifySteps++;
+        mtpAttrConstrainedVerifyRows += (uint64_t)rows;
+    }
+
     MtpAttributionStats GetMtpAttributionStatsSnapshot() {
         MtpAttributionStats s;
         s.steps = mtpAttrSteps.load();
         s.stepsMultimodal = mtpAttrStepsMultimodal.load();
         s.prefillDoneFlips = mtpAttrPrefillDoneFlips.load();
         s.decodeStepsMultimodal = mtpAttrDecodeStepsMultimodal.load();
+        s.constrainedVerifySteps =
+            mtpAttrConstrainedVerifySteps.load();
+        s.constrainedVerifyRows =
+            mtpAttrConstrainedVerifyRows.load();
         return s;
     }
 

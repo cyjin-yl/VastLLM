@@ -1121,8 +1121,11 @@ namespace fastllm {
         uint64_t stepsMultimodal = 0;       // 其中 batch 里至少有一个带图请求
         uint64_t prefillDoneFlips = 0;      // multimodalPrefillDone 被置位的次数
         uint64_t decodeStepsMultimodal = 0; // 带图请求走普通 decode 路径的次数
+        uint64_t constrainedVerifySteps = 0; // 动态 mask 激活时仍走 MTP verify
+        uint64_t constrainedVerifyRows = 0;  // 这些 verify 中实际带 mask 的 logits 行
     };
     void MtpAttributionObserve(const char *event);
+    void MtpAttributionObserveConstrainedVerifyRows(size_t rows);
     MtpAttributionStats GetMtpAttributionStatsSnapshot();
 
     void PrefixCacheStatsObserveRecordPath(const char *event);

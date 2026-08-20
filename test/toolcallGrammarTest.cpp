@@ -2,6 +2,7 @@
 // v100-perfs/tests/toolcall_grammar_invariants.py 的 python 复刻)。
 // 直接驱动 basellm::EvaluateToolCallConstraintText + 合成 vocab。
 #include "models/basellm.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -184,6 +185,39 @@ int main() {
         acc += seq[i];
     }
     Check("I5 全流程可生成", allOk);
+
+    // ---- I6: 投机 verify 每一行必须按前序 draft 推进约束 ----
+    auto tokenId = [](const std::string &token) {
+        for (size_t i = 0; i < VOCAB.size(); i++) {
+            if (VOCAB[i] == token) return (int)i;
+        }
+        return -1;
+    };
+    auto rowAllows = [](const GenerationConfig &row, int id) {
+        return std::find(row.tool_call_allowed_token_ids.begin(),
+                         row.tool_call_allowed_token_ids.end(), id) !=
+               row.tool_call_allowed_token_ids.end();
+    };
+    std::vector<GenerationConfig> speculativeRows;
+    m.AppendToolCallConstraintRowConfigs(
+        "<tool_call>\n<function=", cfg,
+        {tokenId("list"), tokenId("_dir"), tokenId(">")},
+        speculativeRows);
+    Check("I6.1 verify 生成四行约束",
+          speculativeRows.size() == 4);
+    Check("I6.2 row0 允许 list",
+          speculativeRows.size() == 4 &&
+          rowAllows(speculativeRows[0], tokenId("list")));
+    Check("I6.3 row1 允许 _dir",
+          speculativeRows.size() == 4 &&
+          rowAllows(speculativeRows[1], tokenId("_dir")));
+    Check("I6.4 row2 允许名称终止符",
+          speculativeRows.size() == 4 &&
+          rowAllows(speculativeRows[2], tokenId(">")));
+    Check("I6.5 row3 转入必填参数起点",
+          speculativeRows.size() == 4 &&
+          rowAllows(speculativeRows[3], tokenId("<parameter=")) &&
+          !rowAllows(speculativeRows[3], tokenId("</function>")));
 
     // ---- I7: 回归场景(循环形态) ----
     std::string loop = "<tool_call>\n<function=list_dir>\n"

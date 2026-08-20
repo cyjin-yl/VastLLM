@@ -1594,6 +1594,12 @@ struct WorkQueue {
                     (double)fastllm::GetMtpAttributionStatsSnapshot().prefillDoneFlips},
                 {"mtp_multimodal_decode_steps",
                     (double)fastllm::GetMtpAttributionStatsSnapshot().decodeStepsMultimodal},
+                {"mtp_constrained_verify_steps",
+                    (double)fastllm::GetMtpAttributionStatsSnapshot()
+                        .constrainedVerifySteps},
+                {"mtp_constrained_verify_rows",
+                    (double)fastllm::GetMtpAttributionStatsSnapshot()
+                        .constrainedVerifyRows},
                 {"prefix_cache_stats_miss_mm_delta_unavailable",
                     (double)prefixStats.missMmDeltaUnavailable},
                 {"prefix_cache_stats_miss_evicted",

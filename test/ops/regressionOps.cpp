@@ -4454,6 +4454,149 @@ namespace {
         FastllmCudaFree(cudaLogits);
     }
 
+    void RunCudaTokenConstraintMaskRegression() {
+        constexpr int batch = 2;
+        constexpr int vocabSize = 8;
+        std::vector<float> logits(batch * vocabSize, -10.0f);
+        logits[1] = 10.0f;
+        logits[2] = 9.0f;
+        logits[4] = 8.0f;
+        logits[vocabSize + 5] = 10.0f;
+        logits[vocabSize + 3] = 9.0f;
+
+        // row 0: allow {2,4}, then block 4 -> 2.
+        // row 1: blocked-only {5} -> next-best 3.
+        std::vector<uint8_t> mask(batch * vocabSize, 1);
+        std::fill(mask.begin(), mask.begin() + vocabSize, 0);
+        mask[2] = 1;
+        mask[4] = 0;
+        mask[vocabSize + 5] = 0;
+
+        float *cudaLogits = (float*)FastllmCudaMalloc(
+            logits.size() * sizeof(float));
+        int *cudaOutput = (int*)FastllmCudaMalloc(
+            batch * sizeof(int));
+        Expect(cudaLogits != nullptr && cudaOutput != nullptr,
+               "failed to allocate CUDA token-mask regression buffers");
+        FastllmCudaCopyFromHostToDevice(
+            cudaLogits, logits.data(), logits.size() * sizeof(float));
+        Expect(FastllmCudaApplyTokenMask(
+                   cudaLogits, mask.data(), batch, vocabSize),
+               "CUDA token constraint mask launch failed");
+        Expect(FastllmCudaGreedySampling(
+                   cudaLogits, cudaOutput, batch, vocabSize),
+               "masked greedy sampling launch failed");
+        std::vector<int> sampled(batch, -1);
+        FastllmCudaCopyFromDeviceToHost(
+            sampled.data(), cudaOutput, batch * sizeof(int));
+        Expect(sampled == std::vector<int>({2, 3}),
+               "CUDA token constraint mask selected wrong IDs");
+        FastllmCudaFree(cudaOutput);
+        FastllmCudaFree(cudaLogits);
+    }
+
+    void RunMtpConstrainedVerifyAttributionRegression() {
+        const fastllm::MtpAttributionStats before =
+            fastllm::GetMtpAttributionStatsSnapshot();
+        fastllm::MtpAttributionObserveConstrainedVerifyRows(0);
+        const fastllm::MtpAttributionStats afterZero =
+            fastllm::GetMtpAttributionStatsSnapshot();
+        Expect(afterZero.constrainedVerifySteps ==
+                   before.constrainedVerifySteps &&
+               afterZero.constrainedVerifyRows ==
+                   before.constrainedVerifyRows,
+               "empty constrained verify changed attribution stats");
+        fastllm::MtpAttributionObserveConstrainedVerifyRows(3);
+        const fastllm::MtpAttributionStats after =
+            fastllm::GetMtpAttributionStatsSnapshot();
+        Expect(after.constrainedVerifySteps ==
+                   before.constrainedVerifySteps + 1 &&
+               after.constrainedVerifyRows ==
+                   before.constrainedVerifyRows + 3,
+               "constrained verify attribution stats are inaccurate");
+    }
+
+    void RunQwen35MtpConstraintSupportRegression() {
+        fastllm::GenerationConfig config;
+        config.top_k = 1;
+        config.temperature = 1.0f;
+        config.top_p = 1.0f;
+        config.tool_call_allowed_token_ids = {3, 7};
+        Expect(fastllm::Qwen35MtpSupportsGenerationConfig(config),
+               "MTP rejected an allow-list tool constraint");
+        config.tool_call_allowed_token_ids.clear();
+        config.tool_call_blocked_token_ids = {2};
+        Expect(fastllm::Qwen35MtpSupportsGenerationConfig(config),
+               "MTP rejected a blocked-token tool constraint");
+        config.output_logits = true;
+        Expect(!fastllm::Qwen35MtpSupportsGenerationConfig(config),
+               "MTP accepted output_logits collection");
+        config.output_logits = false;
+        config.top_k = 51;
+        Expect(!fastllm::Qwen35MtpSupportsGenerationConfig(config),
+               "MTP accepted an unsupported top-k");
+    }
+
+    void RunCudaTokenConstraintMaskFileOracle() {
+        const char *logitsPath =
+            std::getenv("FASTLLM_TOKEN_MASK_LOGITS");
+        const char *maskPath =
+            std::getenv("FASTLLM_TOKEN_MASK_MASK");
+        const char *outputPath =
+            std::getenv("FASTLLM_TOKEN_MASK_OUTPUT");
+        const char *batchText =
+            std::getenv("FASTLLM_TOKEN_MASK_BATCH");
+        const char *vocabText =
+            std::getenv("FASTLLM_TOKEN_MASK_VOCAB");
+        Expect(logitsPath != nullptr && maskPath != nullptr &&
+                   outputPath != nullptr && batchText != nullptr &&
+                   vocabText != nullptr,
+               "CUDA token-mask file oracle env is incomplete");
+        const int batch = std::stoi(batchText);
+        const int vocabSize = std::stoi(vocabText);
+        Expect(batch > 0 && vocabSize > 0,
+               "CUDA token-mask file oracle shape is invalid");
+        const size_t count = (size_t)batch * vocabSize;
+        const size_t logitsBytes = count * sizeof(float);
+
+        std::vector<float> logits(count);
+        std::vector<uint8_t> mask(count);
+        auto readExact = [](const char *path, void *data,
+                            size_t bytes) {
+            std::ifstream input(path, std::ios::binary);
+            Expect(input.good(),
+                   "CUDA token-mask oracle input cannot open");
+            input.read((char*)data, bytes);
+            Expect((size_t)input.gcount() == bytes &&
+                       input.peek() == std::ifstream::traits_type::eof(),
+                   "CUDA token-mask oracle input size mismatch");
+        };
+        readExact(logitsPath, logits.data(), logitsBytes);
+        readExact(maskPath, mask.data(), count);
+
+        FastllmCudaSetDevice(0);
+        float *cudaLogits =
+            (float*)FastllmCudaMalloc(logitsBytes);
+        Expect(cudaLogits != nullptr,
+               "CUDA token-mask oracle allocation failed");
+        FastllmCudaCopyFromHostToDevice(
+            cudaLogits, logits.data(), logitsBytes);
+        Expect(FastllmCudaApplyTokenMask(
+                   cudaLogits, mask.data(), batch, vocabSize),
+               "CUDA token-mask oracle launch failed");
+        FastllmCudaCopyFromDeviceToHost(
+            logits.data(), cudaLogits, logitsBytes);
+        FastllmCudaFree(cudaLogits);
+
+        std::ofstream output(outputPath,
+                             std::ios::binary | std::ios::trunc);
+        Expect(output.good(),
+               "CUDA token-mask oracle output cannot open");
+        output.write((const char*)logits.data(), logitsBytes);
+        Expect(output.good(),
+               "CUDA token-mask oracle output write failed");
+    }
+
     void RunCudaHandoffSamplingRegression() {
         constexpr int batch = 2;
         constexpr int vocabSize = 128;
@@ -17956,6 +18099,16 @@ int main(int argc, char **argv) {
                 "paged_cache_grow regression requires a CUDA build.");
 #endif
         }
+        if (only != nullptr &&
+            std::string(only) == "cuda_token_mask_oracle") {
+#ifdef USE_CUDA
+            RunCudaTokenConstraintMaskFileOracle();
+            return 0;
+#else
+            throw std::runtime_error(
+                "cuda_token_mask_oracle requires a CUDA build.");
+#endif
+        }
         RunRegressionFixtureScopeRegression();
         if (only != nullptr && std::string(only) == "qwen35_gguf") {
             RunQwen35GGUFConfigRegression();
@@ -18372,6 +18525,12 @@ int main(int argc, char **argv) {
             std::cout << "cuda local expert range mask regression: PASS\n";
             RunCudaGreedyTieBreakRegression();
             std::cout << "cuda greedy tie-break regression: PASS\n";
+            RunCudaTokenConstraintMaskRegression();
+            std::cout << "cuda token constraint mask regression: PASS\n";
+            RunMtpConstrainedVerifyAttributionRegression();
+            std::cout << "MTP constrained-verify attribution regression: PASS\n";
+            RunQwen35MtpConstraintSupportRegression();
+            std::cout << "Qwen3.5 MTP constraint support regression: PASS\n";
             RunCudaHandoffSamplingRegression();
             std::cout << "cuda handoff sampling regression: PASS\n";
         }

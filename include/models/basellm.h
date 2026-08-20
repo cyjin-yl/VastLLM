@@ -635,6 +635,15 @@ namespace fastllm {
                                                     std::vector<int> &allowedIdsOut,
                                                     std::vector<int> *blockedIdsOut = nullptr);
 
+        // 为投机 verify 的每一行生成约束配置。row 0 使用当前文本状态；
+        // 后续行先依次假设接受 proposedTokens 的前缀，再重新计算 mask。
+        // 结果追加到 rows，便于 batch 按 request 拼接。
+        void AppendToolCallConstraintRowConfigs(
+            const std::string &generatedText,
+            const GenerationConfig &generationConfig,
+            const std::vector<int> &proposedTokens,
+            std::vector<GenerationConfig> &rows);
+
         virtual void UpdateToolCallConstraintState(ResponseContext *context, int tokenId);
 
         virtual void OnResponseContextCreated(ResponseContext *context) {}

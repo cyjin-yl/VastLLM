@@ -40,6 +40,8 @@ namespace fastllm {
     Qwen35AttentionProjectionLayout ResolveQwen35AttentionProjectionLayout(
             const WeightMap &weight,
             const std::string &layerPrefix);
+    bool Qwen35MtpSupportsGenerationConfig(
+            const GenerationConfig &config);
     bool MergeQwen35TemporalPatchEmbeddings(
             const Data &firstFrameWeight,
             const Data &secondFrameWeight,
