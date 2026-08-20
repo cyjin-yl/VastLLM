@@ -91,10 +91,12 @@ namespace {
 
 using fastllm::turbokv::kQ8BlockBytes;
 using fastllm::turbokv::kTurbo3BlockBytes;
+using fastllm::turbokv::kTurbo4BlockBytes;
 
 constexpr int kTurboHeadDim   = 256;
 constexpr int kTurboQ8Row     = 272;   // = Q8RowBytes(256)
 constexpr int kTurboT3Row     = 100;   // = Turbo3RowBytes(256)
+constexpr int kTurboT4Row     = 132;   // = Turbo4RowBytes(256)
 constexpr int kTurboWarps     = 4;
 constexpr int kTurboThreads   = kTurboWarps * 32;
 constexpr int kTurboDimsLane  = kTurboHeadDim / 32;   // 每 lane 8 个连续维度
@@ -105,8 +107,10 @@ constexpr int kTurboGroup     = 6;                    // Qwen3.5/3.8: 24 Q head 
 
 static_assert(fastllm::turbokv::Q8RowBytes(kTurboHeadDim) == kTurboQ8Row, "q8_0 行字节数变了");
 static_assert(fastllm::turbokv::Turbo3RowBytes(kTurboHeadDim) == kTurboT3Row, "turbo3 行字节数变了");
+static_assert(fastllm::turbokv::Turbo4RowBytes(kTurboHeadDim) == kTurboT4Row, "turbo4 行字节数变了");
 
 __device__ __constant__ float kTurboXqaCentroids[8] = FASTLLM_TURBOKV_TURBO3_CENTROIDS_INIT;
+__device__ __constant__ float kTurbo4XqaCentroids[16] = FASTLLM_TURBOKV_TURBO4_CENTROIDS_INIT;
 __device__ __constant__ float kTurboXqaWhtSigns1[128] = FASTLLM_TURBOKV_WHT_SIGNS1_INIT;
 __device__ __constant__ float kTurboXqaWhtSigns2[128] = FASTLLM_TURBOKV_WHT_SIGNS2_INIT;
 
@@ -382,6 +386,184 @@ __global__ void FastllmSm70PagedTurboXqaCombineKernel(
     }
 }
 
+
+template <bool TURBO4>
+__global__ void __launch_bounds__(kTurboThreads, 4)
+FastllmSm70PagedTurboPrefillSplitKernel(
+    const half * __restrict__ qd,
+    const uint8_t * __restrict__ pagedK,
+    const uint8_t * __restrict__ pagedV,
+    float * __restrict__ scratch,
+    const int32_t * __restrict__ pageIndices,
+    int numPages, int lastPageLen, int pageLenShift, int pageLenMask,
+    int numKvHeads, int qoLen, int group,
+    int qStrideH, int qStrideN, float scale, int splits) {
+    const int h = blockIdx.x;
+    const int t = blockIdx.y;
+    const int split = blockIdx.z;
+    const int kvHead = h / group;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int pageLen = pageLenMask + 1;
+    const int kvLen = (numPages - 1) * pageLen + lastPageLen;
+    const int visible = kvLen - qoLen + t + 1;
+    const int chunkSize = (kvLen + splits - 1) / splits;
+    const int kvStart = split * chunkSize;
+    const int kvEnd = min(min(kvStart + chunkSize, kvLen), visible);
+
+    __shared__ float sQ[kTurboHeadDim];
+    __shared__ float sLut[16];
+    __shared__ float sAcc[kTurboWarps * kTurboHeadDim];
+    __shared__ float sM[kTurboWarps];
+    __shared__ float sL[kTurboWarps];
+    for (int d = tid; d < kTurboHeadDim; d += kTurboThreads) {
+        sQ[d] = __half2float(
+            qd[(size_t)h * qStrideH + (size_t)t * qStrideN + d]) *
+            scale * 1.4426950408889634f;
+    }
+    for (int i = tid; i < (TURBO4 ? 16 : 8); i += kTurboThreads) {
+        sLut[i] = TURBO4 ? kTurbo4XqaCentroids[i] : kTurboXqaCentroids[i];
+    }
+    __syncthreads();
+
+    float m = -1e30f, l = 0.0f;
+    float acc[kTurboDimsLane] = {0.0f};
+    const int d0 = lane * kTurboDimsLane;
+    const int q8Block = lane >> 2;
+    const int q8Off = (lane & 3) * 8;
+    const int valueBlock = lane >> 4;
+    const int valueGroup = lane & 15;
+    for (int j = kvStart + warp; j < kvEnd; j += kTurboWarps) {
+        const int pageSlot = j >> pageLenShift;
+        const int offInPage = j & pageLenMask;
+        const int page = pageIndices[pageSlot];
+        const size_t row =
+            ((size_t)page * pageLen + offInPage) * numKvHeads + kvHead;
+        const uint8_t *kBlk = pagedK + row * kTurboQ8Row +
+            (size_t)q8Block * kQ8BlockBytes;
+        const float kScale =
+            __half2float(__ldg(reinterpret_cast<const half *>(kBlk)));
+        const int8_t *kQs =
+            reinterpret_cast<const int8_t *>(kBlk + 2 + q8Off);
+        float dot = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < kTurboDimsLane; i++) {
+            dot += sQ[d0 + i] * (kScale * (float)kQs[i]);
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            dot += __shfl_xor_sync(0xffffffffu, dot, off);
+        }
+
+        float vreg[kTurboDimsLane];
+        if constexpr (TURBO4) {
+            const uint8_t *vBlk = pagedV + row * kTurboT4Row +
+                (size_t)valueBlock * kTurbo4BlockBytes;
+            const float norm =
+                __half2float(__ldg(reinterpret_cast<const half *>(vBlk)));
+            const uint8_t *packedBytes =
+                vBlk + 2 + 4 * valueGroup;
+            const uint32_t packed =
+                (uint32_t)__ldg(packedBytes) |
+                ((uint32_t)__ldg(packedBytes + 1) << 8) |
+                ((uint32_t)__ldg(packedBytes + 2) << 16) |
+                ((uint32_t)__ldg(packedBytes + 3) << 24);
+            #pragma unroll
+            for (int i = 0; i < kTurboDimsLane; i++) {
+                vreg[i] = norm * sLut[(packed >> (4 * i)) & 15u];
+            }
+        } else {
+            const uint8_t *vBlk = pagedV + row * kTurboT3Row +
+                (size_t)valueBlock * kTurbo3BlockBytes;
+            const float norm =
+                __half2float(__ldg(reinterpret_cast<const half *>(vBlk)));
+            const uint32_t low2 = __ldg(
+                reinterpret_cast<const uint16_t *>(
+                    vBlk + 2 + 2 * valueGroup));
+            const uint32_t high1 = __ldg(vBlk + 2 + 32 + valueGroup);
+            #pragma unroll
+            for (int i = 0; i < kTurboDimsLane; i++) {
+                const int idx = (int)(((low2 >> (2 * i)) & 3u) |
+                    (((high1 >> i) & 1u) << 2));
+                vreg[i] = norm * sLut[idx];
+            }
+        }
+        if (dot > m) {
+            const float corr = exp2f(m - dot);
+            #pragma unroll
+            for (int i = 0; i < kTurboDimsLane; i++) acc[i] *= corr;
+            l *= corr;
+            m = dot;
+        }
+        const float p = exp2f(dot - m);
+        #pragma unroll
+        for (int i = 0; i < kTurboDimsLane; i++) acc[i] += p * vreg[i];
+        l += p;
+    }
+    if (lane == 0) {
+        sM[warp] = m;
+        sL[warp] = l;
+    }
+    #pragma unroll
+    for (int i = 0; i < kTurboDimsLane; i++) {
+        sAcc[warp * kTurboHeadDim + d0 + i] = acc[i];
+    }
+    __syncthreads();
+    float maxScore = -1e30f;
+    for (int w = 0; w < kTurboWarps; w++) maxScore = fmaxf(maxScore, sM[w]);
+    float sum = 0.0f;
+    for (int w = 0; w < kTurboWarps; w++) {
+        sum += sL[w] * exp2f(sM[w] - maxScore);
+    }
+    float *slot = scratch +
+        ((size_t)(h * qoLen + t) * splits + split) *
+        (kTurboHeadDim + 2);
+    for (int d = tid; d < kTurboHeadDim; d += kTurboThreads) {
+        float value = 0.0f;
+        for (int w = 0; w < kTurboWarps; w++) {
+            value += sAcc[w * kTurboHeadDim + d] *
+                exp2f(sM[w] - maxScore);
+        }
+        slot[d] = value;
+    }
+    if (tid == 0) {
+        slot[kTurboHeadDim] = maxScore;
+        slot[kTurboHeadDim + 1] = sum;
+    }
+}
+
+__global__ void FastllmSm70PagedTurboPrefillCombineKernel(
+    const float * __restrict__ scratch, half * __restrict__ od,
+    int qoLen, int group, int splits,
+    int outHeadStride, int outTokenStride) {
+    const int kvh = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
+    __shared__ float sMs[kTurboMaxSplits], sLs[kTurboMaxSplits];
+    __shared__ float x[kTurboHeadDim];
+    for (int g = 0; g < group; g++) {
+        const int h = kvh * group + g;
+        const float *base = scratch +
+            (size_t)(h * qoLen + t) * splits * (kTurboHeadDim + 2);
+        for (int s = d; s < splits; s += kTurboHeadDim) {
+            sMs[s] = base[(size_t)s * (kTurboHeadDim + 2) + kTurboHeadDim];
+            sLs[s] = base[(size_t)s * (kTurboHeadDim + 2) + kTurboHeadDim + 1];
+        }
+        __syncthreads();
+        float M = -1e30f;
+        for (int s = 0; s < splits; s++) M = fmaxf(M, sMs[s]);
+        float L = 0.0f, value = 0.0f;
+        for (int s = 0; s < splits; s++) {
+            const float factor = exp2f(sMs[s] - M);
+            L += sLs[s] * factor;
+            value += base[(size_t)s * (kTurboHeadDim + 2) + d] * factor;
+        }
+        x[d] = L > 0.0f ? value / L : 0.0f;
+        __syncthreads();
+        TurboInverseWht128(x + (d >> 7) * 128, d & 127);
+        od[(size_t)t * outTokenStride + (size_t)h * outHeadStride + d] =
+            __float2half_rn(x[d]);
+        __syncthreads();
+    }
+}
 int TurboXqaSplits(int numKvHeads, int groupChunks) {
     const int parallel = numKvHeads * groupChunks;
     if (parallel <= 0) {
@@ -444,6 +626,42 @@ void LaunchTurboXqa(const half *qd, const uint8_t *pagedK, const uint8_t *pagedV
             outHeadStride, outTokenStride);
 }
 
+
+float *TurboPrefillScratch(int device, size_t needSlots, size_t &capacity) {
+    struct Entry { float *ptr = nullptr; size_t slots = 0; };
+    static thread_local std::map<int, Entry> cache;
+    Entry &entry = cache[device];
+    if (entry.slots < needSlots) {
+        float *next = (float *)FastllmCudaMalloc(
+            needSlots * (size_t)(kTurboHeadDim + 2) * sizeof(float));
+        if (next == nullptr) {
+            capacity = entry.slots;
+            return entry.ptr;
+        }
+        if (entry.ptr != nullptr) {
+            printf("[Fastllm][turbo-prefill] scratch grow: keep old %p, "
+                   "slots=%zu -> %zu\n", entry.ptr, entry.slots, needSlots);
+        }
+        entry.ptr = next;
+        entry.slots = needSlots;
+    }
+    capacity = entry.slots;
+    return entry.ptr;
+}
+
+bool TurboPrefillEnabled() {
+    const char *value =
+        std::getenv("FASTLLM_CUDA_SM70_TURBO_PREFILL");
+    return value == nullptr || (strcmp(value, "0") != 0 &&
+        strcmp(value, "false") != 0 && strcmp(value, "off") != 0);
+}
+
+int TurboPrefillMaxQoLen() {
+    const char *value =
+        std::getenv("FASTLLM_CUDA_SM70_TURBO_PREFILL_MAX_Q");
+    if (value == nullptr || value[0] == '\0') return 32;
+    return std::max(5, std::min(1024, std::atoi(value)));
+}
 }  // namespace
 
 bool FastllmCudaTrySm70PagedTurboXqa(
@@ -554,9 +772,92 @@ bool FastllmCudaTrySm70PagedTurboXqa(
     return true;
 }
 
+bool FastllmCudaTrySm70PagedTurboPrefill(
+    void *qData, fastllm::DataType qType,
+    int H, int qoLen, int qDim, int qHeadStride, int qTokenStride,
+    const int32_t *pageIndicesGpu, int numPages, int lastPageLen,
+    fastllm::Data *pagedKVCacheK, fastllm::Data *pagedKVCacheV,
+    int pageLen, int numKvHeads, int headDim,
+    void *outData, fastllm::DataType outType,
+    int outHeadStride, int outTokenStride, int group, float scale) {
+    if (!TurboPrefillEnabled() || qoLen <= kTurboMaxQoLen ||
+        qoLen > TurboPrefillMaxQoLen() ||
+        qData == nullptr || outData == nullptr || pageIndicesGpu == nullptr ||
+        pagedKVCacheK == nullptr || pagedKVCacheV == nullptr ||
+        qType != fastllm::DataType::FLOAT16 ||
+        outType != fastllm::DataType::FLOAT16 ||
+        pagedKVCacheK->dataType != fastllm::DataType::Q8_0_KV ||
+        (pagedKVCacheV->dataType != fastllm::DataType::TURBO3_KV &&
+         pagedKVCacheV->dataType != fastllm::DataType::TURBO4_KV) ||
+        pagedKVCacheK->cudaData == nullptr ||
+        pagedKVCacheV->cudaData == nullptr ||
+        headDim != kTurboHeadDim || qDim != kTurboHeadDim ||
+        group != kTurboGroup || numKvHeads <= 0 ||
+        H != group * numKvHeads || numPages <= 0 ||
+        lastPageLen <= 0 || pageLen <= 0 ||
+        (pageLen & (pageLen - 1)) != 0 || lastPageLen > pageLen ||
+        qHeadStride <= 0 || qTokenStride < headDim ||
+        outHeadStride < headDim || outTokenStride < headDim) {
+        return false;
+    }
+    const int kvLen = (numPages - 1) * pageLen + lastPageLen;
+    if (kvLen < qoLen) return false;
+    int device = -1, major = 0, minor = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+                               device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
+                               device) != cudaSuccess ||
+        major != 7 || minor != 0) {
+        cudaGetLastError();
+        return false;
+    }
+    const int parallel = H * qoLen;
+    const int splits = std::max(
+        1, std::min(8, (kTurboSplitTargetBlocks + parallel - 1) / parallel));
+    const size_t needSlots = (size_t)H * qoLen * splits;
+    size_t capacity = 0;
+    float *scratch = TurboPrefillScratch(device, needSlots, capacity);
+    if (scratch == nullptr || capacity < needSlots) return false;
+    int pageLenShift = 0;
+    while ((1 << pageLenShift) < pageLen) pageLenShift++;
+    dim3 splitGrid((unsigned)H, (unsigned)qoLen, (unsigned)splits);
+    const half *qd = (const half *)qData;
+    const uint8_t *pagedK = (const uint8_t *)pagedKVCacheK->cudaData;
+    const uint8_t *pagedV = (const uint8_t *)pagedKVCacheV->cudaData;
+    if (pagedKVCacheV->dataType == fastllm::DataType::TURBO4_KV) {
+        FastllmSm70PagedTurboPrefillSplitKernel<true>
+            <<<splitGrid, kTurboThreads, 0, cudaStreamPerThread>>>(
+                qd, pagedK, pagedV, scratch, pageIndicesGpu,
+                numPages, lastPageLen, pageLenShift, pageLen - 1,
+                numKvHeads, qoLen, group, qHeadStride, qTokenStride,
+                scale, splits);
+    } else {
+        FastllmSm70PagedTurboPrefillSplitKernel<false>
+            <<<splitGrid, kTurboThreads, 0, cudaStreamPerThread>>>(
+                qd, pagedK, pagedV, scratch, pageIndicesGpu,
+                numPages, lastPageLen, pageLenShift, pageLen - 1,
+                numKvHeads, qoLen, group, qHeadStride, qTokenStride,
+                scale, splits);
+    }
+    dim3 combineGrid((unsigned)numKvHeads, (unsigned)qoLen, 1);
+    FastllmSm70PagedTurboPrefillCombineKernel
+        <<<combineGrid, kTurboHeadDim, 0, cudaStreamPerThread>>>(
+            scratch, (half *)outData, qoLen, group, splits,
+            outHeadStride, outTokenStride);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 #else   // USE_ROCM
 
 bool FastllmCudaTrySm70PagedTurboXqa(
+    void *, fastllm::DataType, int, int, int, int, int,
+    const int32_t *, int, int, fastllm::Data *, fastllm::Data *,
+    int, int, int, void *, fastllm::DataType, int, int, int, float) {
+    return false;
+}
+
+bool FastllmCudaTrySm70PagedTurboPrefill(
     void *, fastllm::DataType, int, int, int, int, int,
     const int32_t *, int, int, fastllm::Data *, fastllm::Data *,
     int, int, int, void *, fastllm::DataType, int, int, int, float) {

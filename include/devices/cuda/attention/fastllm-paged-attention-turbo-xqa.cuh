@@ -18,3 +18,12 @@ bool FastllmCudaTrySm70PagedTurboXqa(
     int pageLen, int numKvHeads, int headDim,
     void *outData, fastllm::DataType outType, int outHeadStride, int outTokenStride,
     int group, float scale);
+
+bool FastllmCudaTrySm70PagedTurboPrefill(
+    void *qData, fastllm::DataType qType,
+    int H, int qoLen, int qDim, int qHeadStride, int qTokenStride,
+    const int32_t *pageIndicesGpu, int numPages, int lastPageLen,
+    fastllm::Data *pagedKVCacheK, fastllm::Data *pagedKVCacheV,
+    int pageLen, int numKvHeads, int headDim,
+    void *outData, fastllm::DataType outType,
+    int outHeadStride, int outTokenStride, int group, float scale);

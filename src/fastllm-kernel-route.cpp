@@ -65,6 +65,7 @@ namespace fastllm {
             case KERNEL_ROUTE_ATTN_FLASHINFER:         return "attn.flashinfer";
             case KERNEL_ROUTE_ATTN_NATIVE_FALLBACK:    return "attn.native_fallback";
             case KERNEL_ROUTE_ATTN_SM70_TURBO_XQA:     return "attn.sm70_turbo_xqa";
+            case KERNEL_ROUTE_ATTN_SM70_TURBO_PREFILL: return "attn.sm70_turbo_prefill";
             default:                                   return "unknown";
         }
     }

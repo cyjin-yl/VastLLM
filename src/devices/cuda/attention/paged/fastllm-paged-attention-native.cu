@@ -463,6 +463,17 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
                                 -1, qoLen, 0, 0);
         return true;
     }
+    if (pageIndicesGpuIn != nullptr &&
+        FastllmCudaTrySm70PagedTurboPrefill(
+            qData, qType, H, qoLen, qDim, qHeadStride, qTokenStride,
+            pageIndicesGpuIn, numPages, lastPageLen,
+            pagedKVCacheK, pagedKVCacheV, pageLen, numKvHeads, headDim,
+            outData, outType, outHeadStride, outTokenStride, group, scale)) {
+        fastllm::KernelRouteHit(
+            fastllm::KERNEL_ROUTE_ATTN_SM70_TURBO_PREFILL,
+            -1, qoLen, 0, 0);
+        return true;
+    }
 
     bool batchGqa = qIsHalf && outIsHalf && group > 1 &&
         FastllmPagedCublasBatchGqaEnabled();

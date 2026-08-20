@@ -52,6 +52,7 @@ namespace fastllm {
         // 分派进去之后**实际执行**的 kernel。要判断融合路有没有生效, 看这一项是否非零,
         // 不要看 native_fallback 是否归零。
         KERNEL_ROUTE_ATTN_SM70_TURBO_XQA,
+        KERNEL_ROUTE_ATTN_SM70_TURBO_PREFILL,
         KERNEL_ROUTE_COUNT
     };
 

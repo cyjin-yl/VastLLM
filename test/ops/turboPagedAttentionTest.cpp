@@ -188,6 +188,24 @@ void DequantTurbo3RowHost(const uint8_t *row, int headDim, double *out) {
     }
 }
 
+void DequantTurbo4RowHost(const uint8_t *row, int headDim, double *out) {
+    using namespace fastllm::turbokv;
+    const Turbo4KvBlock *blocks =
+        reinterpret_cast<const Turbo4KvBlock *>(row);
+    for (int g = 0; g < headDim / kTurbo4BlockValues; g++) {
+        const Turbo4KvBlock &b = blocks[g];
+        double x[128];
+        const double norm = HalfBitsToDouble(b.norm);
+        for (int i = 0; i < 128; i++) {
+            const int packed = b.qs[i / 2];
+            const int idx = (packed >> (4 * (i & 1))) & 15;
+            x[i] = (double)kTurbo4CentroidsHost[idx] * norm;
+        }
+        InverseWht128Host(x);
+        for (int i = 0; i < 128; i++) out[g * 128 + i] = x[i];
+    }
+}
+
 struct ErrorStats {
     double maxAbs = 0.0;
     double rms = 0.0;
@@ -221,6 +239,7 @@ struct Fixture {
     int H = 24;
     int kvLen = 0;
     float scale = 0.0625f;   // 1/sqrt(256), fp16 可精确表示
+    fastllm::DataType vType = fastllm::DataType::TURBO3_KV;
 
     std::vector<int32_t> physicalPages;
     fastllm::PagedCacheManager *pagedK = nullptr;
@@ -248,7 +267,7 @@ void BuildPackedFixture(Fixture &f, int layerIdBase,
     Data kDesc(DataType::Q8_0_KV);
     kDesc.Resize({f.numKvHeads, 1, f.headDim});
     kDesc.dataDevice = DataDevice::CUDA;
-    Data vDesc(DataType::TURBO3_KV);
+    Data vDesc(f.vType);
     vDesc.Resize({f.numKvHeads, 1, f.headDim});
     vDesc.dataDevice = DataDevice::CUDA;
 
@@ -278,15 +297,16 @@ void BuildPackedFixture(Fixture &f, int layerIdBase,
                "q8_0 打包写入失败");
         Expect(FastllmCudaPackedKVCacheCopy(
                    (uint8_t *)f.pagedV->cudaData, physicalPages[p], f.pageLen,
-                   f.numKvHeads, f.headDim, DataType::TURBO3_KV,
+                   f.numKvHeads, f.headDim, f.vType,
                    (uint8_t *)srcV.cudaData, DataType::FLOAT16,
                    f.kvLen, p * f.pageLen, len, 0),
-               "turbo3 打包写入失败");
+               std::string(f.vType == DataType::TURBO4_KV ?
+                           "turbo4" : "turbo3") + " 打包写入失败");
     }
     FastllmCudaSyncCurrentThreadStream();
 
     f.kCaches.dataType = DataType::Q8_0_KV;
-    f.vCaches.dataType = DataType::TURBO3_KV;
+    f.vCaches.dataType = f.vType;
     f.kCaches.Resize({f.numKvHeads, 1, f.headDim});
     f.vCaches.Resize({f.numKvHeads, 1, f.headDim});
     f.kCaches.isKVCache = f.vCaches.isKVCache = true;
@@ -303,7 +323,10 @@ void BuildPackedFixture(Fixture &f, int layerIdBase,
     FastllmCudaCopyFromDeviceToHost(vHost.data(), f.pagedV->cudaData, vBytes);
 
     const size_t kRowBytes = fastllm::turbokv::Q8RowBytes(f.headDim);
-    const size_t vRowBytes = fastllm::turbokv::Turbo3RowBytes(f.headDim);
+    const size_t vRowBytes =
+        f.vType == DataType::TURBO4_KV ?
+        fastllm::turbokv::Turbo4RowBytes(f.headDim) :
+        fastllm::turbokv::Turbo3RowBytes(f.headDim);
     f.exactK.assign((size_t)f.numKvHeads * f.kvLen * f.headDim, 0.0);
     f.exactV.assign((size_t)f.numKvHeads * f.kvLen * f.headDim, 0.0);
     for (int j = 0; j < f.kvLen; j++) {
@@ -314,7 +337,15 @@ void BuildPackedFixture(Fixture &f, int layerIdBase,
             size_t row = ((size_t)page * f.pageLen + offsetInPage) * f.numKvHeads + kvh;
             size_t dst = ((size_t)kvh * f.kvLen + j) * f.headDim;
             DequantQ8RowHost(kHost.data() + row * kRowBytes, f.headDim, f.exactK.data() + dst);
-            DequantTurbo3RowHost(vHost.data() + row * vRowBytes, f.headDim, f.exactV.data() + dst);
+            if (f.vType == DataType::TURBO4_KV) {
+                DequantTurbo4RowHost(
+                    vHost.data() + row * vRowBytes, f.headDim,
+                    f.exactV.data() + dst);
+            } else {
+                DequantTurbo3RowHost(
+                    vHost.data() + row * vRowBytes, f.headDim,
+                    f.exactV.data() + dst);
+            }
         }
     }
 }
@@ -378,6 +409,8 @@ RunResult RunChunkedCublas(Fixture &f, fastllm::Data &q, int qoLen, bool batchGq
     // 【关键】必须显式关掉融合路。它已经挂在 chunked-cuBLAS 入口处试探, 不关掉的话
     // 这里测到的根本不是 chunked-cuBLAS 基线, 而是融合 kernel 自己跟自己比。
     ScopedEnvVar noFused("FASTLLM_CUDA_SM70_TURBO_XQA", "0");
+    ScopedEnvVar noFusedPrefill(
+        "FASTLLM_CUDA_SM70_TURBO_PREFILL", "0");
     result.ok = FastllmCudaHalfPagedAttentionBatchFastllmFallback(
         q, f.kCaches, f.vCaches, qSizes, pageSizes, pageIndexs, lastPageLens,
         output, f.group, f.scale);
@@ -394,13 +427,27 @@ RunResult RunFusedTurboXqa(Fixture &f, fastllm::Data &q, int qoLen) {
     int lastPageLen = f.kvLen - ((int)f.physicalPages.size() - 1) * f.pageLen;
     Data output = MakeCudaTensor(DataType::FLOAT16, {qoLen, f.H, f.headDim},
                                  std::vector<float>((size_t)qoLen * f.H * f.headDim, 0.0f));
-    result.ok = FastllmCudaTrySm70PagedTurboXqa(
-        q.cudaData, DataType::FLOAT16, f.H, qoLen, f.headDim,
-        (int)q.strides[0], (int)q.strides[1],
-        (const int32_t *)pageIndexs.cudaData, (int)f.physicalPages.size(), lastPageLen,
-        (Data *)f.pagedK, (Data *)f.pagedV, f.pageLen, f.numKvHeads, f.headDim,
-        output.cudaData, DataType::FLOAT16, f.headDim, f.H * f.headDim,
-        f.group, f.scale);
+    if (qoLen <= 4) {
+        result.ok = FastllmCudaTrySm70PagedTurboXqa(
+            q.cudaData, DataType::FLOAT16, f.H, qoLen, f.headDim,
+            (int)q.strides[0], (int)q.strides[1],
+            (const int32_t *)pageIndexs.cudaData,
+            (int)f.physicalPages.size(), lastPageLen,
+            (Data *)f.pagedK, (Data *)f.pagedV, f.pageLen,
+            f.numKvHeads, f.headDim, output.cudaData,
+            DataType::FLOAT16, f.headDim, f.H * f.headDim,
+            f.group, f.scale);
+    } else {
+        result.ok = FastllmCudaTrySm70PagedTurboPrefill(
+            q.cudaData, DataType::FLOAT16, f.H, qoLen, f.headDim,
+            (int)q.strides[0], (int)q.strides[1],
+            (const int32_t *)pageIndexs.cudaData,
+            (int)f.physicalPages.size(), lastPageLen,
+            (Data *)f.pagedK, (Data *)f.pagedV, f.pageLen,
+            f.numKvHeads, f.headDim, output.cudaData,
+            DataType::FLOAT16, f.headDim, f.H * f.headDim,
+            f.group, f.scale);
+    }
     FastllmCudaSyncCurrentThreadStream();
     result.output = ToFloatVector(output);
     return result;
@@ -663,23 +710,39 @@ void RunBench(int kvLen, int layerIdBase, const std::vector<int> &qoLens) {
                 output, f.group, f.scale);
         };
         auto viaFused = [&]() {
-            FastllmCudaTrySm70PagedTurboXqa(
-                q.cudaData, DataType::FLOAT16, f.H, qoLen, f.headDim,
-                (int)q.strides[0], (int)q.strides[1],
-                (const int32_t *)pageIndexs.cudaData, numPages, lastPageLen,
-                (Data *)f.pagedK, (Data *)f.pagedV, f.pageLen, f.numKvHeads, f.headDim,
-                output.cudaData, DataType::FLOAT16, f.headDim, f.H * f.headDim,
-                f.group, f.scale);
+            if (qoLen <= 4) {
+                FastllmCudaTrySm70PagedTurboXqa(
+                    q.cudaData, DataType::FLOAT16, f.H, qoLen, f.headDim,
+                    (int)q.strides[0], (int)q.strides[1],
+                    (const int32_t *)pageIndexs.cudaData, numPages, lastPageLen,
+                    (Data *)f.pagedK, (Data *)f.pagedV, f.pageLen,
+                    f.numKvHeads, f.headDim, output.cudaData,
+                    DataType::FLOAT16, f.headDim, f.H * f.headDim,
+                    f.group, f.scale);
+            } else {
+                FastllmCudaTrySm70PagedTurboPrefill(
+                    q.cudaData, DataType::FLOAT16, f.H, qoLen, f.headDim,
+                    (int)q.strides[0], (int)q.strides[1],
+                    (const int32_t *)pageIndexs.cudaData, numPages, lastPageLen,
+                    (Data *)f.pagedK, (Data *)f.pagedV, f.pageLen,
+                    f.numKvHeads, f.headDim, output.cudaData,
+                    DataType::FLOAT16, f.headDim, f.H * f.headDim,
+                    f.group, f.scale);
+            }
         };
 
         double base, gqa, fused;
         {
             ScopedEnvVar noFused("FASTLLM_CUDA_SM70_TURBO_XQA", "0");
+            ScopedEnvVar noFusedPrefill(
+                "FASTLLM_CUDA_SM70_TURBO_PREFILL", "0");
             ScopedEnvVar gate("FASTLLM_CUDA_PAGED_CUBLAS_BATCH_GQA", "0");
             base = TimeMs(viaDispatch, 3, 20);
         }
         {
             ScopedEnvVar noFused("FASTLLM_CUDA_SM70_TURBO_XQA", "0");
+            ScopedEnvVar noFusedPrefill(
+                "FASTLLM_CUDA_SM70_TURBO_PREFILL", "0");
             ScopedEnvVar gate("FASTLLM_CUDA_PAGED_CUBLAS_BATCH_GQA", "1");
             gqa = TimeMs(viaDispatch, 3, 20);
         }
@@ -687,7 +750,9 @@ void RunBench(int kvLen, int layerIdBase, const std::vector<int> &qoLens) {
 
         // 每 (token, kvHead) 行的等效访存量, 用于和 372 B/行 的理论下限对照。
         const double rows = (double)kvLen * f.numKvHeads;
-        auto bytesPerRow = [&](double ms) { return ms * 1e-3 * 750e9 / rows; };
+        auto bytesPerRow = [&](double ms) {
+            return ms * 1e-3 * 750e9 / rows;
+        };
         std::cout << "  kvLen=" << kvLen << " qoLen=" << qoLen << "\n"
                   << "    chunked-cuBLAS 默认      " << base  << " ms"
                   << "  (等效 " << bytesPerRow(base) << " B/行 @750GB/s)\n"
@@ -703,8 +768,10 @@ void RunBench(int kvLen, int layerIdBase, const std::vector<int> &qoLens) {
 
 void RunFixture(const std::string &name, int layerIdBase,
                 const std::vector<int32_t> &physicalPages, int lastPageLen,
-                const std::vector<int> &qoLens) {
+                const std::vector<int> &qoLens,
+                fastllm::DataType vType = fastllm::DataType::TURBO3_KV) {
     Fixture f;
+    f.vType = vType;
     BuildPackedFixture(f, layerIdBase, physicalPages, lastPageLen);
     std::cout << "  夹具 " << name << ": kvLen=" << f.kvLen
               << " 物理页=";
@@ -844,7 +911,7 @@ int main(int argc, char **argv) {
         try {
             int layerId = 60200;
             for (int kvLen : benchKvLens) {
-                RunBench(kvLen, layerId, {1, 3});
+                RunBench(kvLen, layerId, {1, 3, 8, 16, 32});
                 layerId += 4;
             }
         } catch (const std::exception &ex) {
@@ -855,9 +922,11 @@ int main(int argc, char **argv) {
     }
     std::cout << "打包分页注意力数值对拍 (K=q8_0, V=turbo3, headDim=256, GQA6)\n";
     try {
-        // 单页 / 多页 / 非线性页表 / 非整页尾部 —— 覆盖页表边界与 lastPageLen。
         RunFixture("单页尾部 40", 60100, {2}, 40, {1, 2, 3, 4});
-        RunFixture("三页乱序尾部 17", 60102, {2, 0, 3}, 17, {1, 2, 3, 4});
+        RunFixture("turbo4 三页乱序", 60106, {3, 1, 4}, 29,
+                   {8, 16, 32}, fastllm::DataType::TURBO4_KV);
+        RunFixture("三页乱序尾部 17", 60102, {2, 0, 3}, 17,
+                   {1, 2, 3, 4, 8, 16, 32});
         RunFixture("两页整页", 60104, {1, 4}, 128, {1, 3});
     } catch (const std::exception &ex) {
         std::cout << "  [FAIL] 异常: " << ex.what() << "\n";
