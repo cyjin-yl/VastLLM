@@ -596,6 +596,16 @@ namespace fastllm {
                               const Data &positionIds, int sampleRow,
                               Data *sampledHiddenStates = nullptr,
                               bool cacheOnly = false);
+        bool AppendMtpPrefillCache(
+                              ResponseContext *context,
+                              const std::vector<int> &devices,
+                              const Data &targetHiddenStates,
+                              const std::vector<int> &inputTokens,
+                              const Data &positionIds,
+                              int expectedTokens,
+                              bool cacheOnly,
+                              int &draftToken,
+                              std::string *error = nullptr);
         std::vector<int> RunMtpGreedyDraftBatch(
                               int device,
                               const std::vector<int> &devices,

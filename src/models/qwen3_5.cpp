@@ -22132,44 +22132,11 @@ namespace fastllm {
                                 const Data &mtpPositionIds,
                                 int expectedTokens, bool cacheOnly,
                                 int &draftToken) {
-                                Qwen35MtpLockGuard guard(model->mtpCacheMutex, __FILE__, __LINE__);
-                                auto cacheIt = model->mtpCaches.find(singleContext);
-                                if (cacheIt == model->mtpCaches.end()) {
-                                    if (expectedTokens != 0) {
-                                        return false;
-                                    }
-                                    cacheIt = model->mtpCaches.emplace(
-                                        singleContext,
-                                        std::make_unique<MtpKvCache>()).first;
-                                }
-                                MtpKvCache &cache = *cacheIt->second;
-                                if (cache.tokens != expectedTokens) {
-                                    model->mtpCaches.erase(cacheIt);
-                                    return false;
-                                }
-                                try {
-                                    draftToken = model->RunMtpGreedyDraft(
-                                        longPrefillMtpDevices[0],
-                                        longPrefillMtpDevices, cache,
-                                        targetHiddenStates, mtpInputTokens,
-                                        mtpPositionIds,
-                                        (int)mtpInputTokens.size() - 1,
-                                        nullptr, cacheOnly);
-                                } catch (...) {
-                                    model->mtpCaches.erase(singleContext);
-                                    throw;
-                                }
-                                int newTokens = expectedTokens +
-                                    (int)mtpInputTokens.size();
-                                bool valid = cache.tokens == newTokens &&
-                                    cache.key.dims.size() >= 2 &&
-                                    cache.value.dims.size() >= 2 &&
-                                    cache.key.dims[1] == newTokens &&
-                                    cache.value.dims[1] == newTokens;
-                                if (!valid) {
-                                    model->mtpCaches.erase(singleContext);
-                                }
-                                return valid;
+                                return model->AppendMtpPrefillCache(
+                                    singleContext, longPrefillMtpDevices,
+                                    targetHiddenStates, mtpInputTokens,
+                                    mtpPositionIds, expectedTokens,
+                                    cacheOnly, draftToken);
                             };
 
                         int longPrefillFirstDraft = -1;
@@ -25990,6 +25957,82 @@ namespace fastllm {
 #endif
     }
 
+    bool Qwen3_5Model::AppendMtpPrefillCache(
+            ResponseContext *context,
+            const std::vector<int> &devices,
+            const Data &targetHiddenStates,
+            const std::vector<int> &inputTokens,
+            const Data &positionIds,
+            int expectedTokens,
+            bool cacheOnly,
+            int &draftToken,
+            std::string *error) {
+        draftToken = -1;
+        auto fail = [&](const std::string &message) {
+            if (error != nullptr) {
+                *error = message;
+            }
+            return false;
+        };
+        if (context == nullptr || devices.empty() ||
+            inputTokens.empty() || expectedTokens < 0) {
+            return fail("invalid MTP prefill append arguments");
+        }
+        try {
+            Qwen35MtpLockGuard guard(
+                mtpCacheMutex, __FILE__, __LINE__);
+            auto cacheIt = mtpCaches.find(context);
+            if (cacheIt == mtpCaches.end()) {
+                if (expectedTokens != 0) {
+                    return fail("MTP cache missing before append");
+                }
+                cacheIt = mtpCaches.emplace(
+                    context, std::make_unique<MtpKvCache>()).first;
+            }
+            MtpKvCache &cache = *cacheIt->second;
+            if (cache.tokens != expectedTokens) {
+                mtpCaches.erase(cacheIt);
+                return fail("MTP cache token count is not aligned");
+            }
+            draftToken = RunMtpGreedyDraft(
+                devices[0], devices, cache, targetHiddenStates,
+                inputTokens, positionIds,
+                (int)inputTokens.size() - 1,
+                nullptr, cacheOnly);
+            const int newTokens =
+                expectedTokens + (int)inputTokens.size();
+            const bool valid =
+                cache.tokens == newTokens &&
+                cache.key.dims.size() >= 2 &&
+                cache.value.dims.size() >= 2 &&
+                cache.key.dims[1] == newTokens &&
+                cache.value.dims[1] == newTokens;
+            if (!valid) {
+                mtpCaches.erase(context);
+                return fail("MTP cache shape is invalid after append");
+            }
+            return true;
+        } catch (const std::exception &caught) {
+            try {
+                Qwen35MtpLockGuard cleanup(
+                    mtpCacheMutex, __FILE__, __LINE__);
+                mtpCaches.erase(context);
+            } catch (...) {
+            }
+            return fail(
+                std::string("MTP prefill append failed: ") +
+                caught.what());
+        } catch (...) {
+            try {
+                Qwen35MtpLockGuard cleanup(
+                    mtpCacheMutex, __FILE__, __LINE__);
+                mtpCaches.erase(context);
+            } catch (...) {
+            }
+            return fail("MTP prefill append failed with unknown error");
+        }
+    }
+
     void Qwen3_5Model::AdjustPositionIdsWithDelta(const Data &positionIds,
                                                   const Data &mropePositionDelta,
                                                   Data &adjustedPositionIds) {
@@ -26872,6 +26915,16 @@ namespace fastllm {
         if (this->weight.weight.find(lmHeadWeightName) == this->weight.weight.end()) {
             lmHeadWeightName = language_prefix + "embed_tokens.weight";
         }
+        if (speculativeCaptureAllHiddenStates && batch == 1) {
+            // ForwardGPU 的 MTP 播种会在最终 RMSNorm 后捕获完整序列；
+            // 多模态隐藏态路径也必须给 append helper 同一语义。不能直接
+            // 复用 LLMSamplingBlock 的结果：它会先把 prefill 压成末 token。
+            Data normalizedHiddenStates;
+            RMSNorm(
+                hiddenStates, weight[language_prefix + "norm.weight"],
+                rms_norm_eps, normalizedHiddenStates);
+            speculativeHiddenStates.CopyFrom(normalizedHiddenStates);
+        }
         std::vector <int> lastRet;
         LLMSamplingBlock(
             this, &hiddenStates,
@@ -27085,6 +27138,140 @@ namespace fastllm {
 
         const int totalSeqLen = inputIds.dims[1];
         const int prefillChunkSize = GetChunkedPrefillSize();
+        std::vector<GenerationConfig> generationConfigs = {
+            generationConfig};
+
+        Data visionInputIdsCpu;
+        visionInputIdsCpu.CopyFrom(inputIds);
+        visionInputIdsCpu.ToDevice(DataDevice::CPU);
+        if (visionInputIdsCpu.dataType != DataType::FLOAT32) {
+            ToDataType(visionInputIdsCpu, DataType::FLOAT32);
+            visionInputIdsCpu.ToDevice(DataDevice::CPU);
+        }
+        const float *visionTokenIds =
+            (const float*)visionInputIdsCpu.cpuData;
+
+        std::vector<int> visionMtpDevices;
+        std::map<int, int> visionMtpRatios;
+        const int visionMtpDrafts = Qwen35MtpDraftsPerStep();
+        bool seedVisionMtp =
+            context != nullptr &&
+            !Qwen35MtpDisabledByEnv() &&
+            visionMtpDrafts > 0 &&
+            HasMtpWeights() &&
+            Qwen35MtpSupportsGenerationConfig(generationConfig) &&
+            GetQwen35GPUForwardDevices(
+                this->deviceMap, visionMtpDevices,
+                visionMtpRatios) &&
+            !visionMtpDevices.empty();
+        const int visionMtpBaseTokens =
+            context == nullptr ? 0 : context->cacheLen;
+        if (seedVisionMtp) {
+            Qwen35MtpLockGuard guard(
+                mtpCacheMutex, __FILE__, __LINE__);
+            if (visionMtpBaseTokens == 0) {
+                mtpCaches.erase(context);
+            } else {
+                auto cacheIt = mtpCaches.find(context);
+                seedVisionMtp =
+                    cacheIt != mtpCaches.end() &&
+                    cacheIt->second->tokens == visionMtpBaseTokens &&
+                    cacheIt->second->key.dims.size() >= 2 &&
+                    cacheIt->second->value.dims.size() >= 2 &&
+                    cacheIt->second->key.dims[1] ==
+                        visionMtpBaseTokens &&
+                    cacheIt->second->value.dims[1] ==
+                        visionMtpBaseTokens;
+                if (!seedVisionMtp) {
+                    mtpCaches.erase(context);
+                }
+            }
+        }
+        auto disableVisionMtp = [&](const std::string &reason) {
+            if (!seedVisionMtp) {
+                return;
+            }
+            seedVisionMtp = false;
+            {
+                Qwen35MtpLockGuard guard(
+                    mtpCacheMutex, __FILE__, __LINE__);
+                mtpCaches.erase(context);
+            }
+            printf(
+                "[Qwen3.5 MTP] multimodal prefill seed disabled: %s.\n",
+                reason.empty() ? "unknown error" : reason.c_str());
+            fflush(stdout);
+        };
+        auto runVisionChunk =
+            [&](int st, int curLen, bool lastChunk,
+                const Data &curInputIds, Data &curPositionIds,
+                std::vector<Data*> &curAttentionMasks,
+                Data &curHiddenStates) {
+                std::vector<int> curSeqLens = {curLen};
+                const bool captureMtp = seedVisionMtp;
+                const bool oldCaptureAllHiddenStates =
+                    speculativeCaptureAllHiddenStates;
+                speculativeCaptureAllHiddenStates = captureMtp;
+                if (captureMtp) {
+                    speculativeHiddenStates.FreeSpace();
+                    speculativeHiddenStates.dims.clear();
+                    speculativeHiddenStates.strides.clear();
+                    speculativeHiddenStates.expansionDims.clear();
+                }
+                std::vector<int> chunkRet;
+                try {
+                    chunkRet = ForwardFromHiddenStates(
+                        1, curInputIds, curAttentionMasks,
+                        curPositionIds, curSeqLens,
+                        pagedPastKeyValues, generationConfigs,
+                        lastTokens, retLogits, curHiddenStates,
+                        curLen == 1);
+                } catch (...) {
+                    speculativeCaptureAllHiddenStates =
+                        oldCaptureAllHiddenStates;
+                    if (captureMtp) {
+                        Qwen35MtpLockGuard guard(
+                            mtpCacheMutex, __FILE__, __LINE__);
+                        mtpCaches.erase(context);
+                    }
+                    throw;
+                }
+                speculativeCaptureAllHiddenStates =
+                    oldCaptureAllHiddenStates;
+                if (!captureMtp) {
+                    return chunkRet;
+                }
+                if (chunkRet.empty()) {
+                    disableVisionMtp(
+                        "target forward returned no token");
+                    return chunkRet;
+                }
+                std::vector<int> mtpInputTokens(curLen);
+                for (int i = 0; i < curLen; i++) {
+                    const int nextIndex = st + i + 1;
+                    mtpInputTokens[i] =
+                        nextIndex < totalSeqLen
+                        ? (int)(visionTokenIds[nextIndex] + 1e-3f)
+                        : chunkRet.back();
+                }
+                int draftToken = -1;
+                std::string appendError;
+                if (!AppendMtpPrefillCache(
+                        context, visionMtpDevices,
+                        speculativeHiddenStates, mtpInputTokens,
+                        curPositionIds, visionMtpBaseTokens + st,
+                        !lastChunk, draftToken, &appendError)) {
+                    disableVisionMtp(appendError);
+                } else if (lastChunk) {
+                    printf(
+                        "[Qwen3.5 MTP] multimodal prefill cache seeded: "
+                        "tokens=%d draft=%d.\n",
+                        visionMtpBaseTokens + totalSeqLen,
+                        draftToken);
+                    fflush(stdout);
+                }
+                return chunkRet;
+            };
         if (prefillChunkSize > 0 && totalSeqLen > prefillChunkSize) {
             const int chunkCount =
                 (totalSeqLen + prefillChunkSize - 1) / prefillChunkSize;
@@ -27095,7 +27282,7 @@ namespace fastllm {
             fflush(stdout);
 
             std::vector <int> ret;
-            std::vector <GenerationConfig> generationConfigs = {generationConfig};
+
             // 【上游BUMP勿回退】块边界上的前缀快照"梯子"。
             //
             // 不做这件事的后果(线上实测): 带图请求只在**整段 prompt** 那一个深度
@@ -27123,13 +27310,12 @@ namespace fastllm {
                 Split(mropePositionIds, 1, st, st + curLen, curPositionIds);
                 Split(hiddenStates, 1, st, st + curLen, curHiddenStates);
                 moveHiddenToModelDevice(curHiddenStates);
+                std::vector<Data*> curAttentionMasks = {nullptr};
 
-                std::vector <Data*> curAttentionMasks = {nullptr};
-                std::vector <int> curSeqLens = {curLen};
-                ret = ForwardFromHiddenStates(
-                    1, curInputIds, curAttentionMasks, curPositionIds,
-                    curSeqLens, pagedPastKeyValues, generationConfigs,
-                    lastTokens, retLogits, curHiddenStates, curLen == 1);
+                ret = runVisionChunk(
+                    st, curLen, st + curLen >= totalSeqLen,
+                    curInputIds, curPositionIds,
+                    curAttentionMasks, curHiddenStates);
                 const int donePrefill = st + curLen;
                 // 最后一块不在这里记: 调度器在 prefill 结束后本来就会记一次,
                 // 重复记只会多做一次拷贝。
@@ -27148,13 +27334,10 @@ namespace fastllm {
 
         moveHiddenToModelDevice(hiddenStates);
         Data attentionMaskCopy(attentionMask);
-        std::vector <Data*> attentionMasks = {&attentionMaskCopy};
-        std::vector <int> seqLens = {totalSeqLen};
-        std::vector <GenerationConfig> generationConfigs = {generationConfig};
-        return ForwardFromHiddenStates(
-            1, inputIds, attentionMasks, mropePositionIds, seqLens,
-            pagedPastKeyValues, generationConfigs, lastTokens,
-            retLogits, hiddenStates, totalSeqLen == 1);
+        std::vector<Data*> attentionMasks = {&attentionMaskCopy};
+        return runVisionChunk(
+            0, totalSeqLen, true, inputIds,
+            mropePositionIds, attentionMasks, hiddenStates);
     }
 
     std::vector <int> Qwen3_5Model::ForwardV2(
