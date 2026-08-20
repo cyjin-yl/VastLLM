@@ -603,27 +603,102 @@ namespace fastllm {
     }
 
     JinjaVar JinjaTemplate::ComputeExpression(JinjaVar &local, std::vector <JinjaToken> tokens, int st, int end, JinjaVar *setValue) {
-        // 三元表达式 "A if C else B" 预处理
+        // Jinja 内联条件表达式 `A if C else B` 的优先级低于普通运算。
+        // 顶层条件可直接选支；若它被括号包住（官方 Qwen3.8 模板大量使用
+        // `prefix + (A if C else B) + suffix`），先把括号内部改写成选中的
+        // token 分支，再递归跑原有表达式求值器。只计算被选中的分支。
         {
-            int depth = 0, ifPos = -1, elsePos = -1;
+            int depth = 0;
+            int ifDepth = std::numeric_limits<int>::max();
+            int ifPos = -1;
+            int elsePos = -1;
             for (int i = st; i < end; i++) {
-                if (tokens[i].type == JinjaToken::JinjaTokenLSB || tokens[i].type == JinjaToken::JinjaTokenLMB) {
+                if (tokens[i].type == JinjaToken::JinjaTokenLSB ||
+                    tokens[i].type == JinjaToken::JinjaTokenLMB) {
                     depth++;
-                } else if (tokens[i].type == JinjaToken::JinjaTokenRSB || tokens[i].type == JinjaToken::JinjaTokenRMB) {
+                } else if (tokens[i].type == JinjaToken::JinjaTokenRSB ||
+                           tokens[i].type == JinjaToken::JinjaTokenRMB) {
                     depth--;
-                } else if (depth == 0 && tokens[i].type == JinjaToken::JinjaTokenIf) {
+                } else if (tokens[i].type == JinjaToken::JinjaTokenIf &&
+                           depth < ifDepth) {
+                    ifDepth = depth;
                     ifPos = i;
-                } else if (depth == 0 && tokens[i].type == JinjaToken::JinjaTokenElse && ifPos != -1) {
+                    elsePos = -1;
+                } else if (tokens[i].type == JinjaToken::JinjaTokenElse &&
+                           ifPos != -1 && depth == ifDepth) {
                     elsePos = i;
+                    break;
                 }
             }
             if (ifPos != -1 && elsePos != -1) {
-                JinjaVar cond = ComputeExpression(local, tokens, ifPos + 1, elsePos);
-                if (cond.BoolValue()) {
-                    return ComputeExpression(local, tokens, st, ifPos);
-                } else {
-                    return ComputeExpression(local, tokens, elsePos + 1, end);
+                JinjaVar condition =
+                    ComputeExpression(local, tokens, ifPos + 1, elsePos);
+                if (ifDepth == 0) {
+                    return condition.BoolValue()
+                        ? ComputeExpression(
+                              local, tokens, st, ifPos, setValue)
+                        : ComputeExpression(
+                              local, tokens, elsePos + 1, end, setValue);
                 }
+
+                int groupStart = -1;
+                int nested = 0;
+                for (int i = ifPos - 1; i >= st; i--) {
+                    if (tokens[i].type == JinjaToken::JinjaTokenRSB ||
+                        tokens[i].type == JinjaToken::JinjaTokenRMB) {
+                        nested++;
+                    } else if (
+                            tokens[i].type == JinjaToken::JinjaTokenLSB ||
+                            tokens[i].type == JinjaToken::JinjaTokenLMB) {
+                        if (nested == 0) {
+                            groupStart = i;
+                            break;
+                        }
+                        nested--;
+                    }
+                }
+                int groupEnd = -1;
+                nested = 0;
+                for (int i = elsePos + 1; i < end; i++) {
+                    if (tokens[i].type == JinjaToken::JinjaTokenLSB ||
+                        tokens[i].type == JinjaToken::JinjaTokenLMB) {
+                        nested++;
+                    } else if (
+                            tokens[i].type == JinjaToken::JinjaTokenRSB ||
+                            tokens[i].type == JinjaToken::JinjaTokenRMB) {
+                        if (nested == 0) {
+                            groupEnd = i;
+                            break;
+                        }
+                        nested--;
+                    }
+                }
+                AssertInFastLLM(
+                    groupStart >= st && groupEnd > elsePos,
+                    "Jinja Error: inline conditional group is not closed.");
+                const int branchStart =
+                    condition.BoolValue() ? groupStart + 1 : elsePos + 1;
+                const int branchEnd =
+                    condition.BoolValue() ? ifPos : groupEnd;
+                std::vector<JinjaToken> rewritten;
+                rewritten.reserve(
+                    tokens.size() -
+                    (groupEnd - groupStart - 1) +
+                    (branchEnd - branchStart));
+                rewritten.insert(
+                    rewritten.end(), tokens.begin(),
+                    tokens.begin() + groupStart + 1);
+                rewritten.insert(
+                    rewritten.end(), tokens.begin() + branchStart,
+                    tokens.begin() + branchEnd);
+                rewritten.insert(
+                    rewritten.end(), tokens.begin() + groupEnd,
+                    tokens.end());
+                const int newEnd =
+                    end - (groupEnd - groupStart - 1) +
+                    (branchEnd - branchStart);
+                return ComputeExpression(
+                    local, std::move(rewritten), st, newEnd, setValue);
             }
         }
         std::vector <JinjaToken> suffixExp; // 后缀表达式

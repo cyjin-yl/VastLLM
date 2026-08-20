@@ -18,7 +18,6 @@ void Check(bool ok, const char *message) {
         failures++;
     }
 }
-
 struct TemplateProbeModel : fastllm::basellm {
     int makeInputCalls = 0;
 
@@ -34,6 +33,7 @@ struct TemplateProbeModel : fastllm::basellm {
         return "";
     }
 };
+
 
 json11::Json ParseJson(const std::string &text) {
     std::string error;
@@ -111,9 +111,32 @@ void TestContextsStayIsolated() {
           "each render sees only its own context");
 }
 
+void TestNestedInlineConditionalExpression() {
+    std::printf("[4] official-template inline conditional works inside parentheses\n");
+    const std::string templ =
+        "{{ '<s>' + (reasoning_instructions + '\\n\\n' "
+        "if reasoning_instructions else '') + content }}";
+    const fastllm::ChatTemplateDryRunResult truthy =
+        fastllm::DryRunChatTemplate(
+            templ,
+            fastllm::JinjaVarFromJson(ParseJson(
+                "{\"reasoning_instructions\":\"R\",\"content\":\"body\"}")));
+    const fastllm::ChatTemplateDryRunResult falsy =
+        fastllm::DryRunChatTemplate(
+            templ,
+            fastllm::JinjaVarFromJson(ParseJson(
+                "{\"reasoning_instructions\":\"\",\"content\":\"body\"}")));
+    Check(truthy.ok && falsy.ok,
+          "both inline-conditional branches parse");
+    Check(truthy.rendered == "<s>R\n\nbody",
+          "truthy branch preserves prefix and suffix concatenation");
+    Check(falsy.rendered == "<s>body",
+          "falsy branch preserves prefix and suffix concatenation");
+}
+
 
 void TestRuntimeTemplateErrorNeverFallsBack() {
-    std::printf("[4] runtime Jinja failure is explicit and never calls MakeInput\n");
+    std::printf("[5] runtime Jinja failure is explicit and never calls MakeInput\n");
     TemplateProbeModel model;
     model.weight.tokenizer.chatTemplate = "{{ messages[0].content ";
     const fastllm::ChatMessages messages = {{"user", "hello"}};
@@ -137,7 +160,7 @@ void TestRuntimeTemplateErrorNeverFallsBack() {
 }
 
 void TestAbsentTemplateKeepsLegacyModelPath() {
-    std::printf("[5] models without a configured template keep MakeInput behavior\n");
+    std::printf("[6] models without a configured template keep MakeInput behavior\n");
     TemplateProbeModel model;
     model.weight.tokenizer.chatTemplate.clear();
     const fastllm::ChatMessages messages = {{"user", "hello"}};
@@ -155,6 +178,7 @@ int main() {
     TestNestedJsonConversionAndRender();
     TestInvalidTemplateIsExplicit();
     TestContextsStayIsolated();
+    TestNestedInlineConditionalExpression();
     TestRuntimeTemplateErrorNeverFallsBack();
     TestAbsentTemplateKeepsLegacyModelPath();
     std::printf("== %d/%d passed ==\n", checks - failures, checks);
