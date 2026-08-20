@@ -283,6 +283,10 @@ void TestCpuOverflowRotatesToDisk() {
                   (unsigned long long)(before + 96));
     SetEnv("FASTLLM_PREFIX_CACHE_CPU_MAX_BYTES", budget);
     SetEnv("FASTLLM_PREFIX_CACHE_ZSTD", "0");
+    // 本用例验证的是"已满足 L3 准入时的 L2 -> L3 轮转"。4-token
+    // 合成页按机械盘默认寻道成本本来不值得落盘；降低重算速度，让存储
+    // 明确胜出，避免把经济性门槛误测成轮转失败。
+    SetEnv("FASTLLM_PREFIX_CACHE_RECOMPUTE_TPS", "1");
 
     const bool okA = m.PageOutTrieNode(leafA);
     const bool okB = m.PageOutTrieNode(leafB);
@@ -295,6 +299,7 @@ void TestCpuOverflowRotatesToDisk() {
           "额度只够一份时, 至少有一页轮转到了 L3(磁盘)");
     SetEnv("FASTLLM_PREFIX_CACHE_CPU_MAX_BYTES", "1048576");
     SetEnv("FASTLLM_PREFIX_CACHE_ZSTD", "1");
+    SetEnv("FASTLLM_PREFIX_CACHE_RECOMPUTE_TPS", "800");
 }
 
 // [6] 滞回: 最小驻留时间内的页不做淘汰候选

@@ -5329,6 +5329,9 @@ namespace fastllm {
 
     static std::unordered_map<int, PagedCacheManager*> layerPagedCacheManagers;
     static std::mutex layerPagedCacheManagersMutex;
+    // 定义在文件后半段(页池物理字节账本旁边)。
+    static uint64_t PagedPoolBudgetBytes();
+    void PagedCacheCudaPoolBytesAdd(long long delta);
 
     static uint64_t EvictPagedPrefixCacheCpuTierBytes(
             uint64_t bytesNeeded) {
@@ -5477,6 +5480,15 @@ namespace fastllm {
         ((Data*)manager)->Resize({initialPages, pageLen, numHeads, headDim});
         if (!metadataOnlyMultiCudaRoot) {
             ((Data*)manager)->Allocate();
+            // 账本修正：初始池字节原来不计入 g_pagedPoolCudaBytes(只有 Grow
+            // 的增量计入),而析构却扣减全额 GetBytes()。于是预算被系统性低估
+            // (128 个 manager x 初始 128 页),析构后计数器还会转负,
+            // FASTLLM_PAGED_POOL_MAX_MB 形同虚设。
+            if (manager->dataDevice == DataDevice::CUDA &&
+                manager->cudaData != nullptr) {
+                PagedCacheCudaPoolBytesAdd(
+                    (long long)((Data*)manager)->GetBytes());
+            }
         }
 
         // 初始化 pageLen 和 unusedPageIndex（物理页 = initialPages）
@@ -5496,6 +5508,17 @@ namespace fastllm {
             if (kvBudgetBytes < 0) {
                 const long long freeB = FastllmCudaGetFreeSize();
                 kvBudgetBytes = freeB > 0 ? (long long)(freeB * 0.85) : 0;
+                // FASTLLM_PAGED_POOL_MAX_MB 是硬预算：不把它折进 maxPages
+                // 的钳制里，逻辑预算就会大于池子真正能长到的上限，于是
+                // 准入检查(required <= maxPages)放行 -> Grow 撞预算 -> 抛错
+                // -> 500。折进来之后"装不下"在准入阶段就变成干净的拒绝，
+                // 而"暂时装不下"由调度器排队消化。
+                const uint64_t poolBudget = PagedPoolBudgetBytes();
+                if (poolBudget > 0 &&
+                    (kvBudgetBytes <= 0 ||
+                     (long long)poolBudget < kvBudgetBytes)) {
+                    kvBudgetBytes = (long long)poolBudget;
+                }
             }
             if (kvBudgetBytes > 0) {
                 // 【上游BUMP勿回退】页字节数必须走 GetDataBytes(打包感知),
@@ -7584,6 +7607,9 @@ namespace fastllm {
         std::atomic<uint64_t> pcStatEvictTrieNodes{0};
         std::atomic<uint64_t> pcStatEvictCpuTierCalls{0};
         std::atomic<uint64_t> pcStatEvictCpuTierBytes{0};
+        std::atomic<uint64_t> pcStatEvictDemotePages{0};
+        std::atomic<uint64_t> pcStatEvictCpuToDiskBytes{0};
+        std::atomic<uint64_t> pcStatEvictHardDropNodes{0};
         // 记录路径(TryRecordPagedCache 链)
         std::atomic<uint64_t> pcRecCalls{0};
         std::atomic<uint64_t> pcRecSkipLinearBounded{0};
@@ -7733,7 +7759,8 @@ namespace fastllm {
                    "mm-remainder-img=%llu mm-no-delta=%llu evicted=%llu "
                    "below-thresh=%llu gen=%llu restore-fail=%llu other=%llu} "
                    "record{ok=%llu rej-min=%llu rej-cap=%llu rej-space=%llu rej-other=%llu} "
-                   "evict{trie-nodes=%llu cpu-calls=%llu cpu-bytes=%llu} "
+                   "evict{trie-nodes=%llu cpu-calls=%llu cpu-bytes=%llu "
+                   "demote-pg=%llu hard-drop=%llu cpu2disk=%lluB} "
                    "resident{mem=%lluMB cpu=%lluMB disk=%lluMB}\n",
                    (unsigned long long)s.requests,
                    (unsigned long long)s.hitRequests,
@@ -7754,6 +7781,7 @@ namespace fastllm {
                    (unsigned long long)s.missBelowThreshold,
                    (unsigned long long)s.missGenerationMismatch,
                    (unsigned long long)s.missRestoreFailed,
+                   (unsigned long long)s.missExtraMissing,
                    (unsigned long long)s.missOther,
                    (unsigned long long)s.recordAccepted,
                    (unsigned long long)s.recordRejectedMinHitsTokens,
@@ -7763,6 +7791,9 @@ namespace fastllm {
                    (unsigned long long)s.evictTrieNodes,
                    (unsigned long long)s.evictCpuTierCalls,
                    (unsigned long long)s.evictCpuTierBytes,
+                   (unsigned long long)s.evictDemotePages,
+                   (unsigned long long)s.evictHardDropNodes,
+                   (unsigned long long)s.evictCpuToDiskBytes,
                    (unsigned long long)(s.memTrieResidentBytes >> 20),
                    (unsigned long long)(s.cpuTierResidentBytes >> 20),
                    (unsigned long long)(s.diskResidentBytes >> 20));
@@ -7839,6 +7870,12 @@ namespace fastllm {
         } else if (std::strcmp(kind, "cpu-tier-call") == 0) {
             pcStatEvictCpuTierCalls.fetch_add(1);
             pcStatEvictCpuTierBytes += nodesOrBytes;
+        } else if (std::strcmp(kind, "demote-pages") == 0) {
+            pcStatEvictDemotePages += nodesOrBytes;
+        } else if (std::strcmp(kind, "cpu-to-disk") == 0) {
+            pcStatEvictCpuToDiskBytes += nodesOrBytes;
+        } else if (std::strcmp(kind, "hard-drop") == 0) {
+            pcStatEvictHardDropNodes += nodesOrBytes;
         }
     }
 
@@ -7922,6 +7959,7 @@ namespace fastllm {
         s.missBelowThreshold = pcStatMissBelowThreshold.load();
         s.missGenerationMismatch = pcStatMissGeneration.load();
         s.missRestoreFailed = pcStatMissRestoreFailed.load();
+        s.missExtraMissing = pcStatMissExtraMissing.load();
         s.missOther = pcStatMissOther.load();
         s.missProbeEmpty = pcStatMissProbeEmpty.load();
         s.missLayerMin = pcStatMissLayerMin.load();
@@ -7938,6 +7976,9 @@ namespace fastllm {
         s.evictTrieNodes = pcStatEvictTrieNodes.load();
         s.evictCpuTierCalls = pcStatEvictCpuTierCalls.load();
         s.evictCpuTierBytes = pcStatEvictCpuTierBytes.load();
+        s.evictDemotePages = pcStatEvictDemotePages.load();
+        s.evictCpuToDiskBytes = pcStatEvictCpuToDiskBytes.load();
+        s.evictHardDropNodes = pcStatEvictHardDropNodes.load();
         // 层占用快照: CPU/disk 用既有全局计数; mem-trie 遍历 manager 求和
         s.cpuTierResidentBytes = pagedPrefixCacheCpuTierBytes.load();
         s.diskResidentBytes = pagedPrefixCacheDiskLiveBytes.load();
@@ -8946,6 +8987,21 @@ namespace fastllm {
     }
 
     void PagedCacheManager::Grow(int newMaxPages) {
+        std::string growError;
+        if (!this->TryGrow(newMaxPages, &growError)) {
+            ErrorInFastLLM(growError);
+        }
+    }
+
+    // 非抛出扩容。失败时把原因写进 *error 并返回 false，调用方负责
+    // 「逐出/下沉 -> 重试 -> 排队」，而不是把异常抛到请求线程变成 500。
+    bool PagedCacheManager::TryGrow(int newMaxPages, std::string *error) {
+        auto fail = [&](const std::string &reason) {
+            if (error != nullptr) {
+                *error = reason;
+            }
+            return false;
+        };
         // 全程持锁：并发 Grow 或取页时，旧池释放与内容拷贝必须串行，
         // 否则第二个拷贝会读已释放的底层存储。
         std::lock_guard<std::mutex> guard(this->pageIndexLocker);
@@ -8954,7 +9010,7 @@ namespace fastllm {
             "PagedCacheManager::Grow: invalid paged cache geometry.");
         const int oldPhysicalPages = this->dims[0];
         if (newMaxPages <= oldPhysicalPages) {
-            return;
+            return true;
         }
 
         const size_t oldRows =
@@ -9013,7 +9069,7 @@ namespace fastllm {
                     fflush(stdout);
                 }
                 if (freeBytesLL > 0 && (uint64_t)freeBytesLL < needBytes) {
-                    ErrorInFastLLM(
+                    return fail(
                         "PagedCacheManager::Grow: insufficient free VRAM "
                         "for pool growth (free=" +
                         std::to_string(freeBytesLL / 1048576) +
@@ -9030,7 +9086,7 @@ namespace fastllm {
                         g_pagedPoolCudaBytes.load(std::memory_order_relaxed);
                     if (cur + (long long)(newBytes - oldBytes) >
                         (long long)budget) {
-                        ErrorInFastLLM(
+                        return fail(
                             "PagedCacheManager::Grow: paged pool budget "
                             "exceeded (pool=" +
                             std::to_string(cur / 1048576) + "MB, budget=" +
@@ -9040,7 +9096,7 @@ namespace fastllm {
             }
             uint8_t *newData = (uint8_t*)FastllmCudaDirectMalloc(newBytes);
             if (newData == nullptr) {
-                ErrorInFastLLM(
+                return fail(
                     "PagedCacheManager::Grow: failed to allocate larger page pool.");
             }
             if (this->cudaData != nullptr && oldBytes > 0) {
@@ -9048,7 +9104,7 @@ namespace fastllm {
                 if (!FastllmCudaValidatePointerRange(
                         this->cudaData, oldBytes, deviceId)) {
                     FastllmCudaDirectFree(newData);
-                    ErrorInFastLLM(
+                    return fail(
                         "PagedCacheManager::Grow: current CUDA pool pointer is invalid.");
                 }
                 FastllmCudaCopyFromDeviceToDevice(
@@ -9060,7 +9116,7 @@ namespace fastllm {
             this->cudaData = newData;
             PagedCacheCudaPoolBytesAdd((long long)(newBytes - oldBytes));
 #else
-            ErrorInFastLLM(
+            return fail(
                 "PagedCacheManager::Grow: CUDA storage is unavailable.");
 #endif
         } else if (this->dataDevice == DataDevice::CPU) {
@@ -9076,7 +9132,7 @@ namespace fastllm {
             delete[] this->cpuData;
             this->cpuData = newData;
         } else {
-            ErrorInFastLLM(
+            return fail(
                 "PagedCacheManager::Grow: unsupported storage device.");
         }
 
@@ -9108,6 +9164,7 @@ namespace fastllm {
                 1, std::memory_order_release);
         }
 #endif
+        return true;
     }
 
     void PagedCacheManager::SetMaxPages(int maxPages) {
@@ -9158,6 +9215,7 @@ namespace fastllm {
         }
         pageToTrieNode.erase(pageIndex);
         ReleasePagedPrefixCacheDiskReference(node->tierDisk);
+        PrefixCacheStatsObserveEviction("hard-drop", 1);
         delete node;
     }
 
@@ -9367,9 +9425,8 @@ namespace fastllm {
             // 懒分配页池兜底：无可用页且逻辑预算未用完时扩容后重试。
             // 所有调用方（decode、MTP 校验 CoW、prefix restore、swap）
             // 无需各自处理页不足。
-            // 【上游BUMP勿回退】同上: 这里的 Grow 也要包 try/catch。裸抛会在
-            // "还没试过回收冷前缀"的情况下就把整批在飞请求打挂 —— 而回收往往
-            // 是能成功的(冷前缀页下放到 L2/L3 就能腾出物理页)。
+            // 【上游BUMP勿回退】TryGrow 不抛错：扩容失败时先把最冷的前缀页下沉到 L2/L3
+            // 换回物理页，再重试一次；仍拿不到才由调用方处理。
             if (this->maxPages > this->dims[0]) {
                 int grown = GetPagedCacheGrowthTarget(
                     this->dims[0], this->maxPages, 1);
@@ -9378,19 +9435,12 @@ namespace fastllm {
                     fprintf(stderr,
                             "[PagedCache] Grow fallback: dims0=%d -> %d\n",
                             this->dims[0], grown);
-                    try {
-                        this->Grow(grown);
-                    } catch (const std::exception &growError) {
+                    std::string growError;
+                    if (!this->TryGrow(grown, &growError)) {
                         fallbackGrowFailed = true;
                         fprintf(stderr,
-                                "[PagedCache] Grow fallback 失败, 改为回收冷前缀: "
-                                "%s\n",
-                                growError.what());
-                    } catch (...) {
-                        fallbackGrowFailed = true;
-                        fprintf(stderr,
-                                "[PagedCache] Grow fallback 失败(未知异常), "
-                                "改为回收冷前缀\n");
+                                "[PagedCache] Grow fallback failed: %s\n",
+                                growError.c_str());
                     }
                 }
                 std::lock_guard<std::mutex> guard(this->pageIndexLocker);
@@ -9402,13 +9452,9 @@ namespace fastllm {
                 pageIndex = GetUnusedPageIndexLocked(pick, nullptr);
             }
             if (pageIndex < 0) {
-                // 扩不动就把冷前缀页下放到 L2/L3 换物理页回来 —— 这是抛错之前
-                // 的最后一条路, 也是三级缓存存在的意义。
+                this->DemoteColdTriePages(1);
                 std::lock_guard<std::mutex> guard(this->pageIndexLocker);
-                if (!this->triePages.empty() &&
-                    EvictColdPagesLocked(nullptr, 1) > 0) {
-                    pageIndex = GetUnusedPageIndexLocked(pick, nullptr);
-                }
+                pageIndex = GetUnusedPageIndexLocked(pick, nullptr);
             }
         }
         if (pageIndex < 0) {
@@ -9939,7 +9985,7 @@ namespace fastllm {
         const uint64_t diskMinHits = PrefixCacheEnvBytes(
             "FASTLLM_PREFIX_CACHE_DISK_MIN_HITS", 2);
         const uint64_t diskMinTokens = PrefixCacheEnvBytes(
-            "FASTLLM_PREFIX_CACHE_DISK_MIN_TOKENS", 65536);
+            "FASTLLM_PREFIX_CACHE_DISK_MIN_TOKENS", 4096);
         if (PagedPrefixCacheDiskTierEnabled() &&
             (node->accessCount >= diskMinHits ||
              prefixTokens >= diskMinTokens) &&
@@ -10059,6 +10105,157 @@ namespace fastllm {
                 break;
             }
         }
+        return freed;
+    }
+
+    // 主动把最冷的、未被引用的 Trie 页下沉到 L2/L3,并把物理页归还
+    // freePages。与 GetUnusedPageIndexLocked 里的"被动逐出"相比,这条路径
+    // 在调度器里提前跑,把 D2H 拷贝挪出前向关键路径,并保证压力来临前
+    // L2/L3 就已经有数据。返回实际下沉的页数。
+    int PagedCacheManager::DemoteColdTriePages(int wantPages) {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        return this->DemoteColdTriePagesLocked(wantPages);
+    }
+
+    int PagedCacheManager::DemoteColdTriePagesLocked(int wantPages) {
+        if (wantPages <= 0 || this->trieRoot == nullptr ||
+            !PagedPrefixCacheCpuTierEnabled()) {
+            return 0;
+        }
+        if (this->triePages.empty()) {
+            return 0;
+        }
+        const int maxPerCall = (int)PrefixCacheEnvBytes(
+            "FASTLLM_PREFIX_CACHE_DEMOTE_MAX_PAGES", 64);
+        const int budget = std::min(wantPages, std::max(1, maxPerCall));
+        std::vector<std::pair<CacheTrieNode*, int> > candidates;
+        candidates.reserve(this->triePages.size());
+        for (int pid : this->triePages) {
+            if (pid < 0 || pid >= (int)this->pageRefCount.size() ||
+                this->pageRefCount[pid] > 0) {
+                continue;
+            }
+            auto it = this->pageToTrieNode.find(pid);
+            if (it == this->pageToTrieNode.end() || it->second == nullptr) {
+                continue;
+            }
+            candidates.push_back(std::make_pair(it->second, pid));
+        }
+        // partial_sort: 只需要最冷的 budget 个，O(n log budget)。
+        // 全排序在 triePages 达到几万页时会把调度线程拖垮。
+        auto colder = [](const std::pair<CacheTrieNode*, int> &left,
+                         const std::pair<CacheTrieNode*, int> &right) {
+            if (left.first->accessCount != right.first->accessCount) {
+                return left.first->accessCount <
+                    right.first->accessCount;
+            }
+            return left.first->lastAccessTimestamp <
+                right.first->lastAccessTimestamp;
+        };
+        const size_t head = std::min(
+            candidates.size(), (size_t)std::max(1, budget));
+        std::partial_sort(
+            candidates.begin(), candidates.begin() + head,
+            candidates.end(), colder);
+        candidates.resize(head);
+        std::unordered_set<int> demoted;
+        for (const auto &item : candidates) {
+            if ((int)demoted.size() >= budget) {
+                break;
+            }
+            CacheTrieNode *node = item.first;
+            const int pid = item.second;
+            if (!PageOutTrieNode(node)) {
+                continue;
+            }
+            this->pageToTrieNode.erase(pid);
+            node->pageId = -1;
+            node->timestamp = 0;
+            demoted.insert(pid);
+        }
+        if (demoted.empty()) {
+            return 0;
+        }
+        int write = 0;
+        for (int i = 0; i < (int)this->triePages.size(); i++) {
+            const int pid = this->triePages[i];
+            if (demoted.count(pid) != 0) {
+                continue;
+            }
+            this->triePages[write++] = pid;
+        }
+        this->triePages.resize(write);
+        for (int pid : demoted) {
+            this->triePagesSet.erase(pid);
+            if (this->freePagesSet.insert(pid).second) {
+                this->freePages.push_back(pid);
+            }
+        }
+        PrefixCacheStatsObserveEviction(
+            "demote-pages", (uint64_t)demoted.size());
+        return (int)demoted.size();
+    }
+
+    // RAM 层满时把最冷的 payload 写盘再释放（VRAM -> RAM -> disk 的第二跳）。
+    // 约定：调用方持有 pageIndexLocker。
+    uint64_t PagedCacheManager::DemoteCpuTierPayloadsToDisk(
+            uint64_t bytesNeeded) {
+        if (bytesNeeded == 0 || this->trieRoot == nullptr ||
+            !PagedPrefixCacheDiskTierEnabled()) {
+            return 0;
+        }
+        std::vector<CacheTrieNode*> candidates;
+        std::function<void(CacheTrieNode*)> collect =
+            [&](CacheTrieNode *node) {
+                if (node == nullptr) {
+                    return;
+                }
+                if (node->tierPayload != nullptr &&
+                    node->tierDisk == nullptr) {
+                    candidates.push_back(node);
+                }
+                for (const auto &item : node->children) {
+                    collect(item.second);
+                }
+            };
+        collect(this->trieRoot);
+        if (candidates.empty()) {
+            return 0;
+        }
+        std::sort(
+            candidates.begin(), candidates.end(),
+            [](const CacheTrieNode *left, const CacheTrieNode *right) {
+                if (left->accessCount != right->accessCount) {
+                    return left->accessCount < right->accessCount;
+                }
+                return left->lastAccessTimestamp <
+                    right->lastAccessTimestamp;
+            });
+        uint64_t freed = 0;
+        for (CacheTrieNode *node : candidates) {
+            PagedPrefixCacheTierPayload *payload = node->tierPayload.get();
+            if (payload == nullptr) {
+                continue;
+            }
+            if (!GetPagedPrefixCacheDiskStore().Append(
+                    payload->bytes,
+                    payload->uncompressedBytes,
+                    payload->zstdCompressed,
+                    payload->checksum,
+                    node->tierDisk)) {
+                break;
+            }
+            const uint64_t before = pagedPrefixCacheCpuTierBytes.load();
+            node->tierPayload.reset();
+            const uint64_t after = pagedPrefixCacheCpuTierBytes.load();
+            if (before > after) {
+                freed += before - after;
+            }
+            if (freed >= bytesNeeded) {
+                break;
+            }
+        }
+        PrefixCacheStatsObserveEviction("cpu-to-disk", freed);
         return freed;
     }
 

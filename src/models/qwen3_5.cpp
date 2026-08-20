@@ -4847,6 +4847,17 @@ namespace fastllm {
             return enabled == nullptr || enabled[0] == 0 || Qwen35MoeIsTrueString(enabled);
         }
 
+        // decode 期页边界记录总开关(默认开; =0 退回旧行为)。
+        static bool Qwen35DecodePrefixRecordEnabled() {
+            static const bool enabled = []() {
+                const char *value = std::getenv(
+                    "FASTLLM_PREFIX_CACHE_DECODE_RECORD");
+                return value == nullptr || value[0] == 0 ||
+                       Qwen35MoeIsTrueString(value);
+            }();
+            return enabled;
+        }
+
         static int Qwen35LinearPrefixSnapshotIntervalTokens() {
             // 默认 64 页(8K token)过稀: 第二个 snapshot 起必须 interval
             // 对齐才能记录, 长上下文请求的 snapshot 点稀疏, 查询命中被
@@ -4870,6 +4881,17 @@ namespace fastllm {
             // 深 snapshot → 整链 no-record。 snapshot 存 CPU tensor,
             // 48 个约几 GB 主机内存, 64GB 级主机可承受。
             return std::max(1, Qwen35EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS", 48));
+        }
+
+        static uint64_t Qwen35LinearPrefixSnapshotMaxBytes() {
+            const char *value = std::getenv(
+                "FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_BYTES");
+            if (value == nullptr || value[0] == 0) {
+                return UINT64_C(4294967296);   // 4 GiB
+            }
+            char *end = nullptr;
+            unsigned long long parsed = std::strtoull(value, &end, 10);
+            return end == value ? UINT64_C(4294967296) : (uint64_t)parsed;
         }
 
         static bool Qwen35LayerIsLinearAttention(const Qwen3_5Model *model, int layer) {
@@ -5113,6 +5135,38 @@ namespace fastllm {
             dst.ToDevice(DataDevice::CUDA, {device}, true);
             return dst.dataDevice == DataDevice::CUDA &&
                    dst.cudaData != nullptr && dst.dims.size() >= 2;
+        }
+
+        static uint64_t Qwen35SnapshotCacheBytes(
+                const Qwen35LinearPrefixSnapshotCache &cache) {
+            if (!cache.valid) {
+                return 0;
+            }
+            uint64_t bytes = cache.single.GetBytes();
+            for (const auto &item : cache.locals) {
+                bytes += item.second.GetBytes();
+            }
+            return bytes;
+        }
+
+        static uint64_t Qwen35LinearPrefixSnapshotBytes(
+                const Qwen35LinearPrefixSnapshot *snapshot) {
+            if (snapshot == nullptr) {
+                return 0;
+            }
+            uint64_t bytes = snapshot->tokens.size() * sizeof(int);
+            for (const auto &layer : snapshot->layers) {
+                if (!layer.linear) {
+                    continue;
+                }
+                bytes += Qwen35SnapshotCacheBytes(layer.first);
+                bytes += Qwen35SnapshotCacheBytes(layer.second);
+            }
+            if (snapshot->mtpValid) {
+                bytes += snapshot->mtpKey.GetBytes();
+                bytes += snapshot->mtpValue.GetBytes();
+            }
+            return bytes;
         }
 
         static const Qwen35LinearPrefixSnapshot *Qwen35FindLinearPrefixSnapshotLocked(
@@ -9032,58 +9086,21 @@ namespace fastllm {
             return false;
         }
         int pageLen = fastllm::GetPageLen();
-        int currentLenRaw = Qwen35CurrentTokenGrowingCacheLen(this, this->block_cnt, context->pastKeyValues);
-        // Record the page-aligned prefix instead of rejecting unaligned tails:
-        // generation-end calls include generated tokens, so requiring
-        // currentLen % pageLen == 0 meant hybrid-agent requests never recorded
-        // anything (the whole record path is gated on this extra returning
-        // true, leaving the L1 trie permanently empty).
-        int currentLen = 0;
-        const bool snapshotLenUsable = fastllm::PagedPrefixSnapshotLengthUsable(
-            currentLenRaw, pageLen, &currentLen);
-        if (currentLen <= 0 || currentLen > (int)context->allTokens.size()) {
-            PrefixCacheStatsObserveRecordPath("extra-skip-len");
+        const int currentLenRaw = Qwen35CurrentTokenGrowingCacheLen(
+            this, this->block_cnt, context->pastKeyValues);
+        const int currentLen = currentLenRaw;
+        // 【上游BUMP勿回退】线性注意力层保存的是"消费了 currentLen 个 token 之后"的递归状态,
+        // 无法截断到更早的长度。721440f2 把这个状态贴上
+        // floor(currentLen/pageLen)*pageLen 的标签来绕开对齐限制,恢复时会
+        // 让 [aligned, currentLen) 这段 token 在线性层被重复消费一次
+        // (静默的数值损坏)。这里恢复严格对齐,agent 能记录靠的是
+        // decode 期间在页边界上主动打点(见 MTP 提交循环)。
+        if (pageLen > 0 && currentLenRaw % pageLen != 0) {
+            PrefixCacheStatsObserveRecordPath("extra-skip-unaligned");
             return false;
         }
-        // 【上游BUMP勿回退】GDN 递归状态无法"截断"到页边界, 标称长度必须等于
-        // 状态真实吃过的 token 数, 否则命中即静默算错。
-        //
-        // 上面那句 "currentLen = 向下取整到页" 是为了让生成结束时也能记上快照
-        // (原先要求严格页对齐 -> 混合架构下一条都记不上, L1 trie 恒空)。但它只
-        // 改了**标称长度**, 没有也不可能改**状态本身**:
-        //   snapshot->layers[i] 存的是 pastKeyValues 当前的 GDN 递归状态,
-        //   它对应的是 currentLenRaw 个 token; 而 snapshot->cachedLen 写的是
-        //   向下取整后的 currentLen, snapshot->tokens 也只取前 currentLen 个。
-        // 于是命中恢复时(见本文件 RestorePagedPrefixCacheExtra 与
-        // Qwen35RestoreSnapshotCache):
-        //   - 全注意力 KV 被恢复成正好 cachedLen 个 token(页粒度, 见
-        //     qwen3_5.cpp 内 restoreOne 的 cache.Resize({..., cachedLen, ...}));
-        //   - GDN 递归状态却已经吃过 currentLenRaw 个 token;
-        //   - 模型随后从第 cachedLen 个 token 继续前向,
-        //     区间 [cachedLen, currentLenRaw) 的 token 被**卷进递归状态两次**。
-        // 差值最大 pageLen-1 = 127 个 token。表现是命中后输出悄悄变差, 不报错、
-        // 不崩溃, 没有任何日志 —— 属于最难查的一类。
-        //
-        // 为什么现在才需要修: 线上 token 级命中率长期约 0.13%
-        // (实测 hitTok=2176/1713565, 且 hitTok/hitReqs 恒等于 128), 这条路几乎
-        // 没被走到, 所以一直没暴露。一旦命中率被提上去, 它立刻变成正确性事故。
-        //
-        // 修法: 状态位置(currentLenRaw)与标称长度(currentLen)不一致就直接不记。
-        // 这不会减少**可复用**的快照 —— 真正能跨请求复用的快照来自分块 prefill
-        // 的对齐记录点(见本文件 "cachedTokens % pageLen == 0" 处的
-        // TryRecordPagedCache 调用, chunk 由 GetChunkedPrefillSize() 保证是
-        // pageLen/snapshot-interval 的整数倍), 那些点天然对齐, 不受影响;
-        // 被丢掉的只是生成结束时那个**请求私有、长度任意**的快照, 它本来就因为
-        // token 序列独一无二而几乎不可能被别的请求匹配上。
-        //
-        // 校验: 见 test/prefixSnapshotAlignTest.cpp 的
-        //       "GDN 快照: 非页对齐位置必须拒绝记录" 用例。
-        // 不一致**总是**计数(线上要看到它多频繁); 是否因此拒绝由
-        // FASTLLM_PREFIX_CACHE_STRICT_SNAPSHOT_ALIGN 决定, 默认不拒绝。
-        if (currentLen != currentLenRaw) {
-            PrefixCacheStatsObserveRecordPath("extra-skip-unaligned");
-        }
-        if (!snapshotLenUsable) {
+        if (currentLen <= 0 || currentLen > (int)context->allTokens.size()) {
+            PrefixCacheStatsObserveRecordPath("extra-skip-len");
             return false;
         }
         int lastSnapshotLen = context->intParams["qwen35_linear_prefix_last_len"];
@@ -9092,8 +9109,13 @@ namespace fastllm {
             PrefixCacheStatsObserveRecordPath("extra-skip-no-progress");
             return false;
         }
+        // 节流改成"距上次快照至少推进 interval 个 token",而不是要求
+        // currentLen 恰好是 interval 的整数倍。原写法在 chunk=512 /
+        // interval=2048 时把 3/4 的 prefill 边界丢掉,decode 期间几乎
+        // 永远不成立。
         int interval = Qwen35LinearPrefixSnapshotIntervalTokens();
-        if (snapshotCount > 0 && currentLen % interval != 0) {
+        if (snapshotCount > 0 &&
+            currentLen - lastSnapshotLen < interval) {
             PrefixCacheStatsObserveRecordPath("extra-skip-interval");
             return false;
         }
@@ -9203,6 +9225,32 @@ namespace fastllm {
             int maxRecords = Qwen35LinearPrefixSnapshotMaxRecords();
             while ((int)items.size() > maxRecords) {
                 items.erase(items.begin());
+            }
+            const uint64_t maxBytes = Qwen35LinearPrefixSnapshotMaxBytes();
+            if (maxBytes > 0) {
+                uint64_t total = 0;
+                for (auto &item : items) {
+                    total += Qwen35LinearPrefixSnapshotBytes(item.get());
+                }
+                while (total > maxBytes && items.size() > 1) {
+                    total -= std::min(
+                        total,
+                        Qwen35LinearPrefixSnapshotBytes(
+                            items.begin()->get()));
+                    items.erase(items.begin());
+                }
+                if (fastllm::PrefixCacheStatsEnabled()) {
+                    static std::atomic<uint64_t> logged{0};
+                    if ((logged.fetch_add(1) & 31) == 0) {
+                        printf("[PrefixCache] linear-snapshots: n=%zu "
+                               "bytes=%lluMB cap{n=%d bytes=%lluMB}\n",
+                               items.size(),
+                               (unsigned long long)(total >> 20),
+                               maxRecords,
+                               (unsigned long long)(maxBytes >> 20));
+                        fflush(stdout);
+                    }
+                }
             }
         }
         context->intParams["qwen35_linear_prefix_last_len"] = currentLen;
@@ -19837,9 +19885,24 @@ namespace fastllm {
                     // 超出逻辑预算（模型 token 上限对应的页数），拒绝。
                     return false;
                 }
+                int freeNotInTrie = 0;
                 {
                     std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
+                    freeNotInTrie = (int)manager->freePages.size();
                     if (required <= manager->FreePageCount()) {
+                        // 容量够,但其中一部分是"在 Trie 里的冷前缀页"。
+                        // 提前把要被抢走的那部分下沉到 L2/L3,既保住前缀
+                        // (下一轮可以回捞),又把 D2H 拷贝挪出前向关键路径。
+                        static const bool proactiveDemote = []() {
+                            const char *value = std::getenv(
+                                "FASTLLM_PREFIX_CACHE_PROACTIVE_DEMOTE");
+                            return value == nullptr || value[0] == 0 ||
+                                   Qwen35MoeIsTrueString(value);
+                        }();
+                        if (proactiveDemote && required > freeNotInTrie) {
+                            manager->DemoteColdTriePagesLocked(
+                                (int)required - freeNotInTrie);
+                        }
                         continue;
                     }
                     // 物理页不足但需求在预算内：懒分配页池按需扩容
@@ -19849,7 +19912,27 @@ namespace fastllm {
                 int grown = GetPagedCacheGrowthTarget(
                     manager->dims[0], manager->maxPages,
                     (int)required - currentFree);
-                manager->Grow(grown);
+                // 关键修复：Grow 超预算/显存不足时不再抛错(=请求 500),
+                // 而是「先下沉最冷前缀 -> 重试 -> 仍不够就返回 false」。
+                // 返回 false 会让调度器 `continue` 掉这个请求,下一轮再试
+                // ——这正是用户要的"排队"语义。
+                std::string growError;
+                if (!manager->TryGrow(grown, &growError)) {
+                    manager->DemoteColdTriePages(
+                        (int)required - currentFree);
+                    if (!manager->TryGrow(grown, &growError)) {
+                        static std::atomic<uint64_t> deferLog{0};
+                        if ((deferLog.fetch_add(1) & 63) == 0) {
+                            fprintf(stderr,
+                                    "[PagedCache] defer request: %s "
+                                    "(need=%lld free=%d phys=%d max=%d)\n",
+                                    growError.c_str(), required,
+                                    currentFree, manager->dims[0],
+                                    manager->maxPages);
+                        }
+                        return false;
+                    }
+                }
             }
             return true;
         };
@@ -19875,7 +19958,14 @@ namespace fastllm {
                 int grown = GetPagedCacheGrowthTarget(
                     manager->dims[0], manager->maxPages,
                     it.second - freePages);
-                manager->Grow(grown);
+                // Grow 失败 = 现在没容量,报"短缺"让调度器把这个请求
+                // 留到下一轮(排队),而不是抛错把整批打挂。
+                if (!manager->TryGrow(grown)) {
+                    manager->DemoteColdTriePages(it.second - freePages);
+                    if (!manager->TryGrow(grown)) {
+                        return true;
+                    }
+                }
             }
             return false;
         };
@@ -22641,6 +22731,14 @@ namespace fastllm {
                         } else {
                             ctx->currentTokens.assign(1, curAcceptedTokens.back());
                         }
+                    }
+                    // decode 期页边界打点：让"prompt + 已生成"整体成为
+                    // 下一轮可复用前缀。TryRecordPagedPrefixCacheExtra 自身
+                    // 会做对齐/推进量判断,不满足时立刻返回,开销可忽略。
+                    if (!skipPagedCacheRecord && !ctx->isAbort &&
+                        !curAcceptedTokens.empty() &&
+                        Qwen35DecodePrefixRecordEnabled()) {
+                        ctx->TryRecordPagedCache(model);
                     }
                 }
                 if (cpuRequestSwapEnabled &&
