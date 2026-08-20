@@ -16,6 +16,7 @@
 #include "../../example/apiserver/output_token_limit.h"
 #include "../../example/apiserver/stop_parser.h"
 #include "../../example/apiserver/image_loader.h"
+#include "../../example/apiserver/tool_call_layout.h"
 #include "../../example/apiserver/utf8_stream_assembler.h"
 #include "../../example/apiserver/openai_multimodal_request.h"
 #include "../../include/utils/stop_token_matcher.h"
@@ -93,6 +94,28 @@ int main() {
         CHECK(!sanitized.empty());
         CHECK(rejected.ReplacementCount() > 0);
     }
+
+    const std::string renderedToolLayout =
+        "<tool_call>\r\n<function=__FL_TOOL_SENTINEL__>\r\n"
+        "<parameter=__FL_ARG_A__>\r\n__FL_VALUE_A__\r\n"
+        "</parameter>\r\n<parameter=__FL_ARG_B__>\r\n"
+        "__FL_VALUE_B__\r\n</parameter>\r\n</function>\r\n"
+        "</tool_call>";
+    fastllm::ToolCallGrammarLayout compiledLayout;
+    std::string layoutError;
+    CHECK(fastllm::CompileToolCallGrammarLayout(
+        renderedToolLayout, compiledLayout, layoutError));
+    CHECK(compiledLayout.valid);
+    CHECK(compiledLayout.functionPrefix == "\r\n<function=");
+    CHECK(compiledLayout.nameTerminator == ">");
+    CHECK(compiledLayout.parameterPrefix == "\r\n<parameter=");
+    CHECK(compiledLayout.parameterValuePrefix == "\r\n");
+    CHECK(compiledLayout.parameterClose == "\r\n</parameter>");
+    CHECK(compiledLayout.functionClose == "\r\n</function>");
+    CHECK(compiledLayout.toolCallClose == "\r\n</tool_call>");
+    CHECK(!fastllm::CompileToolCallGrammarLayout(
+        "<tool_call>missing sentinels</tool_call>",
+        compiledLayout, layoutError));
 
     int selectedOutputLimit = 0;
     std::string outputLimitError;

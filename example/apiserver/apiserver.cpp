@@ -143,6 +143,7 @@ using socket_t = int;
 #include "socket_writer.h"
 #include "openai_output_parser.h"
 #include "utf8_stream_assembler.h"
+#include "tool_call_layout.h"
 #include "output_token_limit.h"
 #include "stop_parser.h"
 #include "image_loader.h"
@@ -243,6 +244,10 @@ ChatTemplateStartupStatus GetChatTemplateStartupStatus() {
 
 void CheckLoadedChatTemplate(
         fastllm::basellm *model, const char *loadStage) {
+    if (model != nullptr) {
+        model->toolCallGrammarLayout =
+            fastllm::ToolCallGrammarLayout();
+    }
     ChatTemplateStartupStatus status;
     if (model == nullptr) {
         status.valid = false;
@@ -273,6 +278,75 @@ void CheckLoadedChatTemplate(
                 model->weight.tokenizer.chatTemplate, context);
         status.valid = result.ok;
         status.error = result.error;
+        if (status.valid) {
+            const json11::Json layoutContext =
+                json11::Json::object {
+                    {"messages", json11::Json::array {
+                        json11::Json::object {
+                            {"role", "user"},
+                            {"content", "tool layout probe"}
+                        },
+                        json11::Json::object {
+                            {"role", "assistant"},
+                            {"content", ""},
+                            {"tool_calls", json11::Json::array {
+                                json11::Json::object {
+                                    {"type", "function"},
+                                    {"function", json11::Json::object {
+                                        {"name", "__FL_TOOL_SENTINEL__"},
+                                        {"arguments", json11::Json::object {
+                                            {"__FL_ARG_A__", "__FL_VALUE_A__"},
+                                            {"__FL_ARG_B__", "__FL_VALUE_B__"}
+                                        }}
+                                    }}
+                                }
+                            }}
+                        }
+                    }},
+                    {"tools", json11::Json::array {
+                        json11::Json::object {
+                            {"type", "function"},
+                            {"function", json11::Json::object {
+                                {"name", "__FL_TOOL_SENTINEL__"},
+                                {"description", "tool layout probe"},
+                                {"parameters", json11::Json::object {
+                                    {"type", "object"},
+                                    {"properties", json11::Json::object {
+                                        {"__FL_ARG_A__", json11::Json::object {
+                                            {"type", "string"}
+                                        }},
+                                        {"__FL_ARG_B__", json11::Json::object {
+                                            {"type", "string"}
+                                        }}
+                                    }},
+                                    {"required", json11::Json::array {
+                                        "__FL_ARG_A__"
+                                    }}
+                                }}
+                            }}
+                        }
+                    }},
+                    {"add_generation_prompt", 0},
+                    {"enable_thinking", 1},
+                    {"preserve_thinking", 1},
+                    {"reasoning_effort", "medium"},
+                    {"add_vision_id", 0}
+                };
+            const fastllm::ChatTemplateDryRunResult layoutResult =
+                fastllm::DryRunChatTemplate(
+                    model->weight.tokenizer.chatTemplate,
+                    fastllm::JinjaVarFromJson(layoutContext));
+            std::string layoutError;
+            if (!layoutResult.ok ||
+                !fastllm::CompileToolCallGrammarLayout(
+                    layoutResult.rendered,
+                    model->toolCallGrammarLayout,
+                    layoutError)) {
+                status.valid = false;
+                status.error = !layoutResult.ok ?
+                    layoutResult.error : layoutError;
+            }
+        }
     }
     {
         std::lock_guard<std::mutex> guard(
@@ -2043,15 +2117,39 @@ struct WorkQueue {
                 toolsEnabled = !config.tool_call_allowed_names.empty();
             }
             if (toolsEnabled) {
+                if (!model->toolCallGrammarLayout.valid) {
+                    writeJsonAndClose(
+                        500, OpenAIHttpError(
+                            "active chat template has no compiled "
+                            "tool-call grammar layout",
+                            "server_error",
+                            "tool_call_layout_unavailable"));
+                    return;
+                }
+                auto trimLeadingLayout = [](std::string value) {
+                    size_t offset = 0;
+                    while (offset < value.size() &&
+                           std::isspace(
+                               static_cast<unsigned char>(
+                                   value[offset]))) {
+                        offset++;
+                    }
+                    return value.substr(offset);
+                };
                 config.tool_call_name_constraint_enabled = true;
                 config.tool_call_invoke_name_prefixes = {
-                    "<function=", "<fuction="
+                    trimLeadingLayout(
+                        model->toolCallGrammarLayout.functionPrefix),
+                    "<fuction="
                 };
-                config.tool_call_name_terminator = ">";
+                config.tool_call_name_terminator =
+                    model->toolCallGrammarLayout.nameTerminator;
                 if (!config.tool_call_allowed_parameter_names.empty()) {
                     config.tool_call_parameter_name_constraint_enabled = true;
                     config.tool_call_parameter_name_prefixes = {
-                        "<parameter=", "<paramter="
+                        trimLeadingLayout(
+                            model->toolCallGrammarLayout.parameterPrefix),
+                        "<paramter="
                     };
                 }
                 if (!config.tool_call_required_parameter_names.empty() &&

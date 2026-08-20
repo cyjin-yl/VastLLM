@@ -153,6 +153,17 @@ namespace fastllm {
         };
     };
 
+    struct ToolCallGrammarLayout {
+        bool valid = false;
+        std::string functionPrefix;
+        std::string nameTerminator;
+        std::string parameterPrefix;
+        std::string parameterValuePrefix;
+        std::string parameterClose;
+        std::string functionClose;
+        std::string toolCallClose;
+    };
+
     struct GenerationConfig {
         int output_token_limit = -1; // 最多输出多少, <= 0代表无限制
         int output_token_least = 0; // 最低输出的多少

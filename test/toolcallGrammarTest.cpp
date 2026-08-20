@@ -2,6 +2,7 @@
 // v100-perfs/tests/toolcall_grammar_invariants.py 的 python 复刻)。
 // 直接驱动 basellm::EvaluateToolCallConstraintText + 合成 vocab。
 #include "models/basellm.h"
+#include "../example/apiserver/tool_call_layout.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -104,6 +105,16 @@ static void Check(const char *name, bool cond, const char *detail = "") {
 
 int main() {
     StubModel m;
+    std::string layoutError;
+    Check("I0.0 Jinja tool layout 编译成功",
+          CompileToolCallGrammarLayout(
+              "<tool_call>\n<function=__FL_TOOL_SENTINEL__>\n"
+              "<parameter=__FL_ARG_A__>\n__FL_VALUE_A__\n"
+              "</parameter>\n<parameter=__FL_ARG_B__>\n"
+              "__FL_VALUE_B__\n</parameter>\n</function>\n"
+              "</tool_call>",
+              m.toolCallGrammarLayout, layoutError),
+          layoutError.c_str());
     // 注入合成 vocab
     for (size_t i = 0; i < VOCAB.size(); i++) {
         m.weight.tokenizer.tokenToStringDict[(int)i] = VOCAB[i];
@@ -112,10 +123,12 @@ int main() {
 
     // ---- I1: 多参数块间隙(已写完 path 块) ----
     std::string P1 =
-        "<tool_call>\n<function=list_dir>\n<parameter=path>/etc</parameter>";
-    Check("I1.2 </function> 可拼出", CanSpell(m, P1, "</function>", cfg));
-    Check("I1.3 <parameter=max_depth> 链路可拼出",
-          CanSpell(m, P1, "<parameter=max_depth>", cfg));
+        "<tool_call>\n<function=list_dir>\n"
+        "<parameter=path>/etc</parameter>";
+    Check("I1.2 Jinja 换行后 </function> 可拼出",
+          CanSpell(m, P1, "\n</function>", cfg));
+    Check("I1.3 Jinja 换行后 <parameter=max_depth> 可拼出",
+          CanSpell(m, P1, "\n<parameter=max_depth>", cfg));
     Check("I1.4 非 schema 名裸 pattern 不可拼",
           !CanSpell(m, P1, "pattern", cfg));
     Check("I1.5 裸 max_depth(无前缀)不可拼",
@@ -133,31 +146,33 @@ int main() {
 
     // ---- I3: 缺必填时 S2 不放行 </function>(修复 B) ----
     std::string P4 =
-        "<tool_call>\n<function=list_dir>\n<parameter=max_depth>2</parameter>";
-    Check("I3.2 缺 path 时 </function> 不可拼",
-          !CanSpell(m, P4, "</function>", cfg));
-    Check("I3.3 缺 path 时 <parameter=path> 可拼",
-          CanSpell(m, P4, "<parameter=path>", cfg));
+        "<tool_call>\n<function=list_dir>\n"
+        "<parameter=max_depth>2</parameter>";
+    Check("I3.2 缺 path 时换行后 </function> 不可拼",
+          !CanSpell(m, P4, "\n</function>", cfg));
+    Check("I3.3 缺 path 时换行后 <parameter=path> 可拼",
+          CanSpell(m, P4, "\n<parameter=path>", cfg));
     std::string P5 = P1 + "\n<parameter=max_depth>2</parameter>";
-    Check("I3.4 必填齐后 </function> 可拼",
-          CanSpell(m, P5, "</function>", cfg));
+    Check("I3.4 必填齐后换行闭合可拼",
+          CanSpell(m, P5, "\n</function>", cfg));
 
     // ---- I4: 空值黑名单 ----
     std::string P6 = "<tool_call>\n<function=list_dir>\n<parameter=path>";
-    Check("I4.2 空值 </parameter> 不可拼",
-          !CanSpell(m, P6, "</parameter>", cfg));
+    Check("I4.2 空值换行后 </parameter> 不可拼",
+          !CanSpell(m, P6, "\n</parameter>", cfg));
     Check("I4.3 全空白值仍不可闭合",
-          !CanSpell(m, P6, "  </parameter>", cfg));
-    Check("I4.4 空值可写非空白值", CanSpell(m, P6, "/etc", cfg));
-    Check("I4.5 非空值后 </parameter> 可拼",
-          CanSpell(m, P6 + "/etc", "</parameter>", cfg));
+          !CanSpell(m, P6, "\n  \n</parameter>", cfg));
+    Check("I4.4 空值可写非空白值",
+          CanSpell(m, P6, "\n/etc", cfg));
+    Check("I4.5 非空值后 Jinja 闭合可拼",
+          CanSpell(m, P6 + "\n/etc", "\n</parameter>", cfg));
 
     // ---- I5: 全流程逐步可生成 ----
     std::vector<std::string> seq = {
-        "<tool_call>", "<function=", "list", "_dir", ">",
-        "<parameter=", "path", ">", "/etc", "</parameter>",
-        "<parameter=", "max", "_depth", ">", "2", "</parameter>",
-        "</function>", "</tool_call>",
+        "<tool_call>", "\n", "<function=", "list", "_dir", ">", "\n",
+        "<parameter=", "path", ">", "\n", "/etc", "\n", "</parameter>", "\n",
+        "<parameter=", "max", "_depth", ">", "\n", "2", "\n",
+        "</parameter>", "\n", "</function>", "\n", "</tool_call>",
     };
     std::string acc;
     bool allOk = true;
@@ -207,34 +222,42 @@ int main() {
     };
     const EvalResult structuralPrefix =
         Eval(m, "<tool_call>", cfg);
-    Check("I0.1 S0 允许真实 function 前缀",
-          evalAllows(structuralPrefix, tokenId("<function=")));
-    Check("I0.2 S0 不允许零进度下划线",
+    Check("I0.1 S0 先允许 Jinja 换行",
+          evalAllows(structuralPrefix, tokenId("\n")));
+    Check("I0.2 S0 不跳过换行直发 function",
+          !evalAllows(structuralPrefix, tokenId("<function=")));
+    Check("I0.3 S0 不允许下划线",
           !evalAllows(structuralPrefix, tokenId("_")));
-    Check("I0.3 S0 不允许零进度空格",
+    Check("I0.4 S0 不允许空格",
           !evalAllows(structuralPrefix, tokenId(" ")));
-    Check("I0.4 S0 不允许零进度点号",
+    Check("I0.5 S0 不允许点号",
           !evalAllows(structuralPrefix, tokenId(".")));
+    const EvalResult structuralAfterNewline =
+        Eval(m, "<tool_call>\n", cfg);
+    Check("I0.6 S0 换行后允许 function 前缀",
+          evalAllows(
+              structuralAfterNewline,
+              tokenId("<function=")));
     const EvalResult functionName =
-        Eval(m, "<tool_call><function=", cfg);
-    Check("I0.5 S1 允许真实工具名",
+        Eval(m, "<tool_call>\n<function=", cfg);
+    Check("I0.7 S1 允许 schema 精确工具名",
           evalAllows(functionName, tokenId("list")));
-    Check("I0.6 S1 不允许前导下划线",
+    Check("I0.8 S1 不允许前导下划线",
           !evalAllows(functionName, tokenId("_")));
-    Check("I0.7 S1 不允许前导点号",
+    Check("I0.9 S1 不允许前导点号",
           !evalAllows(functionName, tokenId(".")));
-    Check("I0.8 S1 允许大小写规范化 List",
-          evalAllows(functionName, tokenId("List")));
+    Check("I0.10 S1 不接受 List 大小写别名",
+          !evalAllows(functionName, tokenId("List")));
     const EvalResult camelToolName =
-        Eval(m, "<tool_call><function=List", cfg);
-    Check("I0.9 S1 允许无下划线 CamelCase 后缀",
-          evalAllows(camelToolName, tokenId("Dir")));
+        Eval(m, "<tool_call>\n<function=List", cfg);
+    Check("I0.11 S1 不继续错误 CamelCase",
+          !evalAllows(camelToolName, tokenId("Dir")));
     const EvalResult exactToolPrefix =
-        Eval(m, "<tool_call><function=list", cfg);
-    Check("I0.10 S1 保留声明内正确位置下划线",
+        Eval(m, "<tool_call>\n<function=list", cfg);
+    Check("I0.12 S1 保留 schema 精确下划线",
           evalAllows(exactToolPrefix, tokenId("_dir")));
-    Check("I0.11 S1 允许规范化后省略下划线",
-          evalAllows(exactToolPrefix, tokenId("Dir")));
+    Check("I0.13 S1 不允许省略 schema 下划线",
+          !evalAllows(exactToolPrefix, tokenId("Dir")));
     const EvalResult toolAfterSeparator =
         Eval(m, "<tool_call><function=list_", cfg);
     Check("I0.12 S1 拒绝重复零进度下划线",
@@ -246,9 +269,9 @@ int main() {
         "<tool_call><function=list_dir><parameter=path>/etc</parameter>"
         "<parameter=max",
         cfg);
-    Check("I0.14 S3 允许 camelCase 参数后缀",
-          evalAllows(parameterPrefix, tokenId("Depth")));
-    Check("I0.15 S3 保留声明内正确位置下划线",
+    Check("I0.14 S3 不接受 camelCase 参数后缀",
+          !evalAllows(parameterPrefix, tokenId("Depth")));
+    Check("I0.15 S3 保留 schema 精确下划线",
           evalAllows(parameterPrefix, tokenId("_depth")));
     const EvalResult parameterAfterSeparator = Eval(
         m,
@@ -268,12 +291,12 @@ int main() {
         {"bash", {"command"}}
     };
     const EvalResult bashStart =
-        Eval(m, "<tool_call><function=", bashConfig);
-    Check("I0.18 S1 允许 Bash 大小写别名",
-          evalAllows(bashStart, tokenId("Bash")));
+        Eval(m, "<tool_call>\n<function=", bashConfig);
+    Check("I0.18 S1 不接受 Bash 大小写别名",
+          !evalAllows(bashStart, tokenId("Bash")));
     const EvalResult bashPartial =
-        Eval(m, "<tool_call><function=ba", bashConfig);
-    Check("I0.19 S1 允许 bash 的真实后缀",
+        Eval(m, "<tool_call>\n<function=ba", bashConfig);
+    Check("I0.19 S1 允许 bash 的精确后缀",
           evalAllows(bashPartial, tokenId("sh")));
     Check("I0.20 S1 拒绝声明外新增空格",
           !evalAllows(bashPartial, tokenId(" sh")));
@@ -302,31 +325,35 @@ int main() {
     std::vector<GenerationConfig> speculativeRows;
     m.AppendToolCallConstraintRowConfigs(
         "<tool_call>\n<function=", cfg,
-        {tokenId("list"), tokenId("_dir"), tokenId(">")},
+        {tokenId("list"), tokenId("_dir"),
+         tokenId(">"), tokenId("\n")},
         speculativeRows);
-    Check("I6.1 verify 生成四行约束",
-          speculativeRows.size() == 4);
+    Check("I6.1 verify 生成五行约束",
+          speculativeRows.size() == 5);
     Check("I6.2 row0 允许 list",
-          speculativeRows.size() == 4 &&
+          speculativeRows.size() == 5 &&
           rowAllows(speculativeRows[0], tokenId("list")));
     Check("I6.3 row1 允许 _dir",
-          speculativeRows.size() == 4 &&
+          speculativeRows.size() == 5 &&
           rowAllows(speculativeRows[1], tokenId("_dir")));
     Check("I6.4 row2 允许名称终止符",
-          speculativeRows.size() == 4 &&
+          speculativeRows.size() == 5 &&
           rowAllows(speculativeRows[2], tokenId(">")));
-    Check("I6.5 row3 转入必填参数起点",
-          speculativeRows.size() == 4 &&
-          rowAllows(speculativeRows[3], tokenId("<parameter=")) &&
-          !rowAllows(speculativeRows[3], tokenId("</function>")));
+    Check("I6.5 row3 只进入 Jinja 换行",
+          speculativeRows.size() == 5 &&
+          rowAllows(speculativeRows[3], tokenId("\n")) &&
+          !rowAllows(speculativeRows[3], tokenId("<parameter=")));
+    Check("I6.6 row4 换行后进入参数起点",
+          speculativeRows.size() == 5 &&
+          rowAllows(speculativeRows[4], tokenId("<parameter=")));
 
     // ---- I7: 回归场景(循环形态) ----
     std::string loop = "<tool_call>\n<function=list_dir>\n"
         "<parameter=path>/etc</parameter>\n"
         "<parameter=path>/etc</parameter>\n"
         "<parameter=path>/etc</parameter>";
-    Check("I7.1 重复闭合后 </function> 可达(可跳出)",
-          CanSpell(m, loop, "</function>", cfg));
+    Check("I7.1 重复闭合后 Jinja 换行闭合可达",
+          CanSpell(m, loop, "\n</function>", cfg));
     std::string bad = P1 + "\n<parameter=";
     Check("I7.2 循环起点 pattern 不可拼",
           !CanSpell(m, bad, "pattern>", cfg));

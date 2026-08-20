@@ -753,6 +753,7 @@ namespace fastllm {
         std::vector<std::vector<float> > sin, cos;
 
         WeightMap weight; // 权重
+        ToolCallGrammarLayout toolCallGrammarLayout;
 
         Data sinData, cosData;
         std::map <std::string, Data*> deviceSinDatas, deviceCosDatas; // deviceSinDatas[xxx]代表xxx设备上的sinData

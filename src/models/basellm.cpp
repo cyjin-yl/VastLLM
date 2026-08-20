@@ -269,9 +269,6 @@ namespace fastllm {
             if (hit == nullptr) {
                 return name;
             }
-            printf("[ToolCallTrace] 工具名归一化: '%s' -> '%s'\n",
-                   name.c_str(), hit->c_str());
-            fflush(stdout);
             return *hit;
         }
 
@@ -547,30 +544,25 @@ namespace fastllm {
                 const std::string &partial,
                 const std::string &tokenText,
                 const std::vector<std::string> &allowedValues,
-                const std::string &terminator,
-                bool canonicalizeNames) {
+                const std::string &terminator) {
             if (tokenText.empty()) {
                 return false;
             }
             const std::string combined = partial + tokenText;
-            const auto terminatorPos = combined.find(terminator);
-            const std::string namePart =
+            const auto terminatorPos =
+                combined.find(terminator);
+            const std::string valuePart =
                 terminatorPos == std::string::npos ?
                 combined : combined.substr(0, terminatorPos);
-            for (const auto &name : allowedValues) {
+            for (const auto &allowed : allowedValues) {
                 if (terminatorPos != std::string::npos) {
-                    if (namePart == name ||
-                        (canonicalizeNames &&
-                         ToolCallNameAliasPrefix(
-                             name, namePart, true))) {
+                    if (valuePart == allowed) {
                         return true;
                     }
                     continue;
                 }
-                if (ToolCallConstraintStartsWith(name, namePart) ||
-                    (canonicalizeNames &&
-                     ToolCallNameAliasPrefix(
-                         name, namePart, false))) {
+                if (ToolCallConstraintStartsWith(
+                        allowed, valuePart)) {
                     return true;
                 }
             }
@@ -804,6 +796,7 @@ namespace fastllm {
             return 0;
         }
 
+
         static ToolCallGrammarCursor LocateToolCallGrammarCursor(
                 const std::string &text,
                 const GenerationConfig &config) {
@@ -902,14 +895,16 @@ namespace fastllm {
         }
         std::string partial;
         std::vector<std::string> allowedValues;
+        std::string constraintState = "legacy";
         std::string activeTerminator =
                 generationConfig.tool_call_name_terminator.empty()
                 ? "\"" : generationConfig.tool_call_name_terminator;
-        bool canonicalizeEnumNames = false;
         if (ToolCallGrammarEnabled()) {
             // ---- 完整状态机路径(默认) ----
             const ToolCallGrammarCursor cursor =
                     LocateToolCallGrammarCursor(generatedText, generationConfig);
+            constraintState =
+                ToolCallGrammarStateName(cursor.state);
 
             // 块内禁止停止符。
             //
@@ -961,18 +956,28 @@ namespace fastllm {
                 case TG_NONE:
                     return;
                 case TG_FUNC_OPEN: {
-                    // S0: 只允许延伸成 invoke 前缀("<function=" 含拼写容错变体)
                     const std::string tail =
-                            generatedText.substr(cursor.segmentStart);
-                    size_t best = 0;
-                    for (const auto &prefix :
-                         generationConfig.tool_call_invoke_name_prefixes) {
-                        best = std::max(best,
-                                ToolCallTailPrefixOverlap(tail, prefix));
+                        generatedText.substr(
+                            cursor.segmentStart);
+                    if (toolCallGrammarLayout.valid) {
+                        allowedValues = {
+                            toolCallGrammarLayout.functionPrefix
+                        };
+                    } else {
+                        // 非 apiserver 调用者的兼容路径。
+                        allowedValues =
+                            generationConfig
+                                .tool_call_invoke_name_prefixes;
                     }
-                    partial = tail.substr(tail.size() - best);
-                    allowedValues =
-                            generationConfig.tool_call_invoke_name_prefixes;
+                    size_t best = 0;
+                    for (const auto &target : allowedValues) {
+                        best = std::max(
+                            best,
+                            ToolCallTailPrefixOverlap(
+                                tail, target));
+                    }
+                    partial =
+                        tail.substr(tail.size() - best);
                     activeTerminator = "\x01";
                     handled = !allowedValues.empty();
                     break;
@@ -983,7 +988,6 @@ namespace fastllm {
                         allowedValues =
                                 generationConfig.tool_call_allowed_names;
                         handled = true;
-                        canonicalizeEnumNames = true;
                     }
                     break;
                 case TG_PARAM_GAP: {
@@ -1008,18 +1012,30 @@ namespace fastllm {
                                 generatedText, generationConfig,
                                 cursor.functionName, cursor.invokePos);
                     }
-                    const size_t m1 =
-                            ToolCallTailPrefixOverlap(tail, paramPrefix);
+                    const std::string parameterTarget =
+                        toolCallGrammarLayout.valid ?
+                        toolCallGrammarLayout.parameterPrefix :
+                        paramPrefix;
+                    const std::string closeTarget =
+                        toolCallGrammarLayout.valid ?
+                        toolCallGrammarLayout.functionClose :
+                        std::string("</function>");
                     if (!missing.empty()) {
-                        partial = tail.substr(tail.size() - m1);
-                        allowedValues = {paramPrefix};
+                        allowedValues = {parameterTarget};
                     } else {
-                        const size_t m2 =
-                                ToolCallTailPrefixOverlap(tail, "</function>");
-                        partial =
-                                tail.substr(tail.size() - std::max(m1, m2));
-                        allowedValues = {paramPrefix, "</function>"};
+                        allowedValues = {
+                            parameterTarget, closeTarget
+                        };
                     }
+                    size_t best = 0;
+                    for (const auto &target : allowedValues) {
+                        best = std::max(
+                            best,
+                            ToolCallTailPrefixOverlap(
+                                tail, target));
+                    }
+                    partial =
+                        tail.substr(tail.size() - best);
                     activeTerminator = "\x01";
                     handled = true;
                     break;
@@ -1032,7 +1048,6 @@ namespace fastllm {
                                 generatedText, generationConfig, partial,
                                 allowedValues)) {
                         handled = true;
-                        canonicalizeEnumNames = true;
                     }
                     break;
                 case TG_PARAM_VALUE: {
@@ -1068,13 +1083,19 @@ namespace fastllm {
                     break;
                 }
                 case TG_FUNC_CLOSE_TAIL: {
-                    // S5: "</function>" 之后只允许 "</tool_call>"
                     const std::string tail =
-                            generatedText.substr(cursor.segmentStart);
-                    const size_t m =
-                            ToolCallTailPrefixOverlap(tail, "</tool_call>");
-                    partial = tail.substr(tail.size() - m);
-                    allowedValues = {"</tool_call>"};
+                        generatedText.substr(
+                            cursor.segmentStart);
+                    allowedValues = {
+                        toolCallGrammarLayout.valid ?
+                        toolCallGrammarLayout.toolCallClose :
+                        std::string("</tool_call>")
+                    };
+                    const size_t matched =
+                        ToolCallTailPrefixOverlap(
+                            tail, allowedValues.front());
+                    partial =
+                        tail.substr(tail.size() - matched);
                     activeTerminator = "\x01";
                     handled = true;
                     break;
@@ -1152,23 +1173,22 @@ namespace fastllm {
                 FindActiveToolCallParameterNamePartial(
                     generatedText, generationConfig,
                     partial, allowedValues);
-            if (parameterNameActive) {
-                canonicalizeEnumNames = true;
-            } else if (FindActiveToolCallNamePartial(
-                           generatedText, generationConfig,
-                           partial)) {
-                allowedValues =
-                    generationConfig.tool_call_allowed_names;
-                canonicalizeEnumNames = true;
-            } else {
-                if (!FindForcedToolCallParameterBlockStart(
+            if (!parameterNameActive) {
+                if (FindActiveToolCallNamePartial(
                         generatedText, generationConfig,
-                        partial, allowedValues)) {
-                    return;
+                        partial)) {
+                    allowedValues =
+                        generationConfig
+                            .tool_call_allowed_names;
+                } else {
+                    if (!FindForcedToolCallParameterBlockStart(
+                            generatedText, generationConfig,
+                            partial, allowedValues)) {
+                        return;
+                    }
+                    // 旧 grammar 路径的结构前缀仍逐字节匹配。
+                    activeTerminator = "\x01";
                 }
-                // "<parameter=" 目标串不含 ">", 用不可能字符避免
-                // 提前命中终止逻辑。结构前缀不做名字规范化。
-                activeTerminator = "\x01";
             }
         }
         if (allowedValues.empty()) {
@@ -1183,7 +1203,7 @@ namespace fastllm {
             std::string tokenText = this->weight.tokenizer.DecodeTokens(std::vector<int>{tokenId});
             if (IsToolCallEnumTokenAllowed(
                     partial, tokenText, allowedValues,
-                    terminator, canonicalizeEnumNames)) {
+                    terminator)) {
                 allowedIds.push_back(tokenId);
             }
         }
@@ -1203,8 +1223,9 @@ namespace fastllm {
             // mask 激活但候选全灭 -> LLMSamplingBlock 按"空即不 mask"
             // 静默降级为自由采样(409412d6 事故的隐性放大器之一)。
             // 这里打 trace 让静默失效可观测。
-            printf("[ToolCallTrace] mask EXHAUSTED (state active, partial='%s', "
+            printf("[ToolCallTrace] mask EXHAUSTED (state=%s, partial='%s', "
                    "allowedValues=%zu) -> silent fallback to free sampling\n",
+                   constraintState.c_str(),
                    partial.size() > 32 ? partial.substr(0, 32).c_str()
                                        : partial.c_str(),
                    allowedValues.size());
@@ -1216,7 +1237,14 @@ namespace fastllm {
     std::string basellm::ResolveToolCallConstraintName(
             const std::string &name,
             const std::vector<std::string> &declared) const {
-        return ResolveDeclaredToolName(name, declared);
+        std::string resolved =
+            ResolveDeclaredToolName(name, declared);
+        if (resolved != name) {
+            printf("[ToolCallTrace] schema 名归一化: '%s' -> '%s'\n",
+                   name.c_str(), resolved.c_str());
+            fflush(stdout);
+        }
+        return resolved;
     }
 
     void basellm::AppendToolCallConstraintRowConfigs(
