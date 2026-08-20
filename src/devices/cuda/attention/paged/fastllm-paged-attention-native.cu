@@ -6,6 +6,8 @@
 #include "utils/utils.h"
 #include "attention/fastllm-attention-dtype.cuh"
 #include "attention/fastllm-paged-attention-native.cuh"
+#include "attention/fastllm-paged-attention-turbo-xqa.cuh"
+#include "fastllm-kernel-route.h"
 
 #include <algorithm>
 #include <cuda_fp8.h>
@@ -432,6 +434,36 @@ static bool FastllmCudaPagedAttentionNativeChunkedCublasRaw(
         outHeadStride < headDim || outTokenStride < headDim) {
         return false;
     }
+    // 【上游BUMP勿回退】融合式打包分页注意力试探路径。
+    //
+    // 前因后果: 生产是 K=q8_0 + V=turbo3(FASTLLM_QWEN35_TURBO3_KV=1), packedKV 恒为真,
+    // 于是 FastllmCudaHalfPagedAttentionBatchFastllmFallback 里
+    //     useChunkedCublasPrefill = !isDecode || packedKV
+    // 恒为 true —— **decode 也走下面这条 gather + chunked cuBLAS**。它的代价是:
+    //   读分页量化 K/V   272 + 100 = 372 B/行
+    //   写连续 fp16      256*2*2   = 1024 B/行     <- 物化
+    //   cuBLAS 再读回    1024 * group             <- 生产未开 BATCH_GQA, 逐 head 读 6 遍
+    // 合计约 7540 B/行, 是理论下限 372 B/行 的 20 倍。融合 kernel 直接在打包字节上做注意力,
+    // 只读那 372 B(qoLen>1 时按 group 分块重读 qoLen 次)。
+    //
+    // 放在这里而不是 FastllmCudaHalfPagedAttentionBatch 分派层的原因: 这里 per-batch 的
+    // pageIndices / lastPageLen / q 与 out 的 stride 都已经解算好, 不需要再复制一份
+    // device->host 元数据搬运逻辑。
+    //
+    // 安全约定(照抄 fastllm-iq4xs-sm70.cu 的 trial path 规范):
+    //   资格不满足 -> 返回 false 且**不写 outData**, 下面的原路径完全不受影响;
+    //   要求调用方已提供 device 端页表(pageIndicesGpuIn != nullptr), 否则不接管。
+    if (pageIndicesGpuIn != nullptr &&
+        FastllmCudaTrySm70PagedTurboXqa(
+            qData, qType, H, qoLen, qDim, qHeadStride, qTokenStride,
+            pageIndicesGpuIn, numPages, lastPageLen,
+            pagedKVCacheK, pagedKVCacheV, pageLen, numKvHeads, headDim,
+            outData, outType, outHeadStride, outTokenStride, group, scale)) {
+        fastllm::KernelRouteHit(fastllm::KERNEL_ROUTE_ATTN_SM70_TURBO_XQA,
+                                -1, qoLen, 0, 0);
+        return true;
+    }
+
     bool batchGqa = qIsHalf && outIsHalf && group > 1 &&
         FastllmPagedCublasBatchGqaEnabled();
 

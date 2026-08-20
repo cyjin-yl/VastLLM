@@ -46,6 +46,12 @@ namespace fastllm {
         KERNEL_ROUTE_ATTN_SM70_FLASH_PREFILL, // SM70 短 query causal prefill(要求 FP8_E4M3 分页 KV)
         KERNEL_ROUTE_ATTN_FLASHINFER,         // FlashInfer(V100 上不可用)
         KERNEL_ROUTE_ATTN_NATIVE_FALLBACK,    // 原生 gather + chunked cublas
+        // 融合式打包分页注意力(q8_0 K + turbo3 V 直读, 不物化 fp16 中间缓冲)。
+        // 注意: 这一项与 attn.native_fallback **并存**不冲突 —— 后者在
+        // FastllmCudaHalfPagedAttentionBatch 的分派层就已计数, 前者记录的是
+        // 分派进去之后**实际执行**的 kernel。要判断融合路有没有生效, 看这一项是否非零,
+        // 不要看 native_fallback 是否归零。
+        KERNEL_ROUTE_ATTN_SM70_TURBO_XQA,
         KERNEL_ROUTE_COUNT
     };
 

@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
+#include "attention/fastllm-turboquant-kv-layout.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -21,80 +22,37 @@
 
 namespace {
 constexpr int kHeadDim = 256;
-constexpr int kQ8BlockValues = 32;
-constexpr int kQ8BlockBytes = 34;
-constexpr int kTurbo3BlockValues = 128;
-constexpr int kTurbo3BlockBytes = 50;
-constexpr int kTurbo4BlockValues = 128;
-constexpr int kTurbo4BlockBytes = 66;
-constexpr int kQ8RowBytes = (kHeadDim / kQ8BlockValues) * kQ8BlockBytes;
-constexpr int kTurbo3RowBytes = (kHeadDim / kTurbo3BlockValues) * kTurbo3BlockBytes;
-constexpr int kTurbo4RowBytes = (kHeadDim / kTurbo4BlockValues) * kTurbo4BlockBytes;
+
+// 【上游BUMP勿回退】分块几何 / 块结构体 / 码本 / 随机化 Hadamard 符号表, 原先在这里各写一份,
+// 现已抽到 include/devices/cuda/attention/fastllm-turboquant-kv-layout.h。
+//
+// 为什么必须抽出去: 融合分页注意力 kernel(fastllm-paged-attention-turbo-xqa.cu)要直接读同一批
+// 打包字节, host 端的 fp64 对拍参考(test/ops/turboPagedAttentionTest.cpp)也要。三处各抄一份码本
+// 和 128 项符号表, 抄错一个 ±1 或改一个小数位都**不会报错**, 只会让反量化结果悄悄偏掉。
+// 现在 device 侧的 __constant__ 数组和 host 侧的 constexpr 数组从同一个宏展开, 物理上无法只改一边。
+// 下面只做别名与宏展开, 语义与原来逐字节相同(静态断言仍在头文件里)。
+using fastllm::turbokv::kQ8BlockValues;
+using fastllm::turbokv::kQ8BlockBytes;
+using fastllm::turbokv::kTurbo3BlockValues;
+using fastllm::turbokv::kTurbo3BlockBytes;
+using fastllm::turbokv::kTurbo4BlockValues;
+using fastllm::turbokv::kTurbo4BlockBytes;
+constexpr int kQ8RowBytes = (int)fastllm::turbokv::Q8RowBytes(kHeadDim);
+constexpr int kTurbo3RowBytes = (int)fastllm::turbokv::Turbo3RowBytes(kHeadDim);
+constexpr int kTurbo4RowBytes = (int)fastllm::turbokv::Turbo4RowBytes(kHeadDim);
 static_assert(kQ8RowBytes == 272 && kTurbo3RowBytes == 100 && kTurbo4RowBytes == 132,
               "Qwen3.5 TurboQuant packed KV row bytes changed");
 
-struct Q8KvBlock {
-    uint16_t scale;
-    int8_t values[kQ8BlockValues];
-};
-static_assert(sizeof(Q8KvBlock) == kQ8BlockBytes, "Q8 KV block layout changed");
+using Q8KvBlock = fastllm::turbokv::Q8KvBlock;
+using Turbo3KvBlock = fastllm::turbokv::Turbo3KvBlock;
+using Turbo4KvBlock = fastllm::turbokv::Turbo4KvBlock;
 
-struct Turbo3KvBlock {
-    uint16_t norm;
-    uint8_t low2[kTurbo3BlockValues / 4];
-    uint8_t high1[kTurbo3BlockValues / 8];
-};
-static_assert(sizeof(Turbo3KvBlock) == kTurbo3BlockBytes,
-              "Turbo3 KV must remain 50 bytes per 128 values");
-
-struct Turbo4KvBlock {
-    uint16_t norm;
-    uint8_t qs[64];
-};
-static_assert(sizeof(Turbo4KvBlock) == kTurbo4BlockBytes,
-              "Turbo4 KV must remain 66 bytes per 128 values");
-
-__device__ __constant__ float kTurbo3Centroids[8] = {
-    -0.190207f, -0.118786f, -0.066822f, -0.021663f,
-     0.021663f,  0.066822f,  0.118786f,  0.190207f
-};
-__device__ __constant__ float kTurbo3Midpoints[7] = {
-    -0.154496f, -0.092804f, -0.044243f, 0.0f,
-     0.044243f,  0.092804f,  0.154496f
-};
-__device__ __constant__ float kTurbo4Centroids[16] = {
-    -0.241529f, -0.182877f, -0.143016f, -0.111036f,
-    -0.083292f, -0.058050f, -0.034299f, -0.011349f,
-     0.011349f,  0.034299f,  0.058050f,  0.083292f,
-     0.111036f,  0.143016f,  0.182877f,  0.241529f
-};
-__device__ __constant__ float kTurbo4Midpoints[15] = {
-    -0.212203f, -0.162947f, -0.127026f, -0.097164f,
-    -0.070671f, -0.046174f, -0.022824f,  0.000000f,
-     0.022824f,  0.046174f,  0.070671f,  0.097164f,
-     0.127026f,  0.162947f,  0.212203f
-};
-
-__device__ __constant__ float kWhtSigns1[128] = {
-    -1,1,1,-1,-1,1,-1,1,-1,-1,1,1,1,1,1,1,
-    1,-1,1,-1,1,-1,-1,1,1,1,-1,1,1,-1,-1,-1,
-    -1,1,1,-1,1,1,-1,1,-1,1,1,-1,-1,1,-1,1,
-    1,1,1,-1,-1,-1,-1,-1,1,-1,1,1,1,1,-1,1,
-    -1,-1,1,-1,-1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,
-    1,-1,-1,1,1,1,-1,-1,1,1,-1,1,1,-1,1,-1,
-    -1,1,1,-1,1,-1,1,-1,1,1,1,1,-1,1,-1,1,
-    1,-1,1,1,-1,-1,-1,-1,-1,1,1,-1,1,1,-1,1
-};
-__device__ __constant__ float kWhtSigns2[128] = {
-    1,1,1,1,-1,1,1,-1,1,-1,-1,-1,1,-1,-1,-1,
-    1,1,-1,-1,1,-1,1,-1,1,-1,-1,1,-1,1,1,1,
-    1,1,-1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,1,-1,
-    1,-1,1,1,1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,
-    1,-1,1,-1,-1,-1,-1,1,-1,1,-1,1,-1,-1,1,1,
-    -1,1,-1,1,1,-1,1,-1,-1,-1,-1,1,-1,-1,1,-1,
-    1,-1,1,1,1,-1,-1,1,-1,1,-1,1,1,-1,-1,1,
-    -1,1,-1,1,1,-1,1,-1,1,-1,-1,-1,-1,-1,1,-1
-};
+__device__ __constant__ float kTurbo3Centroids[8] = FASTLLM_TURBOKV_TURBO3_CENTROIDS_INIT;
+__device__ __constant__ float kTurbo3Midpoints[7] = FASTLLM_TURBOKV_TURBO3_MIDPOINTS_INIT;
+__device__ __constant__ float kTurbo4Centroids[16] = FASTLLM_TURBOKV_TURBO4_CENTROIDS_INIT;
+__device__ __constant__ float kTurbo4Midpoints[15] = FASTLLM_TURBOKV_TURBO4_MIDPOINTS_INIT;
+__device__ __constant__ float kWhtSigns1[128] = FASTLLM_TURBOKV_WHT_SIGNS1_INIT;
+__device__ __constant__ float kWhtSigns2[128] = FASTLLM_TURBOKV_WHT_SIGNS2_INIT;
 
 template <typename T>
 __device__ __forceinline__ float ToFloat(T value) { return static_cast<float>(value); }

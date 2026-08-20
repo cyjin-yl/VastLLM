@@ -1010,6 +1010,17 @@ namespace fastllm {
         uint64_t missGenerationMismatch = 0;  // generation/布局不匹配
         uint64_t missRestoreFailed = 0;   // 有命中但恢复(paged/extra)失败
         uint64_t missOther = 0;
+        // 【上游BUMP勿回退】下面四项是从原来那个笼统的 "no-record" 里拆出来的。
+        // 拆之前, tryRestorePrefixCache 里四个完全不同的提前返回共用同一个
+        // 名字 "no-record", 于是线上看到 miss{no-record=8} 只能理解成
+        // "trie 里没有这条前缀" —— 而真实原因可能是 trie 明明命中了几百页,
+        // 只是 GDN 快照(extra)对不上, 整个命中被丢掉。这个歧义直接导致
+        // 排查方向长期跑偏(去查记录路径, 而记录路径完全正常)。
+        uint64_t missProbeEmpty = 0;      // 探针 manager 的 trie 查询返回 0 页
+        uint64_t missLayerMin = 0;        // 探针有页, 但某层 manager 页数更少 -> min=0
+        uint64_t missSinglePage = 0;      // 命中长度 >= 请求长度, 退一页后为 0
+        uint64_t missExtraMissing = 0;    // paged 命中了, 但 GDN/linear 快照查不到
+        uint64_t missMultimodalDisabled = 0;  // FASTLLM_PREFIX_CACHE_MULTIMODAL=0 主动跳过
         // 记录被拒原因分布(PageOutTrieNode / Record 路径)
         uint64_t recordAccepted = 0;
         uint64_t recordRejectedMinHitsTokens = 0;  // accessCount<minHits && tokens<minTokens
@@ -1030,9 +1041,32 @@ namespace fastllm {
         uint64_t recordSkipNoPagedLen = 0;   // 无任何层有 paged 长度
         uint64_t recordSkipNoUnbounded = 0;  // 无 unbounded 层 -> reusable=0
         uint64_t recordSkipBoundedShort = 0; // bounded 层页链不足 reusable
-        uint64_t recordSkipManagerInvalid = 0;// manager null/非 KV 类型/页空
+        // 【上游BUMP勿回退】原来这三种情况共用一个计数器 recordSkipManagerInvalid,
+        // 名字叫 "mgr-invalid"。混合架构(Qwen3.5: 16 全注意力层 + 48 SSM/GDN 层)
+        // 下它每次记录都会涨 96(=48 层 x 2), 看起来像"绝大多数层记录失败",
+        // 实际上只是 SSM 层本来就没有分页 KV —— 完全正常。已经有人因此把
+        // 排查方向带偏。拆成三个后, mgr-null(SSM 层无 manager) 与真正的异常
+        // (页链为空 / manager 类型不是 KV_CACHE) 一眼分得开。
+        uint64_t recordSkipManagerInvalid = 0;// = null + noPageIndex + wrongType(总和, 保持向后兼容)
+        uint64_t recordSkipManagerNull = 0;      // pagedKVCacheData == nullptr(SSM/GDN 层的正常情况)
+        uint64_t recordSkipManagerNoPageIndex = 0;// manager 有, 但 pageIndex 为空
+        uint64_t recordSkipManagerWrongType = 0; // manager 类型不是 KV_CACHE
+        // 【上游BUMP勿回退】记录侧挂的 manager 与查询侧 GetPagedKVCacheManagers
+        // 返回的 manager 不是同一个对象的次数。非 0 = 前缀链记进了查询永远看不到
+        // 的 manager, 命中率必然恒为 0(而且不会有任何报错)。见 basellm.cpp 里
+        // checkRecordLookupAgreement 的注释。
+        uint64_t recordManagerLookupMismatch = 0;
         uint64_t recordLayersOk = 0;         // Record() 实际执行层数
         uint64_t recordManagerNoPages = 0;   // Record 内 numPages=0
+        // ---- Query() 中断原因(为什么前缀只匹配到第 N 页就停了)----
+        // 这一组是"命中率为 0"这类问题唯一能直接回答"停在哪、为什么停"的证据。
+        uint64_t queryCalls = 0;             // Query() 调用次数
+        uint64_t queryBreakNoChild = 0;      // trie 里没有这一页的哈希
+        uint64_t queryBreakEdgeMismatch = 0; // 哈希撞上了但 token 不等
+        uint64_t queryBreakMaterialize = 0;  // 页被下放到 L2/L3 且上提失败
+        uint64_t queryBreakGeneration = 0;   // 页时间戳与节点不符(页被复用)
+        uint64_t queryFullMatch = 0;         // 走完了全部页, 没有中断
+        uint64_t queryMatchedPages = 0;      // 累计匹配到的页数
         // qwen3_5 linear-attention extra 子路径
         uint64_t extraCalls = 0;
         uint64_t extraOk = 0;
@@ -1049,11 +1083,12 @@ namespace fastllm {
         uint64_t extraSkipUnaligned = 0;     // GDN 状态位置未页对齐, 丢弃以免错位
     };
     void PrefixCacheStatsObserveRecordPath(const char *event);
+    void PrefixCacheStatsObserveQueryPages(size_t pages);
     bool PrefixCacheStatsEnabled();
     void PrefixCacheStatsObserveRequest(
         int totalTokens, int hitTokens,
         const char *hitLayer,       // "mem-trie" | "cpu" | "disk" | nullptr(未命中)
-        const char *missReason);    // "no-record" | "evicted" | "below-threshold" | "generation" | "restore-failed" | "other" | nullptr(有命中)
+        const char *missReason);    // "no-record" | "probe-empty" | "layer-min" | "single-page" | "extra-missing" | "evicted" | "below-threshold" | "generation" | "restore-failed" | "other" | nullptr(有命中)
     void PrefixCacheStatsObserveRecord(bool accepted, const char *rejectReason);
     void PrefixCacheStatsObserveEviction(const char *kind, uint64_t nodesOrBytes);
     PrefixCacheStats GetPrefixCacheStatsSnapshot();

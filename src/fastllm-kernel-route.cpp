@@ -64,6 +64,7 @@ namespace fastllm {
             case KERNEL_ROUTE_ATTN_SM70_FLASH_PREFILL: return "attn.sm70_flash_prefill";
             case KERNEL_ROUTE_ATTN_FLASHINFER:         return "attn.flashinfer";
             case KERNEL_ROUTE_ATTN_NATIVE_FALLBACK:    return "attn.native_fallback";
+            case KERNEL_ROUTE_ATTN_SM70_TURBO_XQA:     return "attn.sm70_turbo_xqa";
             default:                                   return "unknown";
         }
     }
@@ -161,6 +162,25 @@ namespace fastllm {
         //   n 很大时该走张量核 —— V100 的 DP4A 约 62 TOPS, 而 FP16 张量核
         //   约 125 TFLOPS, 反量化+HGEMM 反而更快。
         // 也就是说这个 kernel 天然只覆盖中间那一段, 不是"应该覆盖全部却漏了"。
+        //
+        // 【下界 8 已实测, 不要凭直觉往下调】2026-08-20, V100 空闲, 把本函数的
+        // minN 改成环境变量强行让 n=1..8 进 MMQ, 与 mmvq 同形状对拍(ms):
+        //
+        //          n =      1       2       3       4       5       6       7       8
+        //   attn_qkv mmvq 0.0421  0.0476  0.0616  0.0730  0.0873  0.1011  0.1143  0.1281
+        //            MMQ  0.1121  0.1116  0.1040  0.1039  0.1038  0.1039  0.1031  0.0997
+        //   ffn_down mmvq 0.0703  0.0723  0.1007  0.1281  0.1630  0.1891  0.2195  0.2563
+        //            MMQ  0.2996  0.2997  0.2999  0.3004  0.3000  0.3002  0.3007  0.2904
+        //
+        // MMQ 的耗时对 n **几乎不变**(n<8 会被 s70_pick_mmq_x 补到 tile 宽 8,
+        // 权重照样整块读一遍), 而 mmvq 随 n 线性涨 —— 交叉点落在 n≈6~8。
+        // decode 的 n=1..3 上 MMQ 慢 1.6~4.3 倍。若要挑剔, 8 反而**略偏低**:
+        // attn_gate/attn_output/ffn_down 在 n=8 上 MMQ 仍慢 13~34%。
+        // 复现: EzraVastLLM/scripts/sm70-mmvq-bench/mmq_vs_mmvq.cu (BENCH_MIN_N=1)。
+        //
+        // 相关: 曾有一条"IQ4_XS decode 比 Q5_K_M 慢, 因为没走到 MMQ 快路径"的
+        // 结论, 已被受控复测推翻(IQ4_XS 实际快 1.20x, mmvq 已跑到 V100 带宽的
+        // 82%)。见 v100-perfs/docs/EXPERIENCE.md §15.35 第 8 条。
         if (n < kSm70Iq4XsMmqMinN || n > kSm70Iq4XsMmqMaxN) {
             return "n range";
         }

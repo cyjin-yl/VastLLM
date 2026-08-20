@@ -337,6 +337,7 @@ if (USE_CUDA)
         src/devices/cuda/attention/paged/fastllm-paged-attention-native.cu
         src/devices/cuda/attention/paged/fastllm-sm70-flash-attention.cu
         src/devices/cuda/attention/paged/fastllm-turboquant-kv.cu
+        src/devices/cuda/attention/paged/fastllm-paged-attention-turbo-xqa.cu
         src/devices/cuda/linear/fastllm-linear-fp32.cu
         src/devices/cuda/linear/fastllm-linear-fp16.cu
         src/devices/cuda/linear/fastllm-linear-bf16.cu
@@ -636,6 +637,13 @@ if (UNIT_TEST)
     add_executable(testPagedKvBudget test/pagedKvBudgetTest.cpp)
     target_link_libraries(testPagedKvBudget fastllm)
 
+    # 前缀缓存"记录侧 manager 与查询侧 manager 必须是同一个对象"的回归。
+    # 两侧的全局层号基址一旦分叉(vision 前向曾硬编码 i*2, 而查询侧用
+    # threadTpPagedCacheBase+i), 前缀链会被记进一组永远不被查询的 manager,
+    # 命中率恒为 0 且**完全静默**。判定是纯 CPU 逻辑, 不需要 GPU。
+    add_executable(testPrefixCacheRouting test/prefixCacheRoutingTest.cpp)
+    target_link_libraries(testPrefixCacheRouting fastllm)
+
     # 算子路由普查 + SM70 IQ4_XS MMQ 形状资格。
     # 这两件事的共同点是"数字边界决定整块代码有没有被用到", 而且走错路
     # **完全静默**(结果对, 只是慢)。已经因此误判过两次: 把恒不生效的
@@ -669,6 +677,15 @@ if (UNIT_TEST)
     target_link_libraries(regressionOps fastllm)
     if (USE_CUDA AND NOT USE_ROCM)
         target_include_directories(regressionOps PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    endif()
+
+    # 打包分页 KV(K=q8_0 / V=turbo3)注意力的 fp64 数值对拍。
+    # 单独成 target 而不是塞进 regressionOps: regressionOps.cpp 是与上游的历史冲突文件
+    # (见 UPSTREAM_BUMP_CHECKLIST.md), 往里加东西会让每次 bump 的拆分更难。
+    add_executable(testTurboPagedAttention test/ops/turboPagedAttentionTest.cpp)
+    target_link_libraries(testTurboPagedAttention fastllm)
+    if (USE_CUDA AND NOT USE_ROCM)
+        target_include_directories(testTurboPagedAttention PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     endif()
 
     add_executable(testApiServerSocket

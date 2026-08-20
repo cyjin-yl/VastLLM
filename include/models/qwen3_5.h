@@ -302,6 +302,9 @@ namespace fastllm {
 
     protected:
         bool IsThreadTensorParallelEnabled() const;
+        // 分页 KV manager 的全局层号基址。所有挂 PagedCacheManager 的前向
+        // 路径都必须经由它取基址(定义处有长注释)。首次调用时惰性分配。
+        int PagedCacheLayerBase();
 
 
         std::vector <int> ForwardGPUWithHiddenStates(

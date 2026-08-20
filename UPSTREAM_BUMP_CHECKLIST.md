@@ -12,7 +12,7 @@ grep -rn "上游BUMP勿回退" src/ include/ example/ --include=*.cpp --include=
 
 每处标记都写明了「回退会导致什么」。**冲突解决时以本仓版本为准。**
 
-## 当前受保护的 23 处
+## 当前受保护的 29 处
 
 | 文件 | 修复 | 回退的后果 |
 |---|---|---|
@@ -39,6 +39,17 @@ grep -rn "上游BUMP勿回退" src/ include/ example/ --include=*.cpp --include=
 | `src/models/basellm.cpp` + `include/models/basellm.h` + `example/apiserver/apiserver.cpp` | **`GetPagedCachePoolStats` 按物理页 `dims[0]` 统计水位, 逻辑预算 `maxPages` 单独由 `logicalMaxPagesOut` 带出; metrics 行加 `budget=` 字段** | 这是 af3830b1(页字节数 `dims[0]` vs `maxPages`)的**同胞, 当时漏掉的一处**。页池懒分配: `initialPages = min(128, maxPages)`, 之后靠 `Grow()` 追赶, 而 `freePages` 里只可能有物理页。旧式 `maxPages - FreePageCount()` 把"还没分配出来的页"全算成"正在使用"。线上实测(2026-08-20 空载, 只跑过 2 个请求): 32 个 manager 各 `maxPages=2048`/`dims[0]=128` 且全空闲, 打印成 **`kv_pool=61440/65536 pg (94%)`, 而真实占用是 0%**。一整天"页池顶满"的判断都建立在这个数上, 导致反复去动池预算和前缀缓存, 而池子其实是空的。`qwen3_5.cpp` 调度器里 `busyPages` 一直是对的(显式用 `dims[0]`), 两边口径必须一致 |
 | `src/fastllm.cpp` + `src/models/qwen3_5.cpp` | **GDN 快照标称长度与递归状态位置不一致时计数(`extra-skip-unaligned`), 并提供 `FASTLLM_PREFIX_CACHE_STRICT_SNAPSHOT_ALIGN` 逃生开关** | `TryRecordPagedPrefixCacheExtra` 把 `currentLen` 向下取整到页边界, 但快照里的 GDN 递归状态对应的是取整**前**的 `currentLenRaw`。命中恢复时全注意力 KV 被恢复成正好 `cachedLen` 个 token, 而递归状态已经吃过更多, 区间 `[cachedLen, currentLenRaw)`(最多 127 个 token)被**卷进递归状态两次** —— 静默算错, 不报错不崩溃。**默认不拒绝**是刻意的: agent 负载的主导形态是单调增长的会话(第 N 轮 prompt 严格包含第 N-1 轮全部内容), 服务它的恰恰是生成结束时那个必然不对齐的快照, 拒绝掉会让每轮全量重算。真正的解法是"在 decode 的对齐点记录快照", 未验证前不上。回退掉计数器就再也看不到这个偏差有多频繁 |
 | `src/fastllm.cpp` | **L3 准入判据加寻道项 + 并发放大 + margin; 介质能力只读 sysfs 推导, 零探针零写入** | 原判据只有带宽项 `storedBytes/readRate`, 冷启动默认 300MB/s。本机 L3 落在 `/dev/sda` = **ST16000NM000J 7200rpm 机械盘**(实测随机读中位 24ms / 41MB/s), 于是: (1) 一个 372KB 的页按纯带宽算 9ms、按"寻道+带宽"算 33ms, **高估 3.7 倍**; (2) 机械盘寻道在并发下**串行化**, 8 并发时取回 263ms 反而慢于重算 199ms —— 这就是"单请求划算、并发就亏"的分界线; (3) 冷启动 300MB/s 比实测快 7 倍, 样本攒够之前一路误判。**探测方式是硬约束**: 不做启动探针 —— 写探针文件消耗 SSD 的 TBW 寿命, 随机读探测有机械磨损, 而这是**用户设备**上长期生效的行为。改用只读 `/proc/mounts` + `/sys/class/block/<dev>/queue/rotational` 推导(零 I/O、零写入、换机器自动正确, 不需要校准文件和设备指纹失效逻辑); 运行期真实带宽/重算速度本来就在被动累积(`ObservePagedPrefixCacheRecompute` 等), 有样本就顶掉 sysfs 默认值。未识别设备(NFS/tmpfs)落**保守**默认(按机械盘), 宁可少用一层也不要在未知介质上把请求拖死。判据做成纯函数 `PagedPrefixCacheStorageWinsPure` 以便单测钉死 —— 判错不会报错, 只会悄悄变慢 |
+| `include/devices/cuda/attention/fastllm-turboquant-kv-layout.h` + `src/devices/cuda/.../fastllm-turboquant-kv.cu` | **打包 KV 的分块几何 / 码本 / 随机化 Hadamard 符号表抽成唯一真相源, device `__constant__` 与 host `constexpr` 从同一个宏展开** | 这批常量原先只存在于 `fastllm-turboquant-kv.cu` 的匿名 namespace。现在有三处要读同一批打包字节: 量化/gather kernel、融合注意力 kernel、host 端 fp64 对拍参考。各抄一份的话, 改错码本的一个小数位或抄错 128 项符号表里的一个 ±1 **都不会报错**, 只会让反量化结果悄悄偏掉 —— 正是本仓吃过亏的那类静默故障。bump 时若把头文件丢掉、让 .cu 各自再写一份字面量, 保护就没了 |
+| `src/devices/cuda/attention/paged/fastllm-paged-attention-turbo-xqa.cu` | **融合式打包分页注意力: 逆 Walsh-Hadamard 变换整体挪到 combine kernel 末尾, 每次注意力只做一次** | turbo3 的反量化是 `InverseWht128(centroid[idx]*norm)`, 展开为 `D1·H·D2` —— **纯线性正交变换**。因为 P·V 累加、在线 softmax 的 `acc*=corr`、split-K 合并全是标量加权, 有 `Σ_j p_j·W⁻¹(u_j) = W⁻¹(Σ_j p_j·u_j)`, 所以 acc 可以全程停在未变换域(u 域), 只在最后变换一次。**这不是顺手的优化, 是 kernel 能成立的前提**: 若"顺手改回"每个 key 都做一次逆 WHT(看起来更直白、和 gather kernel 更像), 每 warp 每 token 要多付约 72 条 ALU + 32 条 warp shuffle, 内核从访存瓶颈变成计算瓶颈, 收益基本被吃光, 而且**结果照样是对的** —— 只会变慢, 不会报错。对拍见 `test/ops/turboPagedAttentionTest.cpp`(延后版对 fp64 参考的 RMS 误差反而比现路径小 2-3 倍) |
+| `src/fastllm.cpp` 的 `AllocatePagedCacheManager` + 一切按物理页号寻址的代码 | **页池是懒分配的: `initialPages = preallocateMax ? maxPages : min(128, maxPages)`; 物理页数永远读 `dims[0]`, 绝不读 `maxPages`** | 这条已经咬过**三次**, 每次表现完全不同, 但根因是同一个 —— `maxPages` 是**逻辑上限**(由 `--tokens` 推出来), `dims[0]` 才是**已经分配出来的物理页数**, 两者在 `Grow()` 追上之前始终不等, 且默认差到 128 页封顶。
+  1. 前缀缓存下放/上提按 `maxPages` 算页字节数 -> 恰好整除时从错误 offset 抠页, "下放成功"但内容错, 上提 100% 失败(已修, 见上表);
+  2. `GetPagedCachePoolStats` 按 `maxPages - FreePageCount()` 统计水位 -> 空载报 `kv_pool=94%`, 真实占用 0%(已修, 见上表);
+  3. 2026-08-20: 测试/bench 夹具为构造确定页表**直接往物理页号 0..N-1 写入**, kvLen>16384(=128 页)时页号越界写显存, 报 `cudaErrorIllegalAddress`; 而该错误是**粘性**的, 后续每次 CUDA 调用都报同一个错, 崩溃点看起来在一次无关的 H2D 拷贝上, 一度被误判成新 kernel 越界。
+  **规矩**: (a) 任何按物理页号直接寻址的代码(测试、bench、工具)必须先 `FASTLLM_PAGED_CACHE_PREALLOCATE_MAX=1`, 并断言 `dims[0] >= 需要的页数` —— 预算守卫 `kvBudgetBytes` 也会砍 `maxPages`, 所以只能查实际 `dims[0]`; (b) 生产路径一律经 `GetUnusedPageIndex()` 取页, 不要自己编页号。bump 时若把 `PREALLOCATE_MAX` 分支或这些断言当成冗余删掉, 第四次还会以第四种面貌出现 |
+| `src/models/qwen3_5.cpp` | **分页 KV manager 的全局层号基址统一走 `PagedCacheLayerBase()`** | 多模态前向(`ForwardFromHiddenStates`)曾硬编码 `i*2`(基址 0), 而文本前向 `ForwardGPU` 用 `threadTpPagedCacheBase + i`(启动时被定成 3000000+), 前缀缓存**查询侧**只认后者 -> vision 请求把前缀链记进一组**永远不会被查询**的 manager, 查询又落在一组**从没记过这条前缀**的 manager 上 -> `Query()` 恒返回 0 页, **每个 vision 请求都 miss**, 命中率恒为 0 且无任何报错。实测: 同一后端纯文本命中 94%(hit=1024/1095), 所有带图请求(48K~85K token)全部 hit=0; 而 agent 流量 100% 带图。副作用: 页池被复制成两份, 白吃一半 `FASTLLM_PAGED_POOL_MAX_MB` |
+| `src/models/basellm.cpp` | `TryRecordPagedCache` 里的 `checkRecordLookupAgreement` + `mgr-lookup-mismatch` 打点 | 去掉后, 上面那类「记录侧/查询侧 manager 错配」再次变成完全静默的故障(所有计数器都正常, 只有命中率是 0) |
+| `src/fastllm.cpp` + `src/models/basellm.cpp` + `include/fastllm.h` | 前缀缓存计数器拆分: `mgr-invalid` -> `mgr-null`/`mgr-no-pageidx`/`mgr-wrong-type`; `no-record` -> `probe-empty`/`layer-min`/`single-page`/`extra-missing`; 新增 `query{brk-*}` 中断原因 | 合并回去就会重现两个已经把人带偏过的歧义: (1) 混合架构下 `mgr-invalid` 每次 +96 只是 SSM 层没有分页 KV, 却看着像「记录几乎全失败」; (2) `no-record` 把「trie 里没有」和「trie 命中了几百页但 GDN 快照对不上」混成同一个数 |
+
 
 ## 新增: 算子路由普查(`include/fastllm-kernel-route.h`)
 
@@ -125,19 +136,49 @@ Load tokenizer pre = qwen35 (预分词正则已启用: qwen35)
 ## bump 后必须跑的回归
 
 ```bash
-cmake -DUNIT_TEST=ON .. && cmake --build . --target testSamplingGuard testToolCallGrammar testPreTokenizer testPrefixCacheTier testPagedKvBudget
+cmake -DUNIT_TEST=ON .. && cmake --build . --target testSamplingGuard testToolCallGrammar testPreTokenizer testPrefixCacheTier testPrefixCacheRouting testPagedKvBudget testTurboPagedAttention
 ./testSamplingGuard      # 15/15   —— 采样路径(NaN / temperature=0 / top_k 两条分支)
 ./testToolCallGrammar    # ALL PASS —— 工具调用语法状态机
 ./testPreTokenizer       # 31/31   —— 预分词切分(不需要模型)
 ./testPrefixCacheTier    # 29/29   —— 前缀缓存三级下放/上提
 ./testPagedKvBudget      # 分页 KV 显存账本 + 页池水位口径 + GDN 快照对齐
+./testPrefixCacheRouting # 记录侧/查询侧 manager 必须是同一个对象(vision 命中率恒 0 的那一类)
 FASTLLM_PREFIX_CACHE_STRICT_SNAPSHOT_ALIGN=1 ./testPagedKvBudget   # 严格对齐分支
+./testTurboPagedAttention  # 打包分页注意力(q8_0 K + turbo3 V)对 fp64 参考的数值对拍, 覆盖 qoLen=1..4
 ./testPreTokenizer <gguf> --corpus /home/ezra/projects/EzraVastLLM/pretokenizer-corpus/corpus_list.txt
                          # 42/42, 45/45 篇与 llama-tokenize 逐 token 一致
 ```
 
 这两个测试就是为了"bump 之后能立刻知道有没有把旧错误带回来"而写的。
 **测试不过不要合并。**
+
+## 待办: 逃生阀不能变成永久方案
+
+- `FASTLLM_PREFIX_CACHE_MULTIMODAL`(默认 1)是**临时**逃生阀, 不是设计。
+
+  前缀 trie 的 key 是 **token id 序列**, 而图片在序列里只是一串完全相同的
+  `<|image_pad|>` 占位符 —— **图像内容不进 key**。因此"同一会话内替换图像内容、
+  周围文本不变、且新旧图分辨率相同(=> image_pad token 数相同)"会让 trie 一路
+  匹配过去, **静默**复用上一张图算出来的 KV。典型触发形态: 固定提示词 + 每轮换
+  截图; 轮询同一路摄像头/仪表盘; 图像对比/编辑工作流。
+
+  当前默认开启的理由是本机负载不触发(agent 每轮把历史原样重发, 前缀里的图就是
+  同一批图; 实测同一 agent 每轮 `aggregate image pixels` 三个数字逐轮相同),
+  而收益是 100% 真实流量从 0% 命中变成可命中。
+
+  **正解**: 参照 vLLM, 让每个页块携带它覆盖到的图像内容哈希, 折进 `HashTokenPage`
+  并参与 `edgeTokens` 一级的比较(注意 `CacheTrieNode` 会被
+  `ExportPersistentRecords` / `ImportPersistentRecords` 序列化, 加字段要一并
+  处理格式版本)。做完之后**删除**这个 env 开关。
+
+  对应 todo: `EzraVastLLM/TODO.md` 的 **F8**。
+
+- 另一条同源待查: `multimodalInput` 只在 `~ResponseContext` 里清除, 所以
+  `isMultimodal` 在整个请求生命周期为真, **每个 decode token** 都走
+  `ForwardMultimodal -> ForwardFromHiddenStates` 的通用路径, 绕过
+  `ForwardGPU` 与 MTP 草稿。若成立, MTP 对带图流量从未生效。
+  对应 todo: `EzraVastLLM/TODO.md` 的 **F9**。**注意**: 现有的
+  "vision 6.2 tok/s vs 文本 47.4 tok/s" 不能直接当证据, 两个样本上下文差 70 倍。
 
 ## 已知的上游差异(不是冲突, 但要知道)
 

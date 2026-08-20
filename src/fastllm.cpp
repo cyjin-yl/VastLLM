@@ -7569,6 +7569,11 @@ namespace fastllm {
         std::atomic<uint64_t> pcStatMissGeneration{0};
         std::atomic<uint64_t> pcStatMissRestoreFailed{0};
         std::atomic<uint64_t> pcStatMissOther{0};
+        std::atomic<uint64_t> pcStatMissProbeEmpty{0};
+        std::atomic<uint64_t> pcStatMissLayerMin{0};
+        std::atomic<uint64_t> pcStatMissSinglePage{0};
+        std::atomic<uint64_t> pcStatMissExtraMissing{0};
+        std::atomic<uint64_t> pcStatMissMultimodalDisabled{0};
         std::atomic<uint64_t> pcStatRecordAccepted{0};
         std::atomic<uint64_t> pcStatRecordRejectedMinHitsTokens{0};
         std::atomic<uint64_t> pcStatRecordRejectedCapacity{0};
@@ -7583,9 +7588,19 @@ namespace fastllm {
         std::atomic<uint64_t> pcRecSkipNoPagedLen{0};
         std::atomic<uint64_t> pcRecSkipNoUnbounded{0};
         std::atomic<uint64_t> pcRecSkipBoundedShort{0};
-        std::atomic<uint64_t> pcRecSkipManagerInvalid{0};
+        std::atomic<uint64_t> pcRecSkipManagerNull{0};
+        std::atomic<uint64_t> pcRecSkipManagerNoPageIndex{0};
+        std::atomic<uint64_t> pcRecSkipManagerWrongType{0};
+        std::atomic<uint64_t> pcRecManagerLookupMismatch{0};
         std::atomic<uint64_t> pcRecLayersOk{0};
         std::atomic<uint64_t> pcRecManagerNoPages{0};
+        std::atomic<uint64_t> pcQueryCalls{0};
+        std::atomic<uint64_t> pcQueryBreakNoChild{0};
+        std::atomic<uint64_t> pcQueryBreakEdge{0};
+        std::atomic<uint64_t> pcQueryBreakMaterialize{0};
+        std::atomic<uint64_t> pcQueryBreakGeneration{0};
+        std::atomic<uint64_t> pcQueryFullMatch{0};
+        std::atomic<uint64_t> pcQueryMatchedPages{0};
         std::atomic<uint64_t> pcExtraCalls{0};
         std::atomic<uint64_t> pcExtraOk{0};
         std::atomic<uint64_t> pcExtraSkipDisabled{0};
@@ -7639,6 +7654,16 @@ namespace fastllm {
                 pcStatMissGeneration.fetch_add(1);
             } else if (std::strcmp(missReason, "restore-failed") == 0) {
                 pcStatMissRestoreFailed.fetch_add(1);
+            } else if (std::strcmp(missReason, "probe-empty") == 0) {
+                pcStatMissProbeEmpty.fetch_add(1);
+            } else if (std::strcmp(missReason, "layer-min") == 0) {
+                pcStatMissLayerMin.fetch_add(1);
+            } else if (std::strcmp(missReason, "single-page") == 0) {
+                pcStatMissSinglePage.fetch_add(1);
+            } else if (std::strcmp(missReason, "extra-missing") == 0) {
+                pcStatMissExtraMissing.fetch_add(1);
+            } else if (std::strcmp(missReason, "multimodal-disabled") == 0) {
+                pcStatMissMultimodalDisabled.fetch_add(1);
             } else {
                 pcStatMissOther.fetch_add(1);
             }
@@ -7657,7 +7682,10 @@ namespace fastllm {
             PrefixCacheStats s = GetPrefixCacheStatsSnapshot();
             printf("[PrefixCache] record-path: calls=%llu skip{linear-bounded=%llu "
                    "no-paged-len=%llu no-unbounded=%llu bounded-short=%llu "
-                   "mgr-invalid=%llu mgr-no-pages=%llu} layers-ok=%llu | "
+                   "mgr-null=%llu mgr-no-pageidx=%llu mgr-wrong-type=%llu "
+                   "mgr-no-pages=%llu mgr-lookup-mismatch=%llu} layers-ok=%llu | "
+                   "query{calls=%llu pages=%llu full=%llu brk-no-child=%llu "
+                   "brk-edge=%llu brk-materialize=%llu brk-generation=%llu} | "
                    "extra{calls=%llu ok=%llu disabled=%llu len=%llu "
                    "no-progress=%llu interval=%llu copy=%llu mtp=%llu unaligned=%llu}\n",
                    (unsigned long long)s.recordCalls,
@@ -7665,9 +7693,19 @@ namespace fastllm {
                    (unsigned long long)s.recordSkipNoPagedLen,
                    (unsigned long long)s.recordSkipNoUnbounded,
                    (unsigned long long)s.recordSkipBoundedShort,
-                   (unsigned long long)s.recordSkipManagerInvalid,
+                   (unsigned long long)s.recordSkipManagerNull,
+                   (unsigned long long)s.recordSkipManagerNoPageIndex,
+                   (unsigned long long)s.recordSkipManagerWrongType,
                    (unsigned long long)s.recordManagerNoPages,
+                   (unsigned long long)s.recordManagerLookupMismatch,
                    (unsigned long long)s.recordLayersOk,
+                   (unsigned long long)s.queryCalls,
+                   (unsigned long long)s.queryMatchedPages,
+                   (unsigned long long)s.queryFullMatch,
+                   (unsigned long long)s.queryBreakNoChild,
+                   (unsigned long long)s.queryBreakEdgeMismatch,
+                   (unsigned long long)s.queryBreakMaterialize,
+                   (unsigned long long)s.queryBreakGeneration,
                    (unsigned long long)s.extraCalls,
                    (unsigned long long)s.extraOk,
                    (unsigned long long)s.extraSkipDisabled,
@@ -7682,8 +7720,10 @@ namespace fastllm {
             PrefixCacheStats s = GetPrefixCacheStatsSnapshot();
             printf("[PrefixCache] periodic: reqs=%llu hitReqs=%llu "
                    "hitTok=%llu/%llu (mem=%llu cpu=%llu disk=%llu) "
-                   "miss{no-record=%llu evicted=%llu below-thresh=%llu "
-                   "gen=%llu restore-fail=%llu other=%llu} "
+                   "miss{no-record=%llu probe-empty=%llu layer-min=%llu "
+                   "single-page=%llu extra-missing=%llu mm-disabled=%llu "
+                   "evicted=%llu "
+                   "below-thresh=%llu gen=%llu restore-fail=%llu other=%llu} "
                    "record{ok=%llu rej-min=%llu rej-cap=%llu rej-space=%llu rej-other=%llu} "
                    "evict{trie-nodes=%llu cpu-calls=%llu cpu-bytes=%llu} "
                    "resident{mem=%lluMB cpu=%lluMB disk=%lluMB}\n",
@@ -7695,6 +7735,11 @@ namespace fastllm {
                    (unsigned long long)s.hitTokensCpuTier,
                    (unsigned long long)s.hitTokensDisk,
                    (unsigned long long)s.missNoRecord,
+                   (unsigned long long)s.missProbeEmpty,
+                   (unsigned long long)s.missLayerMin,
+                   (unsigned long long)s.missSinglePage,
+                   (unsigned long long)s.missExtraMissing,
+                   (unsigned long long)s.missMultimodalDisabled,
                    (unsigned long long)s.missEvicted,
                    (unsigned long long)s.missBelowThreshold,
                    (unsigned long long)s.missGenerationMismatch,
@@ -7713,7 +7758,10 @@ namespace fastllm {
                    (unsigned long long)(s.diskResidentBytes >> 20));
             printf("[PrefixCache] record-path: calls=%llu skip{linear-bounded=%llu "
                    "no-paged-len=%llu no-unbounded=%llu bounded-short=%llu "
-                   "mgr-invalid=%llu mgr-no-pages=%llu} layers-ok=%llu | "
+                   "mgr-null=%llu mgr-no-pageidx=%llu mgr-wrong-type=%llu "
+                   "mgr-no-pages=%llu mgr-lookup-mismatch=%llu} layers-ok=%llu | "
+                   "query{calls=%llu pages=%llu full=%llu brk-no-child=%llu "
+                   "brk-edge=%llu brk-materialize=%llu brk-generation=%llu} | "
                    "extra{calls=%llu ok=%llu disabled=%llu len=%llu "
                    "no-progress=%llu interval=%llu copy=%llu mtp=%llu unaligned=%llu}\n",
                    (unsigned long long)s.recordCalls,
@@ -7721,9 +7769,19 @@ namespace fastllm {
                    (unsigned long long)s.recordSkipNoPagedLen,
                    (unsigned long long)s.recordSkipNoUnbounded,
                    (unsigned long long)s.recordSkipBoundedShort,
-                   (unsigned long long)s.recordSkipManagerInvalid,
+                   (unsigned long long)s.recordSkipManagerNull,
+                   (unsigned long long)s.recordSkipManagerNoPageIndex,
+                   (unsigned long long)s.recordSkipManagerWrongType,
                    (unsigned long long)s.recordManagerNoPages,
+                   (unsigned long long)s.recordManagerLookupMismatch,
                    (unsigned long long)s.recordLayersOk,
+                   (unsigned long long)s.queryCalls,
+                   (unsigned long long)s.queryMatchedPages,
+                   (unsigned long long)s.queryFullMatch,
+                   (unsigned long long)s.queryBreakNoChild,
+                   (unsigned long long)s.queryBreakEdgeMismatch,
+                   (unsigned long long)s.queryBreakMaterialize,
+                   (unsigned long long)s.queryBreakGeneration,
                    (unsigned long long)s.extraCalls,
                    (unsigned long long)s.extraOk,
                    (unsigned long long)s.extraSkipDisabled,
@@ -7774,6 +7832,13 @@ namespace fastllm {
         }
     }
 
+    void PrefixCacheStatsObserveQueryPages(size_t pages) {
+        if (!PrefixCacheStatsEnabled() || pages == 0) {
+            return;
+        }
+        pcQueryMatchedPages += (uint64_t)pages;
+    }
+
     void PrefixCacheStatsObserveRecordPath(const char *event) {
         if (!PrefixCacheStatsEnabled() || event == nullptr) {
             return;
@@ -7783,7 +7848,16 @@ namespace fastllm {
         else if (!std::strcmp(event, "skip-no-paged-len")) pcRecSkipNoPagedLen++;
         else if (!std::strcmp(event, "skip-no-unbounded")) pcRecSkipNoUnbounded++;
         else if (!std::strcmp(event, "skip-bounded-short")) pcRecSkipBoundedShort++;
-        else if (!std::strcmp(event, "skip-manager-invalid")) pcRecSkipManagerInvalid++;
+        else if (!std::strcmp(event, "skip-mgr-null")) pcRecSkipManagerNull++;
+        else if (!std::strcmp(event, "skip-mgr-no-pageindex")) pcRecSkipManagerNoPageIndex++;
+        else if (!std::strcmp(event, "skip-mgr-wrong-type")) pcRecSkipManagerWrongType++;
+        else if (!std::strcmp(event, "mgr-lookup-mismatch")) pcRecManagerLookupMismatch++;
+        else if (!std::strcmp(event, "query-call")) pcQueryCalls++;
+        else if (!std::strcmp(event, "query-break-no-child")) pcQueryBreakNoChild++;
+        else if (!std::strcmp(event, "query-break-edge")) pcQueryBreakEdge++;
+        else if (!std::strcmp(event, "query-break-materialize")) pcQueryBreakMaterialize++;
+        else if (!std::strcmp(event, "query-break-generation")) pcQueryBreakGeneration++;
+        else if (!std::strcmp(event, "query-full")) pcQueryFullMatch++;
         else if (!std::strcmp(event, "layer-ok")) pcRecLayersOk++;
         else if (!std::strcmp(event, "manager-no-pages")) pcRecManagerNoPages++;
         else if (!std::strcmp(event, "extra-call")) pcExtraCalls++;
@@ -7813,6 +7887,11 @@ namespace fastllm {
         s.missGenerationMismatch = pcStatMissGeneration.load();
         s.missRestoreFailed = pcStatMissRestoreFailed.load();
         s.missOther = pcStatMissOther.load();
+        s.missProbeEmpty = pcStatMissProbeEmpty.load();
+        s.missLayerMin = pcStatMissLayerMin.load();
+        s.missSinglePage = pcStatMissSinglePage.load();
+        s.missExtraMissing = pcStatMissExtraMissing.load();
+        s.missMultimodalDisabled = pcStatMissMultimodalDisabled.load();
         s.recordAccepted = pcStatRecordAccepted.load();
         s.recordRejectedMinHitsTokens = pcStatRecordRejectedMinHitsTokens.load();
         s.recordRejectedCapacity = pcStatRecordRejectedCapacity.load();
@@ -7854,7 +7933,20 @@ namespace fastllm {
         s.recordSkipNoPagedLen = pcRecSkipNoPagedLen.load();
         s.recordSkipNoUnbounded = pcRecSkipNoUnbounded.load();
         s.recordSkipBoundedShort = pcRecSkipBoundedShort.load();
-        s.recordSkipManagerInvalid = pcRecSkipManagerInvalid.load();
+        s.recordSkipManagerNull = pcRecSkipManagerNull.load();
+        s.recordSkipManagerNoPageIndex = pcRecSkipManagerNoPageIndex.load();
+        s.recordSkipManagerWrongType = pcRecSkipManagerWrongType.load();
+        s.recordManagerLookupMismatch = pcRecManagerLookupMismatch.load();
+        s.recordSkipManagerInvalid = s.recordSkipManagerNull +
+                                     s.recordSkipManagerNoPageIndex +
+                                     s.recordSkipManagerWrongType;
+        s.queryCalls = pcQueryCalls.load();
+        s.queryBreakNoChild = pcQueryBreakNoChild.load();
+        s.queryBreakEdgeMismatch = pcQueryBreakEdge.load();
+        s.queryBreakMaterialize = pcQueryBreakMaterialize.load();
+        s.queryBreakGeneration = pcQueryBreakGeneration.load();
+        s.queryFullMatch = pcQueryFullMatch.load();
+        s.queryMatchedPages = pcQueryMatchedPages.load();
         s.recordLayersOk = pcRecLayersOk.load();
         s.recordManagerNoPages = pcRecManagerNoPages.load();
         s.extraCalls = pcExtraCalls.load();
@@ -10343,12 +10435,18 @@ namespace fastllm {
         int numPages = (int)tokens.size() / this->pageLen;
         CacheTrieNode *cur = this->trieRoot;
         std::unordered_set<int> protectedPages;
+        // 【上游BUMP勿回退】中断原因打点。前缀命中率为 0 时, 这是唯一能区分
+        // "trie 里根本没有这条前缀" 与 "有, 但第 N 页对不上/页被复用了" 的证据;
+        // 少了它, 上层只能统一报一个含义模糊的 no-record。
+        const char *breakEvent = "query-full";
+        PrefixCacheStatsObserveRecordPath("query-call");
 
         for (int i = 0; i < numPages; i++) {
             uint64_t h = HashTokenPage(tokens.data() + i * this->pageLen, this->pageLen);
 
             auto it = cur->children.find(h);
             if (it == cur->children.end()) {
+                breakEvent = "query-break-no-child";
                 break;
             }
 
@@ -10360,6 +10458,7 @@ namespace fastllm {
                     child->edgeTokens.begin(),
                     child->edgeTokens.end(),
                     pageTokens)) {
+                breakEvent = "query-break-edge";
                 break;
             }
             const bool residentHit = child->pageId >= 0;
@@ -10369,6 +10468,7 @@ namespace fastllm {
             if (child->pageId == -1 &&
                 !MaterializeTrieNode(
                     child, protectedPages)) {
+                breakEvent = "query-break-materialize";
                 break;
             }
 
@@ -10377,6 +10477,7 @@ namespace fastllm {
             if (child->pageId < 0 ||
                 child->pageId >= (int)this->pageTimestamp.size() ||
                 this->pageTimestamp[child->pageId] != child->timestamp) {
+                breakEvent = "query-break-generation";
                 break;
             }
 
@@ -10393,5 +10494,7 @@ namespace fastllm {
             protectedPages.insert(child->pageId);
             cur = child;
         }
+        PrefixCacheStatsObserveRecordPath(breakEvent);
+        PrefixCacheStatsObserveQueryPages(cachedPageIds.size());
     }
 }

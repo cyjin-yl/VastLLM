@@ -1278,9 +1278,48 @@ namespace fastllm {
                 cache.pagedKVCacheData->type == PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
                 cache.pagedKVCacheData->Record(this->allTokens, cache.pageIndex);
                 PrefixCacheStatsObserveRecordPath("layer-ok");
+            } else if (cache.pagedKVCacheData == nullptr) {
+                // 【上游BUMP勿回退】这三条分支以前共用一个计数器 "mgr-invalid"。
+                // 混合架构(Qwen3.5: full_attention_interval=4 -> 16 全注意力层 +
+                // 48 SSM/GDN 层)下, 每次记录这一项都会 +96(=48x2), 看上去像
+                // "绝大多数层记录失败", 其实只是 SSM 层压根没有分页 KV。
+                // 这个歧义已经把排查方向带偏过一次, 不要再合回去。
+                PrefixCacheStatsObserveRecordPath("skip-mgr-null");
+            } else if (cache.pageIndex.empty()) {
+                PrefixCacheStatsObserveRecordPath("skip-mgr-no-pageindex");
             } else {
-                PrefixCacheStatsObserveRecordPath("skip-manager-invalid");
+                PrefixCacheStatsObserveRecordPath("skip-mgr-wrong-type");
             }
+        };
+        // 【上游BUMP勿回退】记录侧与查询侧必须落在**同一个** PagedCacheManager 上。
+        //
+        // 记录侧用的是 cache.pagedKVCacheData —— 前向路径当时实际挂上去的那个
+        // manager; 查询侧(前缀恢复)用的是 model->GetPagedKVCacheManagers(layer,
+        // isKey)。这两者由**不同的**层号算式得到, 一旦某条前向路径用了不一样的
+        // 层号基址, 二者就会指向两组互不相交的 manager: 前缀链记进了一组永远不
+        // 会被查询的 manager, 查询又落在一组从没记录过这条前缀的 manager 上,
+        // Query() 恒返回 0 页, 表现为**命中率恒为 0 且没有任何报错**。
+        //
+        // 这正是 Qwen3.5 vision 请求上真实发生过的事故(ForwardFromHiddenStates
+        // 硬编码 i*2, 而 ForwardGPU 用 threadTpPagedCacheBase+i)。当时所有
+        // 计数器看起来都正常(layers-ok 在涨, L1trie 有页, record 路径无拒绝),
+        // 唯一异常只有"命中恒为 0"。这个打点就是为了让这类错配不再静默:
+        // mgr-lookup-mismatch 非 0 = 记录进了查询侧看不到的 manager。
+        auto checkRecordLookupAgreement = [&](int layer, bool isKey,
+                                              const Data &cache) {
+            if (model == nullptr || cache.pagedKVCacheData == nullptr) {
+                return;
+            }
+            auto refs = model->GetPagedKVCacheManagers(layer, isKey);
+            if (refs.empty()) {
+                return;
+            }
+            for (const auto &ref : refs) {
+                if (ref.second == cache.pagedKVCacheData) {
+                    return;
+                }
+            }
+            PrefixCacheStatsObserveRecordPath("mgr-lookup-mismatch");
         };
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
             auto &kvFirst = this->pastKeyValues[i].first;
@@ -1292,6 +1331,8 @@ namespace fastllm {
                 PrefixCacheStatsObserveRecordPath("skip-bounded-short");
                 continue;
             }
+            checkRecordLookupAgreement(i, true, kvFirst);
+            checkRecordLookupAgreement(i, false, kvSecond);
             recordPagedCache(kvFirst);
             recordPagedCache(kvSecond);
         }

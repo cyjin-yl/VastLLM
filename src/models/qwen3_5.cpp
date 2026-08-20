@@ -8932,6 +8932,42 @@ namespace fastllm {
         return true;
     }
 
+    // 【上游BUMP勿回退】分页 KV 的“全局层号基址”。所有会给 pastKeyValues 挂
+    // PagedCacheManager 的前向路径必须用**同一个**基址, 否则同一个模型会
+    // 出现两套互不相交的 manager:
+    //   * MTP 调度循环里的**纯文本**请求走 ForwardGPU/ForwardSingleGPU,
+    //     基址 = threadTpPagedCacheBase(PreparePersistentPrefixCacheManagers
+    //     在启动时就把它定成 3000000+);
+    //   * **多模态(vision)**请求走 ForwardMultimodal ->
+    //     ForwardFromHiddenStates, 这里以前硬编码 i*2, 即基址 0。
+    // 而前缀缓存**查询侧**(Qwen3_5Model::GetPagedKVCacheManagers)只认
+    // threadTpPagedCacheBase 那一套。于是 vision 请求把前缀链记进了一组
+    // **永远不会被查询的** manager, 查询又落在一组**从没记录过这条
+    // 前缀的** manager 上 -> Query() 恒返回 0 页 -> 每个 vision 请求都报
+    // miss=no-record, token 级命中率恒为 0。
+    //
+    // 实测证据(2026-08-20 生产日志): 同一个后端里, 纯文本的 agent
+    // 循环稳定命中(req#8/#12: hit=1024/1095, 94%), 而所有带图的请求
+    // (47983/48589/49377/64541/65301/74133/84567/84721/84954/85351/85462 tok)
+    // **无一例外** hit=0。而这台机器上 agent 流量 100% 带图。
+    //
+    // 另外两个副作用, 修之前很容易把排查带偏:
+    //   1. 页池被复制成两份, 白吃一半 FASTLLM_PAGED_POOL_MAX_MB 显存;
+    //   2. L1trie / memTrieResidentBytes 是遍历**全部** manager 求和的,
+    //      vision 写进去的那一套也被计入 -> 指标看着“缓存是满的”,
+    //      命中却恒为 0。
+    int Qwen3_5Model::PagedCacheLayerBase() {
+#ifdef USE_CUDA
+        if (this->threadTpPagedCacheBase < 0) {
+            this->threadTpPagedCacheBase =
+                qwen35ThreadTpNextPagedCacheBase.fetch_add(
+                    std::max(1, this->block_cnt * 2));
+        }
+#endif
+        return this->threadTpPagedCacheBase < 0 ?
+            0 : this->threadTpPagedCacheBase;
+    }
+
     PagedCacheManager* Qwen3_5Model::GetPagedKVCacheManager(int layerIndex, bool isKey) const {
         if (layerIndex >= 0 && Qwen35LayerIsLinearAttention(this, layerIndex)) {
             return nullptr;
@@ -19813,8 +19849,57 @@ namespace fastllm {
             }
         };
 
+        // 多模态请求的前缀复用有一个**内容不进 key** 的隐患: trie 的键是
+        // token id 序列, 而图片在序列里只是一串完全相同的 <|image_pad|>
+        // 占位符 —— 两张分辨率相同、内容不同的图会产生一模一样的 token。
+        // 于是理论上存在"文本一致 + 图 token 数一致但图不同"的跨会话误命中,
+        // 复用到另一张图算出来的 KV, 而且**静默**。
+        //
+        // 现实负载里这条不成立: agent 每轮把历史原样重发, 前缀里的图就是
+        // 同一批图(实测日志中同一 agent 每轮 aggregate image pixels 完全
+        // 相同), 新图只追加在末尾。真正的通用解是把每个图块的内容哈希折进
+        // 页哈希(vLLM 的做法), 那是另一个改动。
+        //
+        // 【默认关闭, 需要显式 FASTLLM_PREFIX_CACHE_MULTIMODAL=1 才开】
+        //
+        // 除了上面那条"图像内容不进 key"的风险, 还有一条**当前尚未验证**的:
+        // 带图请求命中前缀后, ForwardMultimodal 会走它开头那个"续算"分支
+        //     if (pastKeyValues.size() > 0 && pastKeyValues[0].second.dims.size() > 0)
+        // (命中恢复时 RestorePagedPrefixCacheExtra 会给线性层(含 layer 0)写上
+        //  dims, 所以这个条件成立)。该分支**不做**视觉编码, 也不重算
+        // mm_token_type_ids / mrope_position_ids, 而是直接
+        //     AdjustPositionIdsWithDelta(positionIds, mrope_position_delta, ...)
+        // 然后调用普通 Forward。它的注释本来就写着"续 prefill(典型为前缀缓存
+        // HIT 之后)", 也就是说这条路是**被设计过**的 —— 因此**不会**触发
+        // BuildMultimodalPositionData 里的 imageGridThwList 断言, 不会 500。
+        //
+        // 但读代码看有两个洞(均为静默, 都还**没有**在运行时复现过):
+        //   (a) mrope_position_delta 只在 ForwardMultimodal 的**视觉分支**里
+        //       写进 multimodalInput; PrepareMultimodalImageInputs 并不产出它。
+        //       前缀命中时该请求的视觉分支从未执行 -> delta 缺失 ->
+        //       走 else 分支 adjustedPositionIds.CopyFrom(positionIds), 即
+        //       纯顺序位置, 没有 mRoPE 修正。含图 prompt 的 delta 通常非 0。
+        //   (b) 落在**未命中残段**里的图片, 这条路上不会被 EncodeVisualItems
+        //       编码 -> 模型看到的是 <|image_pad|> 的普通 embedding, 不是图。
+        //
+        // 纯文本路径没有这两个问题(FillLLMInputs 用
+        // intParams["promptLen"] = cacheLen + currentTokens.size() 接着算位置,
+        // 也没有视觉特征要合并)。
+        //
+        // 结论: 在 (a)(b) 被实测证伪或修好之前, 这个开关保持默认关闭。
+        // 见 EzraVastLLM/TODO.md 的 F10。
+        static const bool multimodalPrefixRestoreEnabled = []() {
+            const char *env = std::getenv("FASTLLM_PREFIX_CACHE_MULTIMODAL");
+            return env != nullptr && env[0] != 0 && std::strcmp(env, "0") != 0;
+        }();
         auto tryRestorePrefixCache = [&](ResponseContext *ctx) -> int {
             if (ctx == nullptr || ctx->cacheLen != 0 || ctx->currentTokens.empty()) {
+                return 0;
+            }
+            if (!multimodalPrefixRestoreEnabled && !ctx->multimodalInput.empty()) {
+                PrefixCacheStatsObserveRequest(
+                    (int)ctx->currentTokens.size(), 0, nullptr,
+                    "multimodal-disabled");
                 return 0;
             }
             const int prefixQueryTotalTokens = (int)ctx->currentTokens.size();
@@ -19878,9 +19963,15 @@ namespace fastllm {
             };
 
             int minCachedPages = (int)queryManager(probeManager).size();
+            // 【上游BUMP勿回退】下面四个提前返回原来共用一个 miss 原因
+            // "no-record"。它们的含义完全不同, 混在一起会让线上日志把
+            // "GDN 快照对不上, 整条已命中的 paged 链被丢掉" 显示成
+            // "trie 里没有这条前缀", 直接把排查方向指向记录路径(而记录
+            // 路径是好的)。四个原因必须分开报。
+            const int probeCachedPages = minCachedPages;
             if (minCachedPages <= 0) {
                 PrefixCacheStatsObserveRequest(
-                    prefixQueryTotalTokens, 0, nullptr, "no-record");
+                    prefixQueryTotalTokens, 0, nullptr, "probe-empty");
                 return 0;
             }
             for (int layer = 0; layer < model->block_cnt; layer++) {
@@ -19898,8 +19989,14 @@ namespace fastllm {
                 }
             }
             if (minCachedPages <= 0) {
+                if (PrefixCacheStatsEnabled()) {
+                    printf("[PrefixCache] miss-detail: probePages=%d "
+                           "minPages=0 (some layer manager has no trie chain)\n",
+                           probeCachedPages);
+                    fflush(stdout);
+                }
                 PrefixCacheStatsObserveRequest(
-                    prefixQueryTotalTokens, 0, nullptr, "no-record");
+                    prefixQueryTotalTokens, 0, nullptr, "layer-min");
                 return 0;
             }
 
@@ -19910,16 +20007,30 @@ namespace fastllm {
             }
             if (minCachedPages <= 0) {
                 PrefixCacheStatsObserveRequest(
-                    prefixQueryTotalTokens, 0, nullptr, "no-record");
+                    prefixQueryTotalTokens, 0, nullptr, "single-page");
                 return 0;
             }
 
+            const int pagedCachedLen = cachedLen;
             int extraCachedLen = model->QueryPagedPrefixCacheExtra(ctx, cachedLen);
+            const int rawExtraCachedLen = extraCachedLen;
             extraCachedLen = std::max(0, std::min(extraCachedLen, cachedLen));
             minCachedPages = extraCachedLen / probeManager->pageLen;
             if (minCachedPages <= 0) {
+                // 这一条是最容易被误读成 no-record 的: paged trie 已经命中了
+                // pagedCachedLen 个 token, 但 GDN/linear 快照在 <=pagedCachedLen
+                // 的位置上一个都没有(快照只在少数几个长度上记录), 于是整条
+                // 命中被丢弃。日志里必须能直接看出 "trie 命中了多少 / 快照给了多少"。
+                if (PrefixCacheStatsEnabled()) {
+                    printf("[PrefixCache] miss-detail: paged trie hit %d tok "
+                           "(%d pages) but GDN/linear snapshot lookup returned "
+                           "%d -> whole hit discarded\n",
+                           pagedCachedLen, pagedCachedLen / probeManager->pageLen,
+                           rawExtraCachedLen);
+                    fflush(stdout);
+                }
                 PrefixCacheStatsObserveRequest(
-                    prefixQueryTotalTokens, 0, nullptr, "no-record");
+                    prefixQueryTotalTokens, 0, nullptr, "extra-missing");
                 return 0;
             }
             cachedLen = minCachedPages * probeManager->pageLen;
@@ -25596,6 +25707,9 @@ namespace fastllm {
         Data attenInput;
         Data attenLastOutput;
         Data attenOutput;
+        // 见 PagedCacheLayerBase() 上面的长注释: 这条路径(多模态前向)必须和
+        // ForwardGPU 用同一个基址, 否则 vision 请求的前缀缓存永远命中不了。
+        const int pagedCacheLayerBase = this->PagedCacheLayerBase();
 
         bool isSingleTokenDecode = batch == 1 && all1 &&
                                    !pastKeyValues.empty() &&
@@ -25701,9 +25815,9 @@ namespace fastllm {
                 Data kCacheDesc = makeCacheDesc(k, pastKey.dataType);
                 Data vCacheDesc = makeCacheDesc(v, pastValue.dataType);
                 PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
-                    i * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
+                    (pagedCacheLayerBase + i) * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
                 PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
-                    i * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
+                    (pagedCacheLayerBase + i) * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
                 AppendPagedCache(*pagedCacheKManager, pastKey, k);
                 AppendPagedCache(*pagedCacheVManager, pastValue, v);
                 AttentionPaged(q, pastKey, pastValue, qkv, q.dims[0] / k.dims[0], 1.0 / sqrt(head_dim), 1, pagedAttentionInited);
@@ -26676,6 +26790,10 @@ namespace fastllm {
                               pastKeyValues, generationConfigs, lastTokens, retLogits);
         }
 #endif
+        // 见 PagedCacheLayerBase() 上面的长注释: 挂 PagedCacheManager 的每条
+        // 前向路径都必须用同一个基址, 否则会分裂出两套 manager, 前缀缓存查询
+        // 侧只看得到其中一套。
+        const int pagedCacheLayerBase = this->PagedCacheLayerBase();
         bool all1 = true;
         for (int i = 0; i < batch; i++) {
             all1 &= (seqLens[i] == 1);
@@ -26986,9 +27104,9 @@ namespace fastllm {
                     Data kCacheDesc = makeCacheDesc(k, pastKey.dataType);
                     Data vCacheDesc = makeCacheDesc(v, pastValue.dataType);
                     PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
-                        i * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
+                        (pagedCacheLayerBase + i) * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
                     PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
-                        i * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
+                        (pagedCacheLayerBase + i) * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
                     AppendPagedCache(*pagedCacheKManager, pastKey, k);
                     AppendPagedCache(*pagedCacheVManager, pastValue, v);
                     AttentionPaged(q, pastKey, pastValue, qkv, q.dims[0] / k.dims[0], 1.0 / sqrt(head_dim), 1, pagedAttentionInited);
