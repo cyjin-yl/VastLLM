@@ -1086,13 +1086,33 @@ namespace fastllm {
         // 非对齐点被尝试记录 —— 即分块 prefill 的对齐记录钩子没生效。
         uint64_t extraSkipUnaligned = 0;     // GDN 状态位置未页对齐, 丢弃以免错位
     };
+    // 【上游BUMP勿回退】MTP 归属计数。
+    //
+    // 为什么需要它: "MTP 到底有没有在带图请求上生效"以前是靠**时序推断**回答的
+    // —— 把 pos_accept_rate 行归属到最近的"vision 标记 -> 请求结束"窗口。
+    // 那个方法在 --batch 1(请求严格串行)下成立, 但 --batch 4 之后最多 4 个请求
+    // 交错, 先结束的往往是另一个短请求, 于是同一套划窗会给出**看似确定的错误
+    // 结论**, 而且不报错。见 EXPERIENCE.md 15.43。
+    // 这里改成直接记数: stepsMultimodal != 0 就是"MTP 在带图请求上跑过"。
+    struct MtpAttributionStats {
+        uint64_t steps = 0;                 // 走了 MTP 前向的 decode 步数
+        uint64_t stepsMultimodal = 0;       // 其中 batch 里至少有一个带图请求
+        uint64_t prefillDoneFlips = 0;      // multimodalPrefillDone 被置位的次数
+        uint64_t decodeStepsMultimodal = 0; // 带图请求走普通 decode 路径的次数
+    };
+    void MtpAttributionObserve(const char *event);
+    MtpAttributionStats GetMtpAttributionStatsSnapshot();
+
     void PrefixCacheStatsObserveRecordPath(const char *event);
     void PrefixCacheStatsObserveQueryPages(size_t pages);
     bool PrefixCacheStatsEnabled();
     void PrefixCacheStatsObserveRequest(
         int totalTokens, int hitTokens,
         const char *hitLayer,       // "mem-trie" | "cpu" | "disk" | nullptr(未命中)
-        const char *missReason);    // "no-record" | "probe-empty" | "layer-min" | "single-page" | "extra-missing" | "evicted" | "below-threshold" | "generation" | "restore-failed" | "other" | nullptr(有命中)
+        const char *missReason,     // "no-record" | "probe-empty" | "layer-min" | "single-page" | "extra-missing" | "evicted" | "below-threshold" | "generation" | "restore-failed" | "other" | nullptr(有命中)
+        // 会话标识 = 首页 token 的哈希。同一个 agent 的连续两轮首页相同,
+        // 因此可以**查表**判断两条 req# 是不是同一会话, 而不是靠 token 数猜。
+        uint64_t sessionId = 0);
     void PrefixCacheStatsObserveRecord(bool accepted, const char *rejectReason);
     void PrefixCacheStatsObserveEviction(const char *kind, uint64_t nodesOrBytes);
     PrefixCacheStats GetPrefixCacheStatsSnapshot();

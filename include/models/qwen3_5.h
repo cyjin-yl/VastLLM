@@ -195,6 +195,25 @@ namespace fastllm {
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <std::vector <float>*> *logits = nullptr) override;
 
+        // 【上游BUMP勿回退】带 ResponseContext 的多模态前向。
+        // 多模态 prefill 是在 ForwardMultimodal **内部**分块的(文本长 prefill 则是
+        // 在调度器里分块), 所以调度器拿不到块边界, 也就没法像文本路径那样在块
+        // 边界上记前缀快照。结果: 带图请求**整段 prompt 只有一个深度**有快照,
+        // 任何部分匹配都会因为 snapshot->cachedLen > maxCachedLen 被整条丢弃
+        // (线上实测: trie 匹配 14080 token, 唯一快照在 69632, 于是 miss=extra-missing)。
+        // 这个重载把 context 递进去, 让分块循环能在块边界上补记录。
+        // 虚函数 ForwardMultimodal 仍保持原签名, 其它模型不受影响。
+        std::vector <int> ForwardMultimodalWithContext(
+                ResponseContext *context,
+                const Data &inputIds,
+                const Data &attentionMask,
+                const Data &positionIds,
+                std::vector <std::pair <Data, Data> > &pastKeyValues,
+                const std::map <std::string, std::vector <Data*> > &multimodalInput,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens,
+                std::vector <std::vector <float>*> *logits);
+
         virtual std::vector <int> ForwardMultimodal(
                 const Data &inputIds,
                 const Data &attentionMask,

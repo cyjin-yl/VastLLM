@@ -15737,6 +15737,16 @@ namespace fastllm {
 #endif
     }
 
+    static bool Qwen35AnyMultimodal(
+            const std::vector<ResponseContext*> &contexts) {
+        for (ResponseContext *ctx : contexts) {
+            if (ctx != nullptr && !ctx->multimodalInput.empty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool Qwen3_5Model::Qwen35MTPForward(
         bool useGPUForward,
         ResponseContext *context,
@@ -15878,7 +15888,17 @@ namespace fastllm {
             if (validations % logInterval != 0) {
                 return;
             }
-            printf("[Qwen3.5 MTP] pos_accept_rate=[");
+            // 归属信息直接写进这一行: --batch>1 之后靠日志行先后顺序把
+            // pos_accept_rate 归到某个请求是**不可靠**的(会给出看似确定的
+            // 错误结论)。mm= 是这一路请求本身是否带图; steps= 是累计计数。
+            const MtpAttributionStats attr = GetMtpAttributionStatsSnapshot();
+            printf("[Qwen3.5 MTP] mm=%d steps=%llu/%llu(mm/total) "
+                   "prefill-done=%llu decode-mm=%llu pos_accept_rate=[",
+                   (context != nullptr && !context->multimodalInput.empty()) ? 1 : 0,
+                   (unsigned long long)attr.stepsMultimodal,
+                   (unsigned long long)attr.steps,
+                   (unsigned long long)attr.prefillDoneFlips,
+                   (unsigned long long)attr.decodeStepsMultimodal);
             for (int i = 0; i < mtpDraftsPerStep; i++) {
                 long long attempts =
                     mtpDraftPositionAttempts[i].load(std::memory_order_relaxed);
@@ -19298,7 +19318,17 @@ namespace fastllm {
 
         long long validations = mtpValidationCount.load(std::memory_order_relaxed);
         if (validations > 0 && validations % QWEN35_MTP_LOG_INTERVAL == 0) {
-            printf("[Qwen3.5 MTP] pos_accept_rate=[");
+            // 归属信息直接写进这一行: --batch>1 之后靠日志行先后顺序把
+            // pos_accept_rate 归到某个请求是**不可靠**的(会给出看似确定的
+            // 错误结论)。mm= 是这一路请求本身是否带图; steps= 是累计计数。
+            const MtpAttributionStats attr = GetMtpAttributionStatsSnapshot();
+            printf("[Qwen3.5 MTP] mm=%d steps=%llu/%llu(mm/total) "
+                   "prefill-done=%llu decode-mm=%llu pos_accept_rate=[",
+                   Qwen35AnyMultimodal(contexts) ? 1 : 0,
+                   (unsigned long long)attr.stepsMultimodal,
+                   (unsigned long long)attr.steps,
+                   (unsigned long long)attr.prefillDoneFlips,
+                   (unsigned long long)attr.decodeStepsMultimodal);
             for (int pos = 0; pos < draftsPerStep; pos++) {
                 long long attempts = mtpDraftPositionAttempts[pos].load(
                     std::memory_order_relaxed);
@@ -20003,13 +20033,23 @@ namespace fastllm {
             if (ctx == nullptr || ctx->cacheLen != 0 || ctx->currentTokens.empty()) {
                 return 0;
             }
+            const int prefixQueryTotalTokens = (int)ctx->currentTokens.size();
+            // 会话标识: 首页 token 的哈希。同一个 agent 的连续两轮首页一致,
+            // 所以 sess= 相同的两条 req# 才构成"同一会话的连续两轮"。
+            // 验收收益时必须用这样一对 —— 拿两个不同 agent 的请求去量,
+            // 得到的匹配深度既不真也不假。
+            const int prefixSessionPageLen = fastllm::GetPageLen();
+            const uint64_t prefixSessionId =
+                prefixQueryTotalTokens >= prefixSessionPageLen
+                    ? PagedCacheManager::HashTokenPage(
+                          ctx->currentTokens.data(), prefixSessionPageLen)
+                    : 0;
             if (!multimodalPrefixRestoreEnabled && !ctx->multimodalInput.empty()) {
                 PrefixCacheStatsObserveRequest(
-                    (int)ctx->currentTokens.size(), 0, nullptr,
-                    "multimodal-disabled");
+                    prefixQueryTotalTokens, 0, nullptr,
+                    "multimodal-disabled", prefixSessionId);
                 return 0;
             }
-            const int prefixQueryTotalTokens = (int)ctx->currentTokens.size();
             const uint64_t cpuHitPagesBefore =
                 GetPagedPrefixCacheCpuHitPages();
             const uint64_t diskReadBytesBefore =
@@ -20054,7 +20094,7 @@ namespace fastllm {
             }
             if (probeManager == nullptr) {
                 PrefixCacheStatsObserveRequest(
-                    prefixQueryTotalTokens, 0, nullptr, "other");
+                    prefixQueryTotalTokens, 0, nullptr, "other", prefixSessionId);
                 return 0;
             }
 
@@ -20078,7 +20118,7 @@ namespace fastllm {
             const int probeCachedPages = minCachedPages;
             if (minCachedPages <= 0) {
                 PrefixCacheStatsObserveRequest(
-                    prefixQueryTotalTokens, 0, nullptr, "probe-empty");
+                    prefixQueryTotalTokens, 0, nullptr, "probe-empty", prefixSessionId);
                 return 0;
             }
             for (int layer = 0; layer < model->block_cnt; layer++) {
@@ -20103,7 +20143,7 @@ namespace fastllm {
                     fflush(stdout);
                 }
                 PrefixCacheStatsObserveRequest(
-                    prefixQueryTotalTokens, 0, nullptr, "layer-min");
+                    prefixQueryTotalTokens, 0, nullptr, "layer-min", prefixSessionId);
                 return 0;
             }
 
@@ -20114,7 +20154,7 @@ namespace fastllm {
             }
             if (minCachedPages <= 0) {
                 PrefixCacheStatsObserveRequest(
-                    prefixQueryTotalTokens, 0, nullptr, "single-page");
+                    prefixQueryTotalTokens, 0, nullptr, "single-page", prefixSessionId);
                 return 0;
             }
 
@@ -20137,7 +20177,7 @@ namespace fastllm {
                     fflush(stdout);
                 }
                 PrefixCacheStatsObserveRequest(
-                    prefixQueryTotalTokens, 0, nullptr, "extra-missing");
+                    prefixQueryTotalTokens, 0, nullptr, "extra-missing", prefixSessionId);
                 return 0;
             }
             cachedLen = minCachedPages * probeManager->pageLen;
@@ -20149,12 +20189,12 @@ namespace fastllm {
                     fflush(stdout);
                 }
                 PrefixCacheStatsObserveRequest(
-                    prefixQueryTotalTokens, 0, nullptr, mmRefuse);
+                    prefixQueryTotalTokens, 0, nullptr, mmRefuse, prefixSessionId);
                 return 0;
             }
             if (!model->RestorePagedPrefixCacheExtra(ctx, cachedLen)) {
                 PrefixCacheStatsObserveRequest(
-                    prefixQueryTotalTokens, 0, nullptr, "restore-failed");
+                    prefixQueryTotalTokens, 0, nullptr, "restore-failed", prefixSessionId);
                 return -1;
             }
 
@@ -20267,7 +20307,7 @@ namespace fastllm {
                 if (!restorePagedCache(ctx->pastKeyValues[layer].first, keyRefs) ||
                     !restorePagedCache(ctx->pastKeyValues[layer].second, valueRefs)) {
                     PrefixCacheStatsObserveRequest(
-                        prefixQueryTotalTokens, 0, nullptr, "restore-failed");
+                        prefixQueryTotalTokens, 0, nullptr, "restore-failed", prefixSessionId);
                     return -1;
                 }
             }
@@ -20278,7 +20318,7 @@ namespace fastllm {
                 hitLayer = "cpu";
             }
             PrefixCacheStatsObserveRequest(
-                prefixQueryTotalTokens, cachedLen, hitLayer, nullptr);
+                prefixQueryTotalTokens, cachedLen, hitLayer, nullptr, prefixSessionId);
             ctx->currentTokens.erase(
                 ctx->currentTokens.begin(),
                 ctx->currentTokens.begin() + cachedLen);
@@ -21430,6 +21470,7 @@ namespace fastllm {
                                 float mropeDelta = 0.0f;
                                 if (!ctx->multimodalInput.empty() &&
                                     Qwen35MultimodalPositionDelta(ctx, mropeDelta)) {
+                                    MtpAttributionObserve("decode-mm");
                                     Data *mropePos = new Data();
                                     ownedPositionIds.push_back(mropePos);
                                     mropePos->CopyFrom(Data(
@@ -21462,6 +21503,7 @@ namespace fastllm {
                                 !ctx->multimodalInput.empty() &&
                                 Qwen35MultimodalPositionDelta(ctx, mropeDeltaMulti);
                             if (useMropeMulti) {
+                                MtpAttributionObserve("decode-mm");
                                 std::vector<float> vMrope(3 * seqLen, 0.0f);
                                 for (int row = 0; row < 3; row++) {
                                     for (int i = 0; i < seqLen; i++) {
@@ -21925,7 +21967,8 @@ namespace fastllm {
                     }
                 } else
                 if (selectedMultimodal && singleContext != nullptr) {
-                    ret = model->ForwardMultimodal(
+                    ret = model->ForwardMultimodalWithContext(
+                        singleContext,
                         inputIds,
                         attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
                         positionIds[0] == nullptr ? Data() : *positionIds[0],
@@ -21943,6 +21986,7 @@ namespace fastllm {
                     if (selectedIsPrompt &&
                         Qwen35MultimodalPositionDelta(singleContext, mropeDeltaProbe)) {
                         singleContext->multimodalPrefillDone = true;
+                        MtpAttributionObserve("prefill-done");
                     }
                 } else if (seqLens.size() == 1 && selectedIsPrompt &&
                            seqLens[0] > prefillChunkSize && singleContext != nullptr) {
@@ -22191,6 +22235,22 @@ namespace fastllm {
                             true, singleContext, inputIds, attentionMasks, positionIds,
                             seqLens, pastKeyValues, generationConfigs,
                             acceptedTokenLists, nextInputTokenLists, keptInputLens);
+                    }
+
+                    if (usedMtpForward) {
+                        // 【F9 验收】直接记数, 不做时序推断: 只要 stepsMultimodal
+                        // 非 0, 就说明 MTP 确实在带图请求上跑过。
+                        bool anyMultimodal = false;
+                        for (ResponseContext *tc : tokenContexts) {
+                            if (tc != nullptr && !tc->multimodalInput.empty()) {
+                                anyMultimodal = true;
+                                break;
+                            }
+                        }
+                        MtpAttributionObserve("step");
+                        if (anyMultimodal) {
+                            MtpAttributionObserve("step-mm");
+                        }
                     }
 
                     if (!usedMtpForward && !selectedIsPrompt &&
@@ -26730,6 +26790,18 @@ namespace fastllm {
                                                       const std::map <std::string, std::vector <Data*> > &multimodalInput,
                                                       const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
                                                       std::vector <std::vector <float>*> *retLogits) {
+        return ForwardMultimodalWithContext(
+            nullptr, inputIds, attentionMask, positionIds, pastKeyValues,
+            multimodalInput, generationConfig, lastTokens, retLogits);
+    }
+
+    std::vector <int> Qwen3_5Model::ForwardMultimodalWithContext(
+            ResponseContext *context,
+            const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
+            const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
+            const std::map <std::string, std::vector <Data*> > &multimodalInput,
+            const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+            std::vector <std::vector <float>*> *retLogits) {
         std::vector <int> ret;
         std::vector <float> *logits = nullptr;
         if (retLogits != nullptr && !retLogits->empty()) {
@@ -26926,6 +26998,26 @@ namespace fastllm {
 
             std::vector <int> ret;
             std::vector <GenerationConfig> generationConfigs = {generationConfig};
+            // 【上游BUMP勿回退】块边界上的前缀快照"梯子"。
+            //
+            // 不做这件事的后果(线上实测): 带图请求只在**整段 prompt** 那一个深度
+            // 上有 GDN/linear 快照。查询侧要求 snapshot->cachedLen <= 匹配深度,
+            // 于是任何**部分匹配**都会被整条丢弃 —— req#2 = 69698 token, 唯一
+            // 快照在 aligned(69698) = 69632; req#3 的分页 trie 匹配到 14080,
+            // 69632 > 14080, 整条命中作废, 记 miss=extra-missing。
+            //
+            // 为什么是**几何**间隔而不是每块都记: 快照的保留上限是
+            // FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_PER_REQUEST(默认 16), 淘汰按
+            // 时间戳丢最旧的。每 1024 token 记一条的话, 7 万 token 会产生 68 条,
+            // 只留下最新的 16 条 -> 覆盖全挤在**深端**, 浅匹配照样查不到,
+            // 白白多做 52 次 GDN 状态 D2H 拷贝。几何间隔(1K/2K/4K/.../64K)对
+            // 7 万 token 只产生 7 条, 不触发淘汰, 而且保证**任意匹配深度 d 都能
+            // 找到一条 >= d/2 的快照**, 至少能复用一半。
+            //
+            // 阈值都是 2 的幂且 >= 1024, 因此天然是页长(128)与快照间隔
+            // (FASTLLM_PREFIX_CACHE_SNAPSHOT_INTERVAL_PAGES * 128 = 512)的整数倍,
+            // 不会被 TryRecordPagedPrefixCacheExtra 里的 interval 门挡掉。
+            int nextRecordAt = prefillChunkSize > 1024 ? prefillChunkSize : 1024;
             for (int st = 0; st < totalSeqLen; st += prefillChunkSize) {
                 const int curLen = std::min(prefillChunkSize, totalSeqLen - st);
                 Data curInputIds, curPositionIds, curHiddenStates;
@@ -26940,6 +27032,18 @@ namespace fastllm {
                     1, curInputIds, curAttentionMasks, curPositionIds,
                     curSeqLens, pagedPastKeyValues, generationConfigs,
                     lastTokens, retLogits, curHiddenStates, curLen == 1);
+                const int donePrefill = st + curLen;
+                // 最后一块不在这里记: 调度器在 prefill 结束后本来就会记一次,
+                // 重复记只会多做一次拷贝。
+                if (context != nullptr && donePrefill < totalSeqLen &&
+                    donePrefill >= nextRecordAt) {
+                    // 锁状态与文本长 prefill 的块边界记录点一致(持 forwardLocker,
+                    // 不持 dictLocker), 所以这里没有新的锁序风险。
+                    context->TryRecordPagedCache(this);
+                    while (nextRecordAt <= donePrefill) {
+                        nextRecordAt *= 2;
+                    }
+                }
             }
             return ret;
         }

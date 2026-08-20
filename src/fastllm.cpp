@@ -7625,7 +7625,8 @@ namespace fastllm {
 
     void PrefixCacheStatsObserveRequest(
             int totalTokens, int hitTokens,
-            const char *hitLayer, const char *missReason) {
+            const char *hitLayer, const char *missReason,
+            uint64_t sessionId) {
         if (!PrefixCacheStatsEnabled()) {
             return;
         }
@@ -7676,8 +7677,9 @@ namespace fastllm {
         } else {
             pcStatMissOther.fetch_add(1);
         }
-        printf("[PrefixCache] req#%llu total=%d hit=%d layer=%s miss=%s\n",
-               (unsigned long long)reqSeq, totalTokens, hitTokens,
+        printf("[PrefixCache] req#%llu sess=%016llx total=%d hit=%d layer=%s miss=%s\n",
+               (unsigned long long)reqSeq, (unsigned long long)sessionId,
+               totalTokens, hitTokens,
                hitLayer != nullptr ? hitLayer : "-",
                missReason != nullptr ? missReason : "-");
         // Per-request record-path line: with multi-agent traffic a generation
@@ -7845,6 +7847,32 @@ namespace fastllm {
             return;
         }
         pcQueryMatchedPages += (uint64_t)pages;
+    }
+
+    namespace {
+        std::atomic<uint64_t> mtpAttrSteps{0};
+        std::atomic<uint64_t> mtpAttrStepsMultimodal{0};
+        std::atomic<uint64_t> mtpAttrPrefillDoneFlips{0};
+        std::atomic<uint64_t> mtpAttrDecodeStepsMultimodal{0};
+    }
+
+    void MtpAttributionObserve(const char *event) {
+        if (event == nullptr) {
+            return;
+        }
+        if (!std::strcmp(event, "step")) mtpAttrSteps++;
+        else if (!std::strcmp(event, "step-mm")) mtpAttrStepsMultimodal++;
+        else if (!std::strcmp(event, "prefill-done")) mtpAttrPrefillDoneFlips++;
+        else if (!std::strcmp(event, "decode-mm")) mtpAttrDecodeStepsMultimodal++;
+    }
+
+    MtpAttributionStats GetMtpAttributionStatsSnapshot() {
+        MtpAttributionStats s;
+        s.steps = mtpAttrSteps.load();
+        s.stepsMultimodal = mtpAttrStepsMultimodal.load();
+        s.prefillDoneFlips = mtpAttrPrefillDoneFlips.load();
+        s.decodeStepsMultimodal = mtpAttrDecodeStepsMultimodal.load();
+        return s;
     }
 
     void PrefixCacheStatsObserveRecordPath(const char *event) {

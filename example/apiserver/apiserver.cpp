@@ -1507,6 +1507,16 @@ struct WorkQueue {
                     (double)prefixStats.missMultimodalDisabled},
                 {"prefix_cache_stats_miss_remainder_has_image",
                     (double)prefixStats.missRemainderHasImage},
+                // MTP 归属: mtp_steps_multimodal != 0 == MTP 在带图请求上跑过。
+                // 这是 F9 的验收判据, 不依赖任何时序推断。
+                {"mtp_steps",
+                    (double)fastllm::GetMtpAttributionStatsSnapshot().steps},
+                {"mtp_steps_multimodal",
+                    (double)fastllm::GetMtpAttributionStatsSnapshot().stepsMultimodal},
+                {"mtp_multimodal_prefill_done",
+                    (double)fastllm::GetMtpAttributionStatsSnapshot().prefillDoneFlips},
+                {"mtp_multimodal_decode_steps",
+                    (double)fastllm::GetMtpAttributionStatsSnapshot().decodeStepsMultimodal},
                 {"prefix_cache_stats_miss_mm_delta_unavailable",
                     (double)prefixStats.missMmDeltaUnavailable},
                 {"prefix_cache_stats_miss_evicted",

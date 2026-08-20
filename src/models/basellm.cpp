@@ -883,6 +883,51 @@ namespace fastllm {
             // ---- 完整状态机路径(默认) ----
             const ToolCallGrammarCursor cursor =
                     LocateToolCallGrammarCursor(generatedText, generationConfig);
+
+            // 块内禁止停止符。
+            //
+            // 2026-08-20 生产故障: 模型开了 tool_call 块、生成 7883 个 token
+            // (55812 字节)后**发出 EOS 却从未闭合该块**, 日志打
+            //     [ToolCall] MALFORMED unterminated block (55812B)
+            // 它没有撞 max_tokens(65536), 是自己停的。块残缺 -> 解析器退回显示
+            // 原始文本 -> 上游看到的是 markdown 代码块而不是工具调用 ->
+            // harness 没有任何工具可执行 -> agent 一路空转
+            // (实测 gh pr view 251 -> 252 -> ... -> 258 循环, 白跑 18.5 分钟)。
+            //
+            // 原状态机只约束了"不能**提前**闭合"(必填未齐时 </function> 不可拼、
+            // 空值不能闭合 </parameter>), 漏了"不能**不闭合就结束**"。
+            // 两套不变量测试(test/toolcallGrammarTest.cpp 与
+            // v100-perfs/tests/toolcall_grammar_invariants.py)也都没有这条断言 ——
+            // 覆盖的是"提前闭合", 不是"永不闭合"。
+            //
+            // 所以只要游标处在块内的任一状态, 就把 EOS 与所有停止符拉黑,
+            // 直到 </function> 真正闭合(此时 cursor.state 会变成 TG_NONE/TG_DONE,
+            // 不再进入本分支)。
+            if (blockedIdsOut != nullptr &&
+                (cursor.state == TG_FUNC_OPEN ||
+                 cursor.state == TG_PARAM_GAP ||
+                 cursor.state == TG_PARAM_NAME ||
+                 cursor.state == TG_PARAM_VALUE)) {
+                if (this->eos_token_id >= 0) {
+                    blockedIdsOut->push_back(this->eos_token_id);
+                }
+                for (int id : this->eos_token_ids) {
+                    blockedIdsOut->push_back(id);
+                }
+                for (int id : generationConfig.stop_token_ids) {
+                    blockedIdsOut->push_back(id);
+                }
+                std::sort(blockedIdsOut->begin(), blockedIdsOut->end());
+                blockedIdsOut->erase(
+                    std::unique(blockedIdsOut->begin(), blockedIdsOut->end()),
+                    blockedIdsOut->end());
+                if (ToolCallTraceEnabled()) {
+                    printf("[ToolCallTrace] %s: 屏蔽停止符 x%zu(块未闭合)\n",
+                           ToolCallGrammarStateName(cursor.state),
+                           blockedIdsOut->size());
+                    fflush(stdout);
+                }
+            }
             bool handled = false;
             bool collectValueCloseBlocked = false;
             switch (cursor.state) {
