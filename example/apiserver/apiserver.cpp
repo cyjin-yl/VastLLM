@@ -2464,6 +2464,49 @@ int main(int argc, char** argv) {
                   (unsigned long long)p.current, (unsigned long long)p.total);
         }
     });
+    // 先占端口, 再加载模型。
+    //
+    // 原顺序是"加载 16GB 权重 -> warmup -> 启工作线程 -> 建 socket -> bind"。
+    // 2026-08-20 出过一次事故: 重启时上一个进程还占着 8002, 新进程把权重全部
+    // 读完(RSS 20GB、约 3 分钟)才走到 bind, 然后失败。
+    //
+    // 更糟的是它**没能退出**。bind 失败时确实调了 exit(-1), 但那时工作线程已经
+    // 起来、CUDA 上下文和 20GB 权重都在, exit() 要跑静态析构与 atexit ——
+    // 其中任何一处阻塞就永远出不去。于是进程活着、握着 20GB 主机内存、GPU 上
+    // 只有几百 MB(权重要到第一次请求才上卡), proxy 侧永远 backend=STARTING,
+    // 客户端全部超时。僵持 23 分钟才被人工发现。
+    //
+    // 把 bind 提前: 端口冲突在毫秒级暴露, 此时既没有工作线程也没有 CUDA 上下文,
+    // exit(-1) 干净利落; 顺带省掉那次白跑的 16GB 机械盘加载。
+    // listen() 仍留在模型就绪之后 —— 端口已绑但未监听时连接会被拒绝, 这正是
+    // 想要的语义: 上游立刻知道"还没准备好", 而不是连上以后干等。
+    int local_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (local_fd == -1) {
+        std::cout << "socket error!" << std::endl;
+        exit(-1);
+    }
+    {
+        // SO_REUSEADDR 只放行 TIME_WAIT 残留, **不会**掩盖"另一个进程正在监听"
+        // 这种真冲突(那在 Linux 上需要 SO_REUSEPORT), 所以不削弱上面的保护。
+        int reuseOne = 1;
+        setsockopt(local_fd, SOL_SOCKET, SO_REUSEADDR, &reuseOne,
+                   sizeof(reuseOne));
+    }
+    {
+        struct sockaddr_in early_addr;
+        memset(&early_addr, 0, sizeof(early_addr));
+        early_addr.sin_family = AF_INET;
+        early_addr.sin_port = htons(config.port);
+        early_addr.sin_addr.s_addr = INADDR_ANY;
+        if (bind(local_fd, (struct sockaddr *) &early_addr,
+                 sizeof(early_addr)) == -1) {
+            std::cout << "bind error! port " << config.port
+                      << " already in use (nothing loaded yet, exiting)"
+                      << std::endl;
+            exit(-1);
+        }
+    }
+    LogTs("[Server] port %d bound (model not loaded yet)\n", config.port);
     LogTs("[Load] start model load: %s\n", config.path.c_str());
     workQueue.model = isHFDir
         ? fastllm::CreateLLMModelFromHF(
@@ -2517,11 +2560,6 @@ int main(int argc, char** argv) {
     workQueue.Start();
     LogTs("[Load] model loaded, workers started\n");
 
-    int local_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (local_fd == -1) {
-        std::cout << "socket error!" << std::endl;
-        exit(-1);
-    }
     LogTs("[Server] socket ready!\n");
 #ifndef _WIN32
     serverSocketForSignal = local_fd;
@@ -2529,17 +2567,7 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, HandleShutdownSignal);
 #endif
 
-    struct sockaddr_in local_addr;
-    local_addr.sin_family = AF_INET;
-    local_addr.sin_port = htons(config.port);  //绑定端口
-    local_addr.sin_addr.s_addr = INADDR_ANY; //绑定本机IP地址
-
-    //3.bind()： 将一个网络地址与一个套接字绑定，此处将本地地址绑定到一个套接字上
-    int res = bind(local_fd, (struct sockaddr *) &local_addr, sizeof(local_addr));
-    if (res == -1) {
-        std::cout << "bind error!" << std::endl;
-        exit(-1);
-    }
+    // 端口已在加载模型之前 bind 过(见上面那段注释), 这里只需开始监听。
     LogTs("[Server] bind ready!\n");
     listen(local_fd, 2000);    
     LogTs("[Server] ready, listening on port %d\n", config.port);
