@@ -1101,6 +1101,21 @@ namespace fastllm {
         responseContextDict.RemoveHandle(handleId);
     }
 
+    // decode 期页边界记录总开关（默认开；=0 退回旧行为）。
+    static bool DecodePrefixRecordEnabled() {
+        static const bool enabled = []() {
+            const char *value = std::getenv(
+                "FASTLLM_PREFIX_CACHE_DECODE_RECORD");
+            if (value == nullptr || value[0] == 0) {
+                return true;
+            }
+            return std::strcmp(value, "0") != 0 &&
+                   std::strcmp(value, "false") != 0 &&
+                   std::strcmp(value, "off") != 0;
+        }();
+        return enabled;
+    }
+
     void ResponseContext::TryRecordPagedCache(basellm *model) {
         PrefixCacheStatsObserveRecordPath("call");
         bool hasLinearAttentionCache = false;
@@ -4537,6 +4552,12 @@ namespace fastllm {
                             ctx->TryRecordPagedCache(model);
                             // printf("[Handle %d] Finished. Reason: max positions reached (allTokens=%d, max_positions=%d).\n",
                                    //handles[i], (int)it.second->allTokens.size(), model->max_positions);
+                        } else if (DecodePrefixRecordEnabled()) {
+                            // decode 期页边界打点（与 Qwen35MTPLoop 同策略）：
+                            // 只在生成结束时记录的话，那一刻的 KV 长度几乎不可能
+                            // 页对齐，本轮生成的内容永远进不了前缀缓存。
+                            // 记录条件由 TryRecordPagedCache 链自己判定。
+                            ctx->TryRecordPagedCache(model);
                         }
                     }
                 }
