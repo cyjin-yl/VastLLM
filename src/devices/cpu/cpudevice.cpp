@@ -11372,6 +11372,13 @@ ops += (long long)lines * inputDim * interDim * 2;
             }
         }
 
+        std::string ensurePagesError;
+        AssertInFastLLM(
+            manager.EnsureUnusedPages(
+                newPageCount, &ensurePagesError),
+            "CpuGenerateAppendPagedCacheBatchParamsOp: " +
+            ensurePagesError + ".\n");
+
         std::vector<int> previewNewPages;
         previewNewPages.reserve(newPageCount);
         if (newPageCount > 0) {

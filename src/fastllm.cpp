@@ -9000,6 +9000,60 @@ namespace fastllm {
         }
     }
 
+    bool PagedCacheManager::EnsureUnusedPages(
+            int requiredPages, std::string *error) {
+        auto fail = [&](const std::string &reason) {
+            if (error != nullptr) {
+                *error = reason;
+            }
+            return false;
+        };
+        if (requiredPages <= 0) {
+            return true;
+        }
+
+        int physicalPages = 0;
+        int logicalPages = 0;
+        int availablePages = 0;
+        {
+            std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+            if (this->dims.empty()) {
+                return fail("paged cache has no physical geometry");
+            }
+            physicalPages = this->dims[0];
+            logicalPages = this->maxPages;
+            availablePages =
+                (int)this->freePages.size() +
+                (int)this->triePages.size();
+        }
+        if (availablePages >= requiredPages) {
+            return true;
+        }
+        const int additionalPages =
+            requiredPages - availablePages;
+        const int target = GetPagedCacheGrowthTarget(
+            physicalPages, logicalPages, additionalPages);
+        if (target <= physicalPages) {
+            return fail(
+                "logical page budget cannot satisfy batch append");
+        }
+        std::string growError;
+        if (!this->TryGrow(target, &growError)) {
+            return fail(growError);
+        }
+        {
+            std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+            availablePages =
+                (int)this->freePages.size() +
+                (int)this->triePages.size();
+        }
+        if (availablePages < requiredPages) {
+            return fail(
+                "paged cache growth did not expose enough pages");
+        }
+        return true;
+    }
+
     // 非抛出扩容。失败时把原因写进 *error 并返回 false，调用方负责
     // 「逐出/下沉 -> 重试 -> 排队」，而不是把异常抛到请求线程变成 500。
     bool PagedCacheManager::TryGrow(int newMaxPages, std::string *error) {

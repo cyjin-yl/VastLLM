@@ -9294,6 +9294,13 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             }
         }
 
+        std::string ensurePagesError;
+        AssertInFastLLM(
+            manager.EnsureUnusedPages(
+                newPageCount, &ensurePagesError),
+            "CudaGenerateAppendPagedCacheBatchParamsOp: " +
+            ensurePagesError + ".\n");
+
         std::vector<int> previewNewPages;
         previewNewPages.reserve(newPageCount);
         if (newPageCount > 0) {

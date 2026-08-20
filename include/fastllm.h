@@ -823,6 +823,10 @@ namespace fastllm {
             // 触到 FASTLLM_PAGED_POOL_MAX_MB 预算),调用方应当让该请求
             // 排队等待下一轮调度,而不是抛错 -> 500。
             bool TryGrow(int newMaxPages, std::string *error = nullptr);
+            // 批量 append 在生成元数据前确保一次能预览 requiredPages 个页。
+            // lazy pool 只物理分配 dims[0]，不能把 maxPages 当成现成空闲页。
+            bool EnsureUnusedPages(
+                int requiredPages, std::string *error = nullptr);
             // 把最冷的、未被引用的 Trie 页下沉到 CPU/disk 层,
             // 物理页归还 freePages。返回实际下沉成功的页数。
             // wantPages<=0 时按 freePages 缺口自适应。
