@@ -1181,12 +1181,24 @@ namespace fastllm {
         uint64_t maskedTokens = 0;
         // S4 参数值尾部循环守卫触发次数(退化被截断的步数)
         uint64_t valueLoopBreaks = 0;
+        // CUDA 掩码"全禁->全放开"兜底次数(约束在该步被完全放弃)
+        uint64_t cudaMaskAllBlocked = 0;
+        // 放行集恰好 1 个 token 的步数(模型完全没得选 = 强制)
+        uint64_t forcedSteps = 0;
+        // 掩码否决了模型第一意愿的步数(改写而非护栏; 仅 trace 开启时统计)
+        uint64_t maskOverrodeArgmax = 0;
     };
     // 解析器回调: parsedOk=false 计入 malformed; repaired=true 计入 repaired
     void ToolCallGrammarStatsObserveParse(bool parsedOk, bool repaired);
     void ToolCallGrammarStatsObserveConstraint(size_t allowedCount, size_t vocabSize);
     // S4 检测到参数值尾部循环并屏蔽了延续 token
     void ToolCallValueLoopStatsObserve();
+    // CUDA 掩码整行被全禁, 兜底放开全词表(约束在该步失效)
+    void ToolCallCudaMaskAllBlockedObserve();
+    // 该步放行集只有 1 个 token(强制)
+    void ToolCallForcedStepObserve();
+    // 该步掩码否决了模型的 argmax(改写)
+    void ToolCallMaskOverrodeArgmaxObserve();
     ToolCallGrammarStats GetToolCallGrammarStatsSnapshot();
     // 破损/修复时 dump 原始块到 trace 目录(jsonl, 追加); reason: "malformed"/"repaired"
     void ToolCallTraceDumpBlock(const char *reason, const std::string &block);

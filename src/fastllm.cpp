@@ -3511,6 +3511,33 @@ namespace fastllm {
                 v[i].first = -v[i].first;
             }
         }
+        // ---- 掩码影响力诊断(FASTLLM_TOOLCALL_TRACE=1) ----
+        // 只打印"模型原本最想要哪个 token"与"掩码后实际选了哪个"。
+        // 这是判定约束究竟在**纠正**还是在**改写**的唯一硬证据:
+        //   allowed=1 -> 模型原意就在放行集里, 掩码没改写它;
+        //   allowed=0 -> 掩码把模型的第一意愿挡掉了, 换成了别的 token。
+        // 只在掩码激活时执行, 默认关闭, 不影响生产热路径。
+        if (hasToolNameMask && ToolCallTraceEnabled()) {
+            int rawBest = -1;
+            float rawBestLogit = 0.0f;
+            for (int i = 0; i < vocabSize; i++) {
+                if (rawBest < 0 || base[i] > rawBestLogit) {
+                    rawBestLogit = base[i];
+                    rawBest = i;
+                }
+            }
+            const bool rawAllowed =
+                rawBest >= 0 &&
+                ToolCallConstraintAllowsToken(config, rawBest);
+            const int maskedBest = v.empty() ? -1 : v.front().second;
+            printf("[ToolCallTrace] sample cand=%zu "
+                   "raw_argmax=%d(logit=%.4f,allowed=%d) masked_argmax=%d"
+                   "(logit=%.4f)\n",
+                   v.size(), rawBest, rawBestLogit, (int)rawAllowed,
+                   maskedBest,
+                   maskedBest >= 0 ? base[maskedBest] : 0.0f);
+            fflush(stdout);
+        }
         if (v.empty() && hasToolNameMask) {
             ++g_toolCallMaskEmptied;
             GenerationConfig fallbackConfig = config;
@@ -3579,6 +3606,7 @@ namespace fastllm {
         }
         std::vector<int> candidateOffsets;
         candidateOffsets.reserve(topk);
+        const int topkBeforeMask = topk;
         for (int i = 0; i < topk; i++) {
             int tokenId = (int)base[i * 2];
             if (ToolCallConstraintAllowsToken(config, tokenId)) {
@@ -3594,6 +3622,37 @@ namespace fastllm {
         }
         if (candidateOffsets.empty()) {
             return base[0];
+        }
+        // ---- 生产路径(MTP/GPU top-k)的掩码影响力诊断 ----
+        // 注意这里和 LLMSampling 的本质区别: base 只有 GPU 归约后的
+        // maxTopKSize 个 (tokenId, logit) 对, 掩码是在这份**短名单**上过滤的,
+        // 不是在全词表上。所以掩码只能"筛"不能"提": 正确的名字若不在 top-k
+        // 里就永远选不到, 这是"纠正"能力的硬上限。
+        // raw_argmax = 模型原意(top-k 第一名), masked_argmax = 掩码后实际选中。
+        if (!config.tool_call_allowed_token_ids.empty() ||
+            !config.tool_call_blocked_token_ids.empty()) {
+            if (ToolCallTraceEnabled()) {
+                const int rawId = (int)base[0];
+                const bool rawAllowed =
+                    ToolCallConstraintAllowsToken(config, rawId);
+                const int pickedId =
+                    (int)base[candidateOffsets.front() * 2];
+                std::string head;
+                for (int i = 0; i < topkBeforeMask && i < 8; i++) {
+                    if (!head.empty()) {
+                        head += ",";
+                    }
+                    head += std::to_string((int)base[i * 2]);
+                }
+                printf("[ToolCallTrace] sampleOnly topk=%d cand=%zu "
+                       "raw_argmax=%d(logit=%.4f,allowed=%d) "
+                       "masked_pick=%d(logit=%.4f) topk_head=[%s]\n",
+                       topkBeforeMask, candidateOffsets.size(),
+                       rawId, base[1], (int)rawAllowed,
+                       pickedId, base[candidateOffsets.front() * 2 + 1],
+                       head.c_str());
+                fflush(stdout);
+            }
         }
         topk = candidateOffsets.size();
         if (zeroTemperature) {
@@ -8070,6 +8129,9 @@ namespace fastllm {
         std::atomic<uint64_t> tgConstraintSteps{0};
         std::atomic<uint64_t> tgMaskedTokens{0};
         std::atomic<uint64_t> tgValueLoopBreaks{0};
+        std::atomic<uint64_t> tgCudaMaskAllBlocked{0};
+        std::atomic<uint64_t> tgForcedSteps{0};
+        std::atomic<uint64_t> tgMaskOverrodeArgmax{0};
         std::mutex tgTraceDumpMutex;
     }
 
@@ -8110,6 +8172,18 @@ namespace fastllm {
         tgValueLoopBreaks++;
     }
 
+    void ToolCallCudaMaskAllBlockedObserve() {
+        tgCudaMaskAllBlocked++;
+    }
+
+    void ToolCallForcedStepObserve() {
+        tgForcedSteps++;
+    }
+
+    void ToolCallMaskOverrodeArgmaxObserve() {
+        tgMaskOverrodeArgmax++;
+    }
+
     ToolCallGrammarStats GetToolCallGrammarStatsSnapshot() {
         ToolCallGrammarStats s;
         s.blocksTotal = tgBlocksTotal.load();
@@ -8118,6 +8192,9 @@ namespace fastllm {
         s.constraintSteps = tgConstraintSteps.load();
         s.maskedTokens = tgMaskedTokens.load();
         s.valueLoopBreaks = tgValueLoopBreaks.load();
+        s.cudaMaskAllBlocked = tgCudaMaskAllBlocked.load();
+        s.forcedSteps = tgForcedSteps.load();
+        s.maskOverrodeArgmax = tgMaskOverrodeArgmax.load();
         return s;
     }
 

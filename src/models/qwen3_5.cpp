@@ -6883,6 +6883,46 @@ namespace fastllm {
                 return true;
             }
 
+            // ---- 掩码影响力诊断(FASTLLM_TOOLCALL_TRACE=1) ----
+            // 这里是掩码**真正生效**的唯一位置(GPU 全词表 logits, 先掩码后
+            // top-k)。在打掩码之前把每行的 argmax 取出来 = 模型原意;
+            // 与掩码放行集一比即可区分:
+            //   allowed=1 -> 原意本就合法, 掩码只是护栏(纠正语义);
+            //   allowed=0 -> 掩码把模型第一意愿挡掉并改写(强制语义)。
+            // 需要把 logits 拷回 CPU, 只在 trace 打开时执行, 不影响生产。
+            std::vector<int> rawArgmax;
+            if (ToolCallTraceEnabled()) {
+                Data cpuLogits;
+                cpuLogits.CopyFrom(fullLogits);
+                cpuLogits.ToDevice(DataDevice::CPU);
+                float *lg = (float*)cpuLogits.cpuData;
+                rawArgmax.assign(batch, -1);
+                for (int b = 0; b < batch; b++) {
+                    float *row = lg + (size_t)b * vocabSize;
+                    int best = 0;
+                    for (int t = 1; t < vocabSize; t++) {
+                        if (row[t] > row[best]) {
+                            best = t;
+                        }
+                    }
+                    rawArgmax[b] = best;
+                    const auto &cfg = generationConfigs[b];
+                    const bool allowed =
+                        Qwen35ToolConstraintAllowsToken(cfg, best);
+                    if (!allowed) {
+                        // 模型的第一意愿被掩码否决 = 这一步是"改写"而非"护栏"
+                        fastllm::ToolCallMaskOverrodeArgmaxObserve();
+                    }
+                    printf("[ToolCallTrace] cudaMask row=%d/%d "
+                           "raw_argmax=%d(logit=%.4f,allowed=%d) "
+                           "allow_n=%zu block_n=%zu\n",
+                           b, batch, best, row[best], (int)allowed,
+                           cfg.tool_call_allowed_token_ids.size(),
+                           cfg.tool_call_blocked_token_ids.size());
+                    fflush(stdout);
+                }
+            }
+
             static thread_local std::vector<uint8_t> mask;
             mask.assign((size_t)batch * vocabSize, 1);
             for (int b = 0; b < batch; b++) {
@@ -6912,7 +6952,23 @@ namespace fastllm {
                         break;
                     }
                 }
+                // 常开计数(不依赖 trace): 量化约束的"强制"程度。
+                // allowed 恰好 1 个 = 该步模型完全没得选, 无论它想要什么都
+                // 只能生成这一个 token。结构标签(<function= / <parameter=)
+                // 在词表里不是 token, 必须拼片, 于是这类步会成串出现。
+                // 这是判断约束是"护栏"还是"强制"的规模指标。
+                if (config.tool_call_allowed_token_ids.size() == 1) {
+                    fastllm::ToolCallForcedStepObserve();
+                }
                 if (!anyAllowed) {
+                    // 【上游BUMP勿回退】"全禁 -> 全放开"必须可观测。
+                    // 这条兜底本身是必要的(否则该步无 token 可选,直接卡死),
+                    // 但它等于**在这一步彻底放弃约束**。实测中 S4 空值守卫
+                    // 曾把整个词表塞进 blocked, 每次都静默走到这里, 于是
+                    // <parameter=path>\n\n</parameter> 这种空值畅通无阻,
+                    // 而 toolcall_mask_emptied 始终是 0 —— 那个计数器统计的
+                    // 是 LLMSampling 里的另一条兜底, 覆盖不到 CUDA 这条。
+                    fastllm::ToolCallCudaMaskAllBlockedObserve();
                     std::memset(row, 1, vocabSize);
                 }
             }

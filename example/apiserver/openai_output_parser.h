@@ -181,6 +181,11 @@ public:
             OpenAIParsedToolCall parsed;
             if (ParseBlock(block, parsed)) {
                 fastllm::ToolCallGrammarStatsObserveParse(true, false);
+                // 解析成功的块也 dump 一份原始 XML(仅 trace 模式)。
+                // 排查"模型想调 A 却发出了 B"这类问题时, 结构化结果里已经
+                // 看不到原始文本了 —— content 被剥离, 块被转成 JSON,
+                // 现场就此消失。这里补上唯一的原文留存点。
+                fastllm::ToolCallTraceDumpBlock("parsed", block);
                 delta.toolCalls.push_back(std::move(parsed));
             } else {
                 // 完整闭合块解析失败 = 结构破损(不能静默: 计数 + dump)

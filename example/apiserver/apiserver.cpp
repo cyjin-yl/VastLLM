@@ -1756,6 +1756,15 @@ struct WorkQueue {
                 {"toolcall_value_loop_breaks",
                     (double)fastllm::GetToolCallGrammarStatsSnapshot()
                             .valueLoopBreaks},
+                {"toolcall_cuda_mask_all_blocked",
+                    (double)fastllm::GetToolCallGrammarStatsSnapshot()
+                            .cudaMaskAllBlocked},
+                {"toolcall_forced_steps",
+                    (double)fastllm::GetToolCallGrammarStatsSnapshot()
+                            .forcedSteps},
+                {"toolcall_mask_overrode_argmax",
+                    (double)fastllm::GetToolCallGrammarStatsSnapshot()
+                            .maskOverrodeArgmax},
                 {"toolcall_mask_emptied",
                     (double)fastllm::GetToolCallMaskEmptiedCount()},
                 {"chat_template_startup_valid",

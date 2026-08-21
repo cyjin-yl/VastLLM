@@ -975,15 +975,48 @@ namespace fastllm {
         // 同一段子串连续重复 kMinRepeats 次构成, 是则屏蔽会把循环再推进
         // 一步的 token。走既有 blocked 通道, 不新增采样路径。
         static size_t ToolCallValueLoopPeriod(const std::string &value) {
-            static const size_t kMinRepeats = 3;   // 连续重复几次算循环
-            static const size_t kMinPeriod = 2;    // 单字符重复交给 repeat_penalty
-            static const size_t kMaxPeriod = 96;   // 超过这个长度不认为是退化
+            // 阈值按周期长度分档。理由是实测:
+            //  - 短周期(缩进、", "、"</div>")在正常代码/文本里连续重复两遍
+            //    极其常见, 门槛必须高, 否则误伤合法参数值;
+            //  - 长周期是退化的特征形态。生产实测那次是 27 字节的
+            //    " [in_progress] (Tool tests)" 连抄 6 遍 —— 正常文本几乎
+            //    不会连续重复两遍同一个 12 字节以上的片段。
+            // 旧实现一律要求 3 次: 长周期要先吐三遍脏数据才截断, 而那三遍
+            // 本身已经是坏参数(OMP 找不到该 task 名 -> 报错 -> 重试循环)。
+            static const size_t kMinPeriod = 2;
+            static const size_t kMaxPeriod = 96;
+            static const size_t kLongPeriod = 12;   // 长周期分界
+            static const size_t kRepeatsShort = 6;  // 短周期: 需重复 6 次
+            static const size_t kRepeatsLong = 2;   // 长周期: 2 次即截断
             for (size_t period = kMinPeriod; period <= kMaxPeriod; period++) {
-                if (value.size() < period * kMinRepeats) {
-                    break;
+                const size_t repeats =
+                    period >= kLongPeriod ? kRepeatsLong : kRepeatsShort;
+                if (value.size() < period * repeats) {
+                    continue;
+                }
+                const std::string cycle =
+                    value.substr(value.size() - period, period);
+                // 纯空白的循环是合法的:代码缩进、对齐、空行。
+                if (cycle.find_first_not_of(" \t\r\n") == std::string::npos) {
+                    continue;
+                }
+                // 短周期还要求循环体本身有变化。"======"/"------"/"0000"
+                // 这类单字符重复在 markdown 分隔线、代码里都正常出现,
+                // 交给 repeat_penalty, 不在这里拦。
+                if (period < kLongPeriod) {
+                    bool varied = false;
+                    for (size_t i = 1; i < cycle.size(); i++) {
+                        if (cycle[i] != cycle[0]) {
+                            varied = true;
+                            break;
+                        }
+                    }
+                    if (!varied) {
+                        continue;
+                    }
                 }
                 bool same = true;
-                for (size_t rep = 1; rep < kMinRepeats && same; rep++) {
+                for (size_t rep = 1; rep < repeats && same; rep++) {
                     if (value.compare(value.size() - period, period,
                                       value,
                                       value.size() - period * (rep + 1),
@@ -1005,6 +1038,189 @@ namespace fastllm {
                 return env == nullptr || std::string(env) != "0";
             }();
             return enabled;
+        }
+
+        // trace 用: 把 allowedValues 拼成一行(截断), 便于看清某一步到底
+        // 把生成引导到了哪几个候选上。只在 FASTLLM_TOOLCALL_TRACE=1 时调用。
+        static std::string JoinToolCallValuesForTrace(
+                const std::vector<std::string> &values) {
+            std::string joined;
+            for (const auto &value : values) {
+                if (!joined.empty()) {
+                    joined += "|";
+                }
+                if (joined.size() > 180) {
+                    joined += "...";
+                    break;
+                }
+                joined += value;
+            }
+            for (auto &ch : joined) {
+                if (ch == '\n') ch = '?';
+                if (ch == '\r') ch = '?';
+                if (ch == '\t') ch = '?';
+            }
+            return joined;
+        }
+
+        // ---- 字符级语法推进器 ----
+        // 语义对齐 llama.cpp 的 llama_grammar_accept_str: 一个 token 合法
+        // <=> 它的全部字符能从当前状态被语法连续消费。
+        //
+        // 旧实现是"每状态维护一个候选字符串集合, 逐状态独立做前缀匹配",
+        // 于是**跨状态边界的 token 一律被拒**。实测代价:
+        //   模型想调 bash, 自然选的 token 是 '=b'(id 21402) —— '=' 补完
+        //   functionPrefix, 'b' 开启名字。旧判定算出 "\n<function=b" 不是
+        //   "\n<function=" 的前缀, 直接拒掉, 只放行光秃秃的 '='(id 28)。
+        //   模型被迫改走自己概率更低的拼法, 隐状态偏离, 随后在 S1 选了
+        //   todo 而不是 bash。同一形态在 'bash>'、'i>' 等处反复出现。
+        //   计数: 一次工具调用 90 步约束中 17 步完全没得选、13 步直接
+        //   否决了模型的 argmax。
+        // 逐字符推进天然支持跨边界, 无需任何特例; 转移规则全部取自
+        // CompileToolCallGrammarLayout 编译出的 layout, 不含模型专有字面量,
+        // 换 GLM/Claude 模板同样成立。
+        struct ToolCallWalkPos {
+            ToolCallGrammarState state = TG_FUNC_OPEN;
+            size_t off = 0;              // 当前结构串内已匹配长度
+            std::string name;            // S1/S3 已生成的名字前缀
+            bool viaParam = true;        // S2: parameterPrefix 分支可行
+            bool viaClose = true;        // S2: functionClose 分支可行
+            size_t valueCloseOff = 0;    // S4: parameterClose 尾部匹配进度
+        };
+
+        static bool ToolCallIsPrefixOfAny(
+                const std::string &text,
+                const std::vector<std::string> &values) {
+            for (const auto &value : values) {
+                if (value.size() >= text.size() &&
+                    value.compare(0, text.size(), text) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        static bool ToolCallIsExactAny(
+                const std::string &text,
+                const std::vector<std::string> &values) {
+            for (const auto &value : values) {
+                if (value == text) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // 推进一个字符; 返回 false 表示该字符在当前语法下非法。
+        static bool ToolCallWalkChar(
+                ToolCallWalkPos &pos, char ch,
+                const ToolCallGrammarLayout &layout,
+                const std::vector<std::string> &toolNames,
+                const std::vector<std::string> &paramNames) {
+            const char nameTerm = layout.nameTerminator.empty() ?
+                '>' : layout.nameTerminator[0];
+            switch (pos.state) {
+                case TG_FUNC_OPEN: {
+                    if (pos.off >= layout.functionPrefix.size() ||
+                        layout.functionPrefix[pos.off] != ch) {
+                        return false;
+                    }
+                    if (++pos.off == layout.functionPrefix.size()) {
+                        pos.state = TG_FUNC_NAME;
+                        pos.off = 0;
+                        pos.name.clear();
+                    }
+                    return true;
+                }
+                case TG_FUNC_NAME: {
+                    if (ch == nameTerm &&
+                        ToolCallIsExactAny(pos.name, toolNames)) {
+                        pos.state = TG_PARAM_GAP;
+                        pos.off = 0;
+                        pos.viaParam = pos.viaClose = true;
+                        return true;
+                    }
+                    pos.name += ch;
+                    return ToolCallIsPrefixOfAny(pos.name, toolNames);
+                }
+                case TG_PARAM_GAP: {
+                    const bool a = pos.viaParam &&
+                        pos.off < layout.parameterPrefix.size() &&
+                        layout.parameterPrefix[pos.off] == ch;
+                    const bool b = pos.viaClose &&
+                        pos.off < layout.functionClose.size() &&
+                        layout.functionClose[pos.off] == ch;
+                    if (!a && !b) {
+                        return false;
+                    }
+                    pos.viaParam = a;
+                    pos.viaClose = b;
+                    pos.off++;
+                    if (a && pos.off == layout.parameterPrefix.size()) {
+                        pos.state = TG_PARAM_NAME;
+                        pos.off = 0;
+                        pos.name.clear();
+                    } else if (b && pos.off == layout.functionClose.size()) {
+                        pos.state = TG_FUNC_CLOSE_TAIL;
+                        pos.off = 0;
+                    }
+                    return true;
+                }
+                case TG_PARAM_NAME: {
+                    if (ch == nameTerm &&
+                        ToolCallIsExactAny(pos.name, paramNames)) {
+                        pos.state = TG_PARAM_VALUE;
+                        pos.valueCloseOff = 0;
+                        return true;
+                    }
+                    pos.name += ch;
+                    return ToolCallIsPrefixOfAny(pos.name, paramNames);
+                }
+                case TG_PARAM_VALUE: {
+                    // 自由文本(必须能表示代码里的裸 '<'), 只跟踪闭合进度。
+                    if (!layout.parameterClose.empty() &&
+                        ch == layout.parameterClose[pos.valueCloseOff]) {
+                        if (++pos.valueCloseOff ==
+                                layout.parameterClose.size()) {
+                            pos.state = TG_PARAM_GAP;
+                            pos.off = 0;
+                            pos.viaParam = pos.viaClose = true;
+                        }
+                    } else {
+                        pos.valueCloseOff =
+                            (!layout.parameterClose.empty() &&
+                             ch == layout.parameterClose[0]) ? 1 : 0;
+                    }
+                    return true;
+                }
+                case TG_FUNC_CLOSE_TAIL: {
+                    if (pos.off >= layout.toolCallClose.size() ||
+                        layout.toolCallClose[pos.off] != ch) {
+                        return false;
+                    }
+                    if (++pos.off == layout.toolCallClose.size()) {
+                        pos.state = TG_NONE;
+                        pos.off = 0;
+                    }
+                    return true;
+                }
+                default:
+                    return true;      // TG_NONE: 块外自由生成
+            }
+        }
+
+        static bool ToolCallWalkAcceptsToken(
+                ToolCallWalkPos pos, const std::string &tokenText,
+                const ToolCallGrammarLayout &layout,
+                const std::vector<std::string> &toolNames,
+                const std::vector<std::string> &paramNames) {
+            for (char ch : tokenText) {
+                if (!ToolCallWalkChar(pos, ch, layout, toolNames,
+                                      paramNames)) {
+                    return false;
+                }
+            }
+            return true;
         }
 
         // tail 结尾与 target 前缀的最长重合长度
@@ -1120,6 +1336,11 @@ namespace fastllm {
         std::string partial;
         std::vector<std::string> allowedValues;
         std::string constraintState = "legacy";
+        // 字符级推进器的起点。由下面的状态机分支填充:把 cursor 的状态与
+        // 已生成的分段内容翻译成 ToolCallWalkPos, 之后逐 token 推进判定。
+        ToolCallWalkPos walkerPos;
+        bool walkerStateValid = false;
+        std::string walkerToolName;
         std::string activeTerminator =
                 generationConfig.tool_call_name_terminator.empty()
                 ? "\"" : generationConfig.tool_call_name_terminator;
@@ -1251,6 +1472,71 @@ namespace fastllm {
             bool collectValueCloseBlocked = false;
             // 非空表示 S4 参数值尾部已形成循环,内容是重复的那一段
             std::string valueLoopCycle;
+            // ---- 构造推进器起点: 从块开头逐字符重放到当前位置 ----
+            // 不手工翻译每个 case 的 partial, 重放天然正确, 且与
+            // LocateToolCallGrammarCursor 的 rfind 语义互相校验:
+            // 重放终点应当恰好等于 cursor.state, 不一致就说明推进器
+            // 与游标对某个输入的解读分歧, trace 直接暴露。
+            if (toolCallGrammarLayout.valid) {
+                const size_t openPos =
+                    generatedText.rfind("<tool_call>");
+                if (openPos != std::string::npos) {
+                    // 重放阶段用全部工具的参数名并集(此时还不知道模型
+                    // 最终选了哪个工具); 最终逐 token 判定时才按
+                    // walkerToolName 取精确集合。
+                    std::vector<std::string> replayParamNames;
+                    for (const auto &entry :
+                         generationConfig
+                             .tool_call_allowed_parameter_names) {
+                        replayParamNames.insert(
+                            replayParamNames.end(),
+                            entry.second.begin(), entry.second.end());
+                    }
+                    const size_t blockStart =
+                        openPos + std::string("<tool_call>").size();
+                    const std::string blockText =
+                        generatedText.substr(blockStart);
+                    ToolCallWalkPos replay;
+                    replay.state = TG_FUNC_OPEN;
+                    for (char ch : blockText) {
+                        if (!ToolCallWalkChar(
+                                replay, ch, toolCallGrammarLayout,
+                                generationConfig.tool_call_allowed_names,
+                                replayParamNames)) {
+                            // 重放中卡住: 回退到旧判定路径, 别让新逻辑
+                            // 破坏既有行为。
+                            replay.state = TG_NONE;
+                            break;
+                        }
+                        if (replay.state == TG_FUNC_NAME &&
+                            replay.off == 0) {
+                            // 刚进入 TG_FUNC_NAME, 名字起点; 名字内容
+                            // 由后续字符积累, 这里暂不记录。
+                        }
+                    }
+                    if (replay.state != TG_NONE) {
+                        walkerPos = replay;
+                        walkerStateValid = true;
+                        // 重放完后反查当前函数名: 用已有的游标函数名
+                        // (FindActiveToolCallInvokeName 与游标同源)。
+                        std::string activeName;
+                        std::string::size_type invokePos;
+                        if (FindActiveToolCallInvokeName(
+                                generatedText, generationConfig,
+                                activeName, invokePos)) {
+                            walkerToolName = activeName;
+                        }
+                        if (ToolCallTraceEnabled() &&
+                            replay.state != cursor.state) {
+                            printf("[ToolCallTrace] WALKER MISMATCH: "
+                                   "replay=%s cursor=%s\n",
+                                   ToolCallGrammarStateName(replay.state),
+                                   ToolCallGrammarStateName(cursor.state));
+                            fflush(stdout);
+                        }
+                    }
+                }
+            }
             switch (cursor.state) {
                 case TG_NONE:
                     return;
@@ -1416,11 +1702,14 @@ namespace fastllm {
             }
             if (ToolCallTraceEnabled()) {
                 printf("[ToolCallTrace] state=%s seg=%zu partial=%zuB "
-                       "handled=%d allowed=%zu\n",
+                       "handled=%d allowed=%zu partial_text=%.64s "
+                       "allowed_values=%.200s\n",
                        ToolCallGrammarStateName(cursor.state),
                        cursor.segmentStart == std::string::npos
                                ? (size_t)-1 : cursor.segmentStart,
-                       partial.size(), (int)handled, allowedValues.size());
+                       partial.size(), (int)handled, allowedValues.size(),
+                       partial.c_str(),
+                       JoinToolCallValuesForTrace(allowedValues).c_str());
                 fflush(stdout);
             }
             if (!valueLoopCycle.empty() && blockedIdsOut != nullptr) {
@@ -1468,6 +1757,21 @@ namespace fastllm {
                 const std::string target = "</parameter>";
                 const std::string tail =
                         generatedText.substr(cursor.segmentStart);
+                // 【上游BUMP勿回退】tail 里已经有完整闭合标签时必须直接返回。
+                // 否则 combined 从 first 起恒等于 target, 追加**任何** token
+                // 都判定成"会形成完整闭合" -> 整个词表 248320 个 id 全被塞进
+                // blocked。而 CUDA 掩码对"全禁"的兜底是 memset(row,1) 全放开,
+                // 于是约束在最该生效的一步彻底失效, 且没有任何计数器能看见。
+                // 实测: 503 步 blocked=248320, 空值参数(path/i)照样闭合,
+                // 现场就是 <parameter=path>\n\n</parameter> 直接发给客户端。
+                if (tail.find(target) != std::string::npos) {
+                    if (ToolCallTraceEnabled()) {
+                        printf("[ToolCallTrace] S4 empty-value close already "
+                               "complete -> skip guard\n");
+                        fflush(stdout);
+                    }
+                    return;
+                }
                 for (const auto &item :
                      this->weight.tokenizer.tokenToStringDict) {
                     const int tokenId = item.first;
@@ -1531,12 +1835,38 @@ namespace fastllm {
         std::vector<int> allowedIds;
         allowedIds.reserve(allowedValues.size() * 4);
         const std::string terminator = activeTerminator;
+        // 走字符级推进器需要:状态机路径已启用 + layout 已编译。
+        // 满足时用推进器判定(支持跨状态边界的 token);否则退回旧的
+        // 逐状态前缀匹配, 保证非 apiserver 调用者/无 layout 时行为不变。
+        const bool useWalker =
+            ToolCallGrammarEnabled() && toolCallGrammarLayout.valid &&
+            walkerStateValid;
+        ToolCallWalkPos walkStart;
+        std::vector<std::string> walkParamNames;
+        if (useWalker) {
+            walkStart = walkerPos;
+            auto paramIt =
+                generationConfig.tool_call_allowed_parameter_names.find(
+                    walkerToolName);
+            if (paramIt !=
+                    generationConfig.tool_call_allowed_parameter_names.end()) {
+                walkParamNames = paramIt->second;
+            }
+        }
         for (const auto &item : this->weight.tokenizer.tokenToStringDict) {
             int tokenId = item.first;
             std::string tokenText = this->weight.tokenizer.DecodeTokens(std::vector<int>{tokenId});
-            if (IsToolCallEnumTokenAllowed(
-                    partial, tokenText, allowedValues,
-                    terminator)) {
+            bool ok;
+            if (useWalker) {
+                ok = ToolCallWalkAcceptsToken(
+                        walkStart, tokenText, toolCallGrammarLayout,
+                        generationConfig.tool_call_allowed_names,
+                        walkParamNames);
+            } else {
+                ok = IsToolCallEnumTokenAllowed(
+                        partial, tokenText, allowedValues, terminator);
+            }
+            if (ok) {
                 allowedIds.push_back(tokenId);
             }
         }
@@ -1562,6 +1892,24 @@ namespace fastllm {
                    partial.size() > 32 ? partial.substr(0, 32).c_str()
                                        : partial.c_str(),
                    allowedValues.size());
+            fflush(stdout);
+        }
+        // 掩码真正生效时,把放行的 token id 打出来。有了它才能回答
+        // "模型原意那个 token 到底在不在放行集里" —— 采样层的
+        // raw_argmax 与这里的 id 列表对照,就能区分"纠正"和"改写"。
+        if (!allowedIds.empty() && ToolCallTraceEnabled()) {
+            std::string ids;
+            for (size_t i = 0; i < allowedIds.size() && i < 32; i++) {
+                if (!ids.empty()) {
+                    ids += ",";
+                }
+                ids += std::to_string(allowedIds[i]);
+            }
+            if (allowedIds.size() > 32) {
+                ids += ",...";
+            }
+            printf("[ToolCallTrace] mask allowed_ids n=%zu [%s]\n",
+                   allowedIds.size(), ids.c_str());
             fflush(stdout);
         }
         allowedIdsOut = std::move(allowedIds);
@@ -1649,6 +1997,27 @@ namespace fastllm {
     }
 
     void basellm::UpdateToolCallConstraintState(ResponseContext *context, int tokenId) {
+        // 逐 token 轨迹(仅 trace): 这是唯一能拿到"实际提交了哪些 token id"的挂点。
+        // B 类问题(模型想调 bash 却发出 todo)必须对比 grammar 开/关两条轨迹的
+        // token 序列 —— 同一段文本 "<tool_call>\n<function=" 在两边可能被拆成
+        // 不同的 token(词表里 '<function=' 根本不是一个 token, 必须拼片),
+        // 而不同的拼法会产生不同的隐状态。
+        // 故意放在下面那个 early return **之前**: 关掉工具约束时也要记录,
+        // 否则就拿不到对照组。
+        if (ToolCallTraceEnabled() && tokenId >= 0) {
+            const std::string text =
+                this->weight.tokenizer.DecodeTokens(std::vector<int>{tokenId});
+            std::string safe;
+            for (char ch : text) {
+                if (ch == '\n') safe += "\\n";
+                else if (ch == '\r') safe += "\\r";
+                else if (ch == '\t') safe += "\\t";
+                else safe += ch;
+            }
+            printf("[ToolCallTrace] tok id=%d text='%s'\n",
+                   tokenId, safe.c_str());
+            fflush(stdout);
+        }
         if (context == nullptr ||
             (!context->generationConfig.tool_call_name_constraint_enabled &&
              !context->generationConfig.tool_call_parameter_name_constraint_enabled &&
