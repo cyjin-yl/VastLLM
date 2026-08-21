@@ -366,7 +366,8 @@ namespace fastllm {
         } else if (type == JinjaToken::JinjaTokenNot) {
             return -1;
         } else if (type == JinjaToken::JinjaTokenEqual || type == JinjaToken::JinjaTokenNotEqual || type == JinjaToken::JinjaTokenIn
-                || type == JinjaToken::JinjaTokenLess || type == JinjaToken::JinjaTokenMore) {
+                || type == JinjaToken::JinjaTokenLess || type == JinjaToken::JinjaTokenMore
+                || type == JinjaToken::JinjaTokenLessEqual || type == JinjaToken::JinjaTokenMoreEqual) {
             return 0;
         } else if (type == JinjaToken::JinjaTokenAdd || type == JinjaToken::JinjaTokenSub || type == JinjaToken::JinjaTokenConcat) {
             return 1;
@@ -560,6 +561,22 @@ namespace fastllm {
         int pos = 0;
         bool trimNext = false;
         for (int i = 0; i < temp.size(); i++) {
+            if (temp[i] == '{' && i + 1 < temp.size() && temp[i + 1] == '#') {
+                size_t curEnd = temp.find("#}", i + 2);
+                AssertInFastLLM(curEnd != std::string::npos,
+                                "Can't find comment end: " + temp.substr(i, std::min(10, (int)temp.size() - i)));
+                std::string part = temp.substr(pos, i - pos);
+                if (i + 2 < temp.size() && temp[i + 2] == '-')
+                    part.erase(0, part.find_first_not_of(" \n\r\t"));
+                if (trimNext)
+                    part.erase(part.find_last_not_of(" \n\r\t") + 1);
+                if (!part.empty())
+                    blocks.push_back(JinjaBlock(part));
+                trimNext = (curEnd > 0 && temp[curEnd - 1] == '-');
+                pos = curEnd + 2;
+                i = curEnd + 1;
+                continue;
+            }
             if (temp[i] == '{' && i + 1 < temp.size() && (temp[i + 1] == '{' || temp[i + 1] == '%') ) {
                 size_t curEnd = temp[i + 1] == '%' ? temp.find("%}", i + 2) : temp.find("}}", i + 2);
                 AssertInFastLLM(curEnd != -1, 
@@ -897,6 +914,8 @@ namespace fastllm {
                         tokens[i].type == JinjaToken::JinjaTokenNotEqual ||
                         tokens[i].type == JinjaToken::JinjaTokenLess ||
                         tokens[i].type == JinjaToken::JinjaTokenMore ||
+                        tokens[i].type == JinjaToken::JinjaTokenLessEqual ||
+                        tokens[i].type == JinjaToken::JinjaTokenMoreEqual ||
                         tokens[i].type == JinjaToken::JinjaTokenSlice ||
                         tokens[i].type == JinjaToken::JinjaTokenIn ||
                         tokens[i].type == JinjaToken::JinjaTokenAnd ||
@@ -1070,6 +1089,8 @@ namespace fastllm {
                         it.type == JinjaToken::JinjaTokenNotEqual ||
                         it.type == JinjaToken::JinjaTokenLess ||
                         it.type == JinjaToken::JinjaTokenMore ||
+                        it.type == JinjaToken::JinjaTokenLessEqual ||
+                        it.type == JinjaToken::JinjaTokenMoreEqual ||
                         it.type == JinjaToken::JinjaTokenIn ||
                         it.type == JinjaToken::JinjaTokenAnd ||
                         it.type == JinjaToken::JinjaTokenOr) {
