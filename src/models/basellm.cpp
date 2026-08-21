@@ -963,6 +963,50 @@ namespace fastllm {
             }
         }
 
+        // ---- 参数值尾部循环守卫 ----
+        // S4 参数值是自由文本(必须能表示代码里的裸 '<'),量化模型在这里
+        // 会退化成同一片段的无限重复。实测形态: OMP todo 结果把清单
+        // "- X [in_progress] (Tool tests)" 回显进上下文后, 模型把
+        // "[in_progress] (Tool tests)" 连抄 6 遍塞进 task 参数。
+        // 全局 repeat_penalty 治不了这个: 实测 1.05 压不住, 调到 1.15
+        // 重复是没了但换成语义崩坏(task 空值), 而且会误伤正常长文本参数
+        // (写代码的 content 参数本来就有大量重复缩进)。
+        // 这里把防重复限制在"当前参数值"这一个状态内: 检测尾部是否已由
+        // 同一段子串连续重复 kMinRepeats 次构成, 是则屏蔽会把循环再推进
+        // 一步的 token。走既有 blocked 通道, 不新增采样路径。
+        static size_t ToolCallValueLoopPeriod(const std::string &value) {
+            static const size_t kMinRepeats = 3;   // 连续重复几次算循环
+            static const size_t kMinPeriod = 2;    // 单字符重复交给 repeat_penalty
+            static const size_t kMaxPeriod = 96;   // 超过这个长度不认为是退化
+            for (size_t period = kMinPeriod; period <= kMaxPeriod; period++) {
+                if (value.size() < period * kMinRepeats) {
+                    break;
+                }
+                bool same = true;
+                for (size_t rep = 1; rep < kMinRepeats && same; rep++) {
+                    if (value.compare(value.size() - period, period,
+                                      value,
+                                      value.size() - period * (rep + 1),
+                                      period) != 0) {
+                        same = false;
+                    }
+                }
+                if (same) {
+                    return period;
+                }
+            }
+            return 0;
+        }
+
+        static bool ToolCallValueLoopGuardEnabled() {
+            static const bool enabled = []() {
+                const char *env =
+                    getenv("FASTLLM_TOOLCALL_VALUE_LOOP_GUARD");
+                return env == nullptr || std::string(env) != "0";
+            }();
+            return enabled;
+        }
+
         // tail 结尾与 target 前缀的最长重合长度
         // ("...abc<par" vs "<parameter=" -> 4)
         static size_t ToolCallTailPrefixOverlap(const std::string &tail,
@@ -1205,6 +1249,8 @@ namespace fastllm {
             }
             bool handled = false;
             bool collectValueCloseBlocked = false;
+            // 非空表示 S4 参数值尾部已形成循环,内容是重复的那一段
+            std::string valueLoopCycle;
             switch (cursor.state) {
                 case TG_NONE:
                     return;
@@ -1337,6 +1383,16 @@ namespace fastllm {
                     if (valueStillEmpty && blockedIdsOut != nullptr) {
                         collectValueCloseBlocked = true;
                     }
+                    // 值非空时才查循环:空值走上面的闭合屏蔽分支。
+                    if (!valueStillEmpty && blockedIdsOut != nullptr &&
+                        ToolCallValueLoopGuardEnabled()) {
+                        const size_t period =
+                            ToolCallValueLoopPeriod(committedValue);
+                        if (period > 0) {
+                            valueLoopCycle = committedValue.substr(
+                                committedValue.size() - period);
+                        }
+                    }
                     break;
                 }
                 case TG_FUNC_CLOSE_TAIL: {
@@ -1366,6 +1422,44 @@ namespace fastllm {
                                ? (size_t)-1 : cursor.segmentStart,
                        partial.size(), (int)handled, allowedValues.size());
                 fflush(stdout);
+            }
+            if (!valueLoopCycle.empty() && blockedIdsOut != nullptr) {
+                // 尾部已连续重复 kMinRepeats 次。模型下一步若要再抄一遍,
+                // 必然先生成 cycle 的某个前缀 —— 屏蔽这些 token 即可断链,
+                // 其余词表不受影响(正常续写、闭合标签都还能生成)。
+                // 若这一步把候选清空, 采样层既有的 "allowedIds 为空则不 mask"
+                // 兜底会接管, 不存在卡死路径。
+                for (const auto &item :
+                     this->weight.tokenizer.tokenToStringDict) {
+                    const int tokenId = item.first;
+                    const std::string tokenText =
+                            this->weight.tokenizer.DecodeTokens(
+                                std::vector<int>{tokenId});
+                    if (tokenText.empty()) {
+                        continue;
+                    }
+                    const size_t compareLen =
+                            std::min(tokenText.size(),
+                                     valueLoopCycle.size());
+                    if (valueLoopCycle.compare(0, compareLen,
+                                               tokenText, 0,
+                                               compareLen) == 0) {
+                        blockedIdsOut->push_back(tokenId);
+                    }
+                }
+                std::sort(blockedIdsOut->begin(), blockedIdsOut->end());
+                blockedIdsOut->erase(
+                    std::unique(blockedIdsOut->begin(),
+                                blockedIdsOut->end()),
+                    blockedIdsOut->end());
+                ToolCallValueLoopStatsObserve();
+                if (ToolCallTraceEnabled()) {
+                    printf("[ToolCallTrace] S4 value-loop cycle=%zuB "
+                           "blocked=%zu\n",
+                           valueLoopCycle.size(), blockedIdsOut->size());
+                    fflush(stdout);
+                }
+                return;
             }
             if (collectValueCloseBlocked && blockedIdsOut != nullptr) {
                 // 只屏蔽会让全空白值形成完整 </parameter> 的 token。

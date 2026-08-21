@@ -1753,6 +1753,9 @@ struct WorkQueue {
                 {"toolcall_constraint_masked_tokens",
                     (double)fastllm::GetToolCallGrammarStatsSnapshot()
                             .maskedTokens},
+                {"toolcall_value_loop_breaks",
+                    (double)fastllm::GetToolCallGrammarStatsSnapshot()
+                            .valueLoopBreaks},
                 {"toolcall_mask_emptied",
                     (double)fastllm::GetToolCallMaskEmptiedCount()},
                 {"chat_template_startup_valid",

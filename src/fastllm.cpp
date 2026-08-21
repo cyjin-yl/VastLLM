@@ -8069,6 +8069,7 @@ namespace fastllm {
         std::atomic<uint64_t> tgRepairedTotal{0};
         std::atomic<uint64_t> tgConstraintSteps{0};
         std::atomic<uint64_t> tgMaskedTokens{0};
+        std::atomic<uint64_t> tgValueLoopBreaks{0};
         std::mutex tgTraceDumpMutex;
     }
 
@@ -8105,6 +8106,10 @@ namespace fastllm {
         }
     }
 
+    void ToolCallValueLoopStatsObserve() {
+        tgValueLoopBreaks++;
+    }
+
     ToolCallGrammarStats GetToolCallGrammarStatsSnapshot() {
         ToolCallGrammarStats s;
         s.blocksTotal = tgBlocksTotal.load();
@@ -8112,6 +8117,7 @@ namespace fastllm {
         s.repairedTotal = tgRepairedTotal.load();
         s.constraintSteps = tgConstraintSteps.load();
         s.maskedTokens = tgMaskedTokens.load();
+        s.valueLoopBreaks = tgValueLoopBreaks.load();
         return s;
     }
 

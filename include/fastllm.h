@@ -1179,10 +1179,14 @@ namespace fastllm {
         // 引擎侧: 约束激活步数 / 被 mask 掉的候选 token 总数
         uint64_t constraintSteps = 0;
         uint64_t maskedTokens = 0;
+        // S4 参数值尾部循环守卫触发次数(退化被截断的步数)
+        uint64_t valueLoopBreaks = 0;
     };
     // 解析器回调: parsedOk=false 计入 malformed; repaired=true 计入 repaired
     void ToolCallGrammarStatsObserveParse(bool parsedOk, bool repaired);
     void ToolCallGrammarStatsObserveConstraint(size_t allowedCount, size_t vocabSize);
+    // S4 检测到参数值尾部循环并屏蔽了延续 token
+    void ToolCallValueLoopStatsObserve();
     ToolCallGrammarStats GetToolCallGrammarStatsSnapshot();
     // 破损/修复时 dump 原始块到 trace 目录(jsonl, 追加); reason: "malformed"/"repaired"
     void ToolCallTraceDumpBlock(const char *reason, const std::string &block);
