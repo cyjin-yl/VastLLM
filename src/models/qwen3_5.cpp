@@ -19116,6 +19116,7 @@ namespace fastllm {
         }
         std::vector<int> matchedDrafts(batch, 0);
         std::vector<int> commitLens(batch, 0);
+        bool invalidReplacementTarget = false;
         for (int b = 0; b < batch; b++) {
             int proposalCount = seqLens[b] - 1;
             bool useTypicalAcceptance =
@@ -19160,31 +19161,38 @@ namespace fastllm {
                 }
                 matchedDrafts[b]++;
             }
-            // 【上游BUMP勿回退】动态工具 grammar 必须再次校验最终
-            // target bonus。线上曾生成 "</parameter list=...>"：
-            // proposals 全部合法，但 bonus 越过 S4 close mask。
-            // 非法 bonus 不是 draft，commitLen 只能到 proposalCount。
+            // 【上游BUMP勿回退】不仅 bonus，draft 拒绝位置的
+            // replacement target 也必须按已接受 drafts 推进后的状态校验。
+            // 旧代码无条件提交 replacement，导致尾引号或下一 tool_call
+            // 被吞进 task/code/timeout 参数。
+            bool targetAllowed = true;
+            if (constraintTracking) {
+                std::vector<int> allowedIds;
+                std::vector<int> blockedIds;
+                EvaluateToolCallConstraintText(
+                    constraintText, generationConfigs[b],
+                    allowedIds, &blockedIds);
+                const int targetToken = targetRet[
+                    tokenOffsets[b] + matchedDrafts[b]];
+                targetAllowed =
+                    Qwen35ToolConstraintAllowsTokenLists(
+                        allowedIds, blockedIds, targetToken);
+            }
             if (matchedDrafts[b] == proposalCount) {
-                bool bonusAllowed = true;
-                if (constraintTracking) {
-                    std::vector<int> allowedIds;
-                    std::vector<int> blockedIds;
-                    EvaluateToolCallConstraintText(
-                        constraintText, generationConfigs[b],
-                        allowedIds, &blockedIds);
-                    const int bonusToken =
-                        targetRet[tokenOffsets[b] + proposalCount];
-                    bonusAllowed =
-                        Qwen35ToolConstraintAllowsTokenLists(
-                            allowedIds, blockedIds, bonusToken);
-                }
                 // Invalid bonus is not an accepted draft. Keep all verified
                 // proposals and roll the cache back before the bonus row.
                 commitLens[b] =
-                    bonusAllowed ? seqLens[b] : proposalCount;
-            } else {
+                    targetAllowed ? seqLens[b] : proposalCount;
+            } else if (targetAllowed) {
                 commitLens[b] = matchedDrafts[b] + 1;
+            } else {
+                invalidReplacementTarget = true;
+                break;
             }
+        }
+        if (invalidReplacementTarget) {
+            rollbackTargetCaches();
+            return false;
         }
         // A partial-prefix replay may reuse speculativeHiddenStates as regular
         // forward scratch. Preserve the committed target hidden rows first;
