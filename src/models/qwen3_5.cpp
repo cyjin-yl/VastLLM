@@ -19160,6 +19160,10 @@ namespace fastllm {
                 }
                 matchedDrafts[b]++;
             }
+            // 【上游BUMP勿回退】动态工具 grammar 必须再次校验最终
+            // target bonus。线上曾生成 "</parameter list=...>"：
+            // proposals 全部合法，但 bonus 越过 S4 close mask。
+            // 非法 bonus 不是 draft，commitLen 只能到 proposalCount。
             if (matchedDrafts[b] == proposalCount) {
                 bool bonusAllowed = true;
                 if (constraintTracking) {
@@ -19455,16 +19459,25 @@ namespace fastllm {
         acceptedTokens.assign(batch, std::vector<int>());
         nextInputTokens.assign(batch, std::vector<int>());
         keptInputLens = commitLens;
+        // 【上游BUMP勿回退】acceptedTokens 必须严格按 commitLens 组装。
+        // commitLens 已经会为非法 grammar bonus 从 seqLen 回退到
+        // proposalCount；旧代码却无条件 push target bonus，把刚拒绝的
+        // token 再塞回输出，表现为 "</parameter >"、todo list 变字符串、
+        // eval timeout 吞入 "}]}]"。这里剩余槽位为 0 时绝不能追加 target。
         auto commitAcceptedTokens = [&](int b) {
             int tokenOffset = tokenOffsets[b];
             acceptedTokens[b].clear();
             acceptedTokens[b].reserve(commitLens[b]);
-            for (int pos = 0; pos < matchedDrafts[b]; pos++) {
+            const int committedDrafts =
+                std::min(matchedDrafts[b], commitLens[b]);
+            for (int pos = 0; pos < committedDrafts; pos++) {
                 acceptedTokens[b].push_back((int)(
                     inputPtr[tokenOffset + pos + 1] + 1.0e-3f));
             }
-            acceptedTokens[b].push_back(
-                targetRet[tokenOffset + matchedDrafts[b]]);
+            if ((int)acceptedTokens[b].size() < commitLens[b]) {
+                acceptedTokens[b].push_back(
+                    targetRet[tokenOffset + matchedDrafts[b]]);
+            }
         };
         {
             std::vector<Data> mtpPositionStorage(batch);
