@@ -106,3 +106,59 @@ inline bool CompileOpenAIToolSchemaConstraints(
     }
     return true;
 }
+
+inline void CollectOpenAIToolPropertySchemas(
+    const json11::Json &schema,
+    std::map<std::string, json11::Json> &properties) {
+    const auto &direct = schema["properties"];
+    if (direct.is_object()) {
+        for (const auto &item : direct.object_items()) {
+            if (!properties.count(item.first)) {
+                properties[item.first] = item.second;
+            }
+        }
+    }
+    for (const char *key : {"oneOf", "anyOf"}) {
+        const auto &branches = schema[key];
+        if (!branches.is_array()) continue;
+        for (const auto &branch : branches.array_items()) {
+            if (branch.is_object()) {
+                CollectOpenAIToolPropertySchemas(
+                    branch, properties);
+            }
+        }
+    }
+}
+
+inline bool OpenAIToolSchemaTypeMatches(
+    const json11::Json &value, const std::string &type) {
+    if (type == "string") return value.is_string();
+    if (type == "boolean") return value.is_bool();
+    if (type == "number") return value.is_number();
+    if (type == "integer") {
+        return value.is_number() &&
+            value.number_value() ==
+                (double)(long long)value.number_value();
+    }
+    if (type == "array") return value.is_array();
+    if (type == "object") return value.is_object();
+    return false;
+}
+
+inline json11::Json CoerceOpenAIToolArgument(
+    const json11::Json &value, const json11::Json &schema) {
+    if (!value.is_string() || !schema.is_object() ||
+        !schema["type"].is_string()) {
+        return value;
+    }
+    const std::string type = schema["type"].string_value();
+    if (type == "string") return value;
+    std::string error;
+    const json11::Json parsed =
+        json11::Json::parse(value.string_value(), error);
+    if (error.empty() &&
+        OpenAIToolSchemaTypeMatches(parsed, type)) {
+        return parsed;
+    }
+    return value;
+}

@@ -2063,6 +2063,9 @@ struct WorkQueue {
                                          "invalid_stop"));
                 return;
             }
+            std::map<std::string,
+                     std::map<std::string, json11::Json>>
+                toolParameterSchemas;
             bool toolsEnabled = node->config["tools"].is_array();
             if (node->config["tool_choice"].is_string() &&
                 node->config["tool_choice"].string_value() == "none") {
@@ -2084,6 +2087,9 @@ struct WorkQueue {
                         // 支持 todo(init:list, done:task|phase) 等关系。
                         CompileOpenAIToolSchemaConstraints(
                             name, tool["function"]["parameters"], config);
+                        CollectOpenAIToolPropertySchemas(
+                            tool["function"]["parameters"],
+                            toolParameterSchemas[name]);
                     }
                 }
                 toolsEnabled = !config.tool_call_allowed_names.empty();
@@ -2224,7 +2230,22 @@ struct WorkQueue {
                                 collision = true;
                                 break;
                             }
-                            normalizedArguments[resolved] = item.second;
+                            json11::Json value = item.second;
+                            const auto toolSchemas =
+                                toolParameterSchemas.find(
+                                    normalized.name);
+                            if (toolSchemas !=
+                                    toolParameterSchemas.end()) {
+                                const auto propertySchema =
+                                    toolSchemas->second.find(resolved);
+                                if (propertySchema !=
+                                        toolSchemas->second.end()) {
+                                    value = CoerceOpenAIToolArgument(
+                                        value, propertySchema->second);
+                                }
+                            }
+                            normalizedArguments[resolved] =
+                                std::move(value);
                         }
                         if (!collision) {
                             normalized.arguments =
