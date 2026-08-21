@@ -758,7 +758,7 @@ namespace fastllm {
         // 按 tokenizer 实例懒计算一次，热路径只追加少量 blocked id。
         std::once_flag toolCallMalformedCloseTokensOnce;
         std::vector<int> toolCallMalformedCloseTokenIds;
-        std::vector<int>
+        std::vector<std::vector<int>>
             toolCallMalformedCloseContinuationTokenIds;
 
         Data sinData, cosData;

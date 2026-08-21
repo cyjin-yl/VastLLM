@@ -35,6 +35,7 @@ static const std::vector<std::string> VOCAB = {
     "Bash", "bash", "ba", "sh", "ash", " sh",
     "]", "+", ")", "span", "op", "init", "done", "append",
     "phase", "items", "task", "k", "</parameter ", " >",
+    "parameter_100000",
 };
 
 static GenerationConfig MakeConfig() {
@@ -190,6 +191,15 @@ int main() {
               closePrefixEval.blocked.end(),
               (int)(std::find(VOCAB.begin(), VOCAB.end(), " >") -
                     VOCAB.begin())));
+    const std::string P9 = P6 + "\n/etc\n</";
+    const EvalResult shortPrefixEval = Eval(m, P9, cfg);
+    Check("I4.11c 短前缀跨 token 畸形闭合被屏蔽",
+          std::binary_search(
+              shortPrefixEval.blocked.begin(),
+              shortPrefixEval.blocked.end(),
+              (int)(std::find(
+                  VOCAB.begin(), VOCAB.end(),
+                  "parameter_100000") - VOCAB.begin())));
     Check("I4.12 分 token 畸形 </parameter 空格不可拼",
           !CanSpell(m, P6 + "\n/etc\n", "</parameter >", cfg));
     Check("I4.13 普通 HTML 闭合标签仍可拼",

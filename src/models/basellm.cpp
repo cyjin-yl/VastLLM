@@ -1123,6 +1123,8 @@ namespace fastllm {
                     std::call_once(
                         toolCallMalformedCloseTokensOnce, [&]() {
                             const std::string marker = "</parameter";
+                            toolCallMalformedCloseContinuationTokenIds
+                                .resize(marker.size() + 1);
                             for (const auto &item :
                                  this->weight.tokenizer
                                      .tokenToStringDict) {
@@ -1146,28 +1148,30 @@ namespace fastllm {
                                     toolCallMalformedCloseTokenIds
                                         .push_back(item.first);
                                 }
-                                size_t first = 0;
-                                while (first < tokenText.size() &&
-                                       std::isspace(
-                                           (unsigned char)
-                                               tokenText[first])) {
-                                    first++;
-                                }
-                                if (first > 0 &&
-                                    first < tokenText.size() &&
-                                    tokenText[first] == '>') {
-                                    toolCallMalformedCloseContinuationTokenIds
-                                        .push_back(item.first);
+                                for (size_t prefix = 1;
+                                     prefix <= marker.size();
+                                     prefix++) {
+                                    const std::string combined =
+                                        marker.substr(0, prefix) +
+                                        tokenText;
+                                    if (combined.size() >
+                                            marker.size() &&
+                                        combined.compare(
+                                            0, marker.size(),
+                                            marker) == 0 &&
+                                        combined[marker.size()] != '>') {
+                                        toolCallMalformedCloseContinuationTokenIds[
+                                            prefix].push_back(item.first);
+                                    }
                                 }
                             }
                             std::sort(
                                 toolCallMalformedCloseTokenIds.begin(),
                                 toolCallMalformedCloseTokenIds.end());
-                            std::sort(
-                                toolCallMalformedCloseContinuationTokenIds
-                                    .begin(),
-                                toolCallMalformedCloseContinuationTokenIds
-                                    .end());
+                            for (auto &ids :
+                                 toolCallMalformedCloseContinuationTokenIds) {
+                                std::sort(ids.begin(), ids.end());
+                            }
                         });
                     blockedIdsOut->insert(
                         blockedIdsOut->end(),
@@ -1175,17 +1179,17 @@ namespace fastllm {
                         toolCallMalformedCloseTokenIds.end());
                     const std::string valueTail =
                         generatedText.substr(cursor.segmentStart);
-                    const std::string closeTarget = "</parameter>";
+                    const std::string closeMarker = "</parameter";
                     const size_t closePrefix =
                         ToolCallTailPrefixOverlap(
-                            valueTail, closeTarget);
-                    if (closePrefix + 1 == closeTarget.size()) {
+                            valueTail, closeMarker);
+                    if (closePrefix > 0) {
+                        const auto &invalid =
+                            toolCallMalformedCloseContinuationTokenIds[
+                                closePrefix];
                         blockedIdsOut->insert(
                             blockedIdsOut->end(),
-                            toolCallMalformedCloseContinuationTokenIds
-                                .begin(),
-                            toolCallMalformedCloseContinuationTokenIds
-                                .end());
+                            invalid.begin(), invalid.end());
                     }
                 }
                 std::sort(blockedIdsOut->begin(), blockedIdsOut->end());
