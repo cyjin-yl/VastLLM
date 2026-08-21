@@ -4540,6 +4540,7 @@ namespace {
         Expect(!fastllm::Qwen35ToolConstraintAllowsToken(config, 7),
                "MTP allow-list accepted an undeclared token");
         config.tool_call_allowed_token_ids.clear();
+        config.tool_call_blocked_token_ids.clear();
         config.output_logits = true;
         Expect(!fastllm::Qwen35MtpSupportsGenerationConfig(config),
                "MTP accepted output_logits collection");

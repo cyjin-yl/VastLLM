@@ -1497,7 +1497,7 @@ namespace fastllm {
     bool Qwen35MtpSupportsGenerationConfig(
             const GenerationConfig &config) {
         // 动态工具约束由 speculative verify 的逐行配置和 GPU logits mask
-        // 精确处理；不能再因为 allowed/blocked 非空退回普通 decode。
+        // 精确处理；不能因为 allowed/blocked 非空退回普通 decode。
         // repeat_penalty 同样由 verify 前向的 LastTokensManager 处理。
         if (config.output_logits) {
             return false;
@@ -16988,17 +16988,60 @@ namespace fastllm {
             }
             return accepted;
         };
-        auto buildCommittedTokens = [&](const std::vector<int> &targetTokens,
-                                        int draftTokenCount,
-                                        int acceptedDrafts) {
+        auto computeCommitLen = [&](const std::vector<int> &targetTokens,
+                                    int draftTokenCount,
+                                    int acceptedDrafts) {
             int commitLen = acceptedDrafts == draftTokenCount ?
                             draftTokenCount + 1 : acceptedDrafts + 1;
+            if (acceptedDrafts != draftTokenCount ||
+                context == nullptr) {
+                return commitLen;
+            }
+            const bool constraintTracking =
+                generationConfigs[0].tool_call_name_constraint_enabled ||
+                generationConfigs[0].tool_call_parameter_name_constraint_enabled ||
+                generationConfigs[0].tool_call_required_parameter_constraint_enabled;
+            if (!constraintTracking) {
+                return commitLen;
+            }
+            std::string constraintText =
+                context->toolCallConstraintGeneratedText;
+            for (int i = 0; i < acceptedDrafts; i++) {
+                constraintText += weight.tokenizer.DecodeTokens(
+                    {tokenAt(i + 1)});
+                if (constraintText.size() > 8192) {
+                    constraintText.erase(
+                        0, constraintText.size() - 8192);
+                }
+            }
+            std::vector<int> allowedIds;
+            std::vector<int> blockedIds;
+            EvaluateToolCallConstraintText(
+                constraintText, generationConfigs[0],
+                allowedIds, &blockedIds);
+            const int bonusToken = targetTokens[acceptedDrafts];
+            if (!Qwen35ToolConstraintAllowsTokenLists(
+                    allowedIds, blockedIds, bonusToken)) {
+                // All draft tokens are valid; only the speculative bonus
+                // crossed the dynamic grammar boundary. Commit the drafts,
+                // drop the bonus, and let the next target step resample it.
+                return draftTokenCount;
+            }
+            return commitLen;
+        };
+        auto buildCommittedTokens = [&](const std::vector<int> &targetTokens,
+                                        int acceptedDrafts,
+                                        int commitLen) {
             std::vector<int> committed;
             committed.reserve(commitLen);
-            for (int i = 0; i < acceptedDrafts; i++) {
+            const int committedDrafts =
+                std::min(acceptedDrafts, commitLen);
+            for (int i = 0; i < committedDrafts; i++) {
                 committed.push_back(tokenAt(i + 1));
             }
-            committed.push_back(targetTokens[acceptedDrafts]);
+            if (commitLen > acceptedDrafts) {
+                committed.push_back(targetTokens[acceptedDrafts]);
+            }
             return committed;
         };
         auto buildInputIdsSlice = [&](int begin, int end) {
@@ -17568,10 +17611,11 @@ namespace fastllm {
             mtpValidationCount.fetch_add(1, std::memory_order_relaxed);
             mtpProfileMark(mtpProfileMatchUs);
 
-            int commitLen = matchedDrafts == draftTokenCount ? seqLen : matchedDrafts + 1;
-            std::vector<int> committedRet = buildCommittedTokens(
+            int commitLen = computeCommitLen(
                 targetRet, draftTokenCount, matchedDrafts);
-            if (matchedDrafts != draftTokenCount) {
+            std::vector<int> committedRet = buildCommittedTokens(
+                targetRet, matchedDrafts, commitLen);
+            if (commitLen != seqLen) {
                 int captureSlot = commitLen - 1;
                 std::vector<CacheMeta> prefixRootKeyMetas(block_cnt), prefixRootValueMetas(block_cnt);
                 std::vector<std::map<int, CacheMeta> > prefixLocalKeyMetas(block_cnt), prefixLocalValueMetas(block_cnt);
@@ -17907,10 +17951,11 @@ namespace fastllm {
             mtpProfileMark(mtpProfileMatchUs);
 
             mtpValidationCount.fetch_add(1, std::memory_order_relaxed);
-            int commitLen = matchedDrafts == draftTokenCount ? seqLen : matchedDrafts + 1;
-            std::vector<int> committedRet = buildCommittedTokens(
+            int commitLen = computeCommitLen(
                 targetRet, draftTokenCount, matchedDrafts);
-            if (matchedDrafts == draftTokenCount) {
+            std::vector<int> committedRet = buildCommittedTokens(
+                targetRet, matchedDrafts, commitLen);
+            if (commitLen == seqLen) {
                 std::vector<CacheMeta> finalRootKeyMetas(block_cnt), finalRootValueMetas(block_cnt);
                 std::vector<std::map<int, CacheMeta> > finalLocalKeyMetas(block_cnt), finalLocalValueMetas(block_cnt);
                 try {
@@ -18323,10 +18368,11 @@ namespace fastllm {
             }
         }
         mtpProfileMark(mtpProfileMatchUs);
-        int commitLen = matchedDrafts == draftTokenCount ? seqLen : matchedDrafts + 1;
-        std::vector<int> committedRet = buildCommittedTokens(
+        int commitLen = computeCommitLen(
             targetRet, draftTokenCount, matchedDrafts);
-        if (matchedDrafts == draftTokenCount) {
+        std::vector<int> committedRet = buildCommittedTokens(
+            targetRet, matchedDrafts, commitLen);
+        if (commitLen == seqLen) {
             singleCleanupPrefixTokens = seqLen;
             commitValidationCachePrefix(seqLen);
             mtpProfileMark(mtpProfileCommitUs);
@@ -19115,12 +19161,23 @@ namespace fastllm {
                 matchedDrafts[b]++;
             }
             if (matchedDrafts[b] == proposalCount) {
-                // Every proposal was accepted, so the final target row is the
-                // speculative bonus token. The batched recurrent/conv kernels
-                // have already left the real target cache at this full prefix;
-                // commit it directly instead of discarding the bonus and
-                // paying for the same last proposal again on the next step.
-                commitLens[b] = seqLens[b];
+                bool bonusAllowed = true;
+                if (constraintTracking) {
+                    std::vector<int> allowedIds;
+                    std::vector<int> blockedIds;
+                    EvaluateToolCallConstraintText(
+                        constraintText, generationConfigs[b],
+                        allowedIds, &blockedIds);
+                    const int bonusToken =
+                        targetRet[tokenOffsets[b] + proposalCount];
+                    bonusAllowed =
+                        Qwen35ToolConstraintAllowsTokenLists(
+                            allowedIds, blockedIds, bonusToken);
+                }
+                // Invalid bonus is not an accepted draft. Keep all verified
+                // proposals and roll the cache back before the bonus row.
+                commitLens[b] =
+                    bonusAllowed ? seqLens[b] : proposalCount;
             } else {
                 commitLens[b] = matchedDrafts[b] + 1;
             }
