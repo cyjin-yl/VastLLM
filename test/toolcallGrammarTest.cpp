@@ -34,7 +34,7 @@ static const std::vector<std::string> VOCAB = {
     "List", "Dir", "dir", "Depth", "depth",
     "Bash", "bash", "ba", "sh", "ash", " sh",
     "]", "+", ")", "span", "op", "init", "done", "append",
-    "phase", "items", "task", "k", "</parameter ",
+    "phase", "items", "task", "k", "</parameter ", " >",
 };
 
 static GenerationConfig MakeConfig() {
@@ -183,6 +183,13 @@ int main() {
           CanSpell(m, P8, ">", cfg));
     Check("I4.11 完整闭合名后空格不可拼",
           !CanSpell(m, P8, " >", cfg));
+    const EvalResult closePrefixEval = Eval(m, P8, cfg);
+    Check("I4.11b 完整闭合名显式屏蔽空格+>",
+          std::binary_search(
+              closePrefixEval.blocked.begin(),
+              closePrefixEval.blocked.end(),
+              (int)(std::find(VOCAB.begin(), VOCAB.end(), " >") -
+                    VOCAB.begin())));
     Check("I4.12 分 token 畸形 </parameter 空格不可拼",
           !CanSpell(m, P6 + "\n/etc\n", "</parameter >", cfg));
     Check("I4.13 普通 HTML 闭合标签仍可拼",

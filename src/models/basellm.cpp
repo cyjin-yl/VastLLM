@@ -1146,15 +1146,47 @@ namespace fastllm {
                                     toolCallMalformedCloseTokenIds
                                         .push_back(item.first);
                                 }
+                                size_t first = 0;
+                                while (first < tokenText.size() &&
+                                       std::isspace(
+                                           (unsigned char)
+                                               tokenText[first])) {
+                                    first++;
+                                }
+                                if (first > 0 &&
+                                    first < tokenText.size() &&
+                                    tokenText[first] == '>') {
+                                    toolCallMalformedCloseContinuationTokenIds
+                                        .push_back(item.first);
+                                }
                             }
                             std::sort(
                                 toolCallMalformedCloseTokenIds.begin(),
                                 toolCallMalformedCloseTokenIds.end());
+                            std::sort(
+                                toolCallMalformedCloseContinuationTokenIds
+                                    .begin(),
+                                toolCallMalformedCloseContinuationTokenIds
+                                    .end());
                         });
                     blockedIdsOut->insert(
                         blockedIdsOut->end(),
                         toolCallMalformedCloseTokenIds.begin(),
                         toolCallMalformedCloseTokenIds.end());
+                    const std::string valueTail =
+                        generatedText.substr(cursor.segmentStart);
+                    const std::string closeTarget = "</parameter>";
+                    const size_t closePrefix =
+                        ToolCallTailPrefixOverlap(
+                            valueTail, closeTarget);
+                    if (closePrefix + 1 == closeTarget.size()) {
+                        blockedIdsOut->insert(
+                            blockedIdsOut->end(),
+                            toolCallMalformedCloseContinuationTokenIds
+                                .begin(),
+                            toolCallMalformedCloseContinuationTokenIds
+                                .end());
+                    }
                 }
                 std::sort(blockedIdsOut->begin(), blockedIdsOut->end());
                 blockedIdsOut->erase(
