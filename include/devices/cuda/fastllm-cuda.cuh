@@ -1122,13 +1122,14 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                                   float typicalPosteriorAlpha,
                                   const int *penaltyIds = nullptr,
                                   const float *penaltyFactors = nullptr,
+                                  const float *penaltyOffsets = nullptr,
                                   int penaltyTokens = 0);
 bool FastllmCudaTopKTopPSamplingToDevice(
                                   float *logits, float *probs,
                                   float *temperatures, int *topKArr,
                                   float *topPArr,
                                   int *penaltyIds, float *penaltyFactors,
-                                  int penaltyTokens,
+                                  float *penaltyOffsets, int penaltyTokens,
                                   int *output, float *floatOutput,
                                   int batch, int vocabSize);
 bool FastllmCudaGreedySampling(float *logits, int *output,

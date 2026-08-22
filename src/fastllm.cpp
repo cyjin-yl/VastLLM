@@ -3432,17 +3432,28 @@ namespace fastllm {
         float *base = ((float*)logits.cpuData) + outerOffset * vocabSize;
         SanitizeLogitsForSampling(base, vocabSize, "LLMSampling");
 
-        if (fabs(config.repeat_penalty - 1.0) > 1e-6) {
-            std::multiset<int>::iterator begin = tokens.tokenSet.begin();
-            std::multiset<int>::iterator end = tokens.tokenSet.end();
+        const bool useRepeat = fabs(config.repeat_penalty - 1.0f) > 1e-6f;
+        const bool useAdditive = fabs(config.presence_penalty) > 1e-6f ||
+                                 fabs(config.frequency_penalty) > 1e-6f;
+        if (useRepeat || useAdditive) {
             std::set<int> unique(tokens.tokenSet.begin(), tokens.tokenSet.end());
-            if (config.last_n <= 0) {
-                begin = unique.begin();
-                end = unique.end();
-            }
-            for (std::multiset<int>::iterator iter = begin; iter != end; ++iter) {
-                int id = *iter;
-                base[id] = (base[id] < 0 ? base[id] * config.repeat_penalty : base[id] / config.repeat_penalty);
+            for (int id : unique) {
+                if (id < 0 || id >= vocabSize) {
+                    continue;
+                }
+                const int occurrences = (int)tokens.tokenSet.count(id);
+                if (useRepeat) {
+                    const int repeatOccurrences =
+                        config.last_n <= 0 ? 1 : occurrences;
+                    const float factor = std::pow(
+                        config.repeat_penalty, repeatOccurrences);
+                    base[id] = base[id] < 0 ? base[id] * factor
+                                           : base[id] / factor;
+                }
+                if (useAdditive) {
+                    base[id] -= config.presence_penalty +
+                                config.frequency_penalty * occurrences;
+                }
             }
         }
         // 【上游BUMP勿回退】不要把 zeroTemperature 分支删掉改回裸的

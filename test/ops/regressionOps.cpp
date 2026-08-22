@@ -4541,6 +4541,10 @@ namespace {
                "MTP allow-list accepted an undeclared token");
         config.tool_call_allowed_token_ids.clear();
         config.tool_call_blocked_token_ids.clear();
+        config.presence_penalty = 1.5f;
+        config.frequency_penalty = 0.25f;
+        Expect(fastllm::Qwen35MtpSupportsGenerationConfig(config),
+               "MTP rejected supported additive token penalties");
         config.output_logits = true;
         Expect(!fastllm::Qwen35MtpSupportsGenerationConfig(config),
                "MTP accepted output_logits collection");
@@ -4628,6 +4632,7 @@ namespace {
         std::vector<float> topPs(batch, 0.01f);
         std::vector<int> penaltyIds = {-1, 5};
         std::vector<float> penaltyFactors = {1.0f, 100.0f};
+        std::vector<float> penaltyOffsets = {0.0f, 1.5f};
 
         float *cudaLogits = (float*)FastllmCudaMalloc(logitsBytes);
         float *cudaProbs = (float*)FastllmCudaMalloc(logitsBytes);
@@ -4640,13 +4645,16 @@ namespace {
             (int*)FastllmCudaMalloc(batch * penaltyTokens * sizeof(int));
         float *cudaPenaltyFactors = (float*)FastllmCudaMalloc(
             batch * penaltyTokens * sizeof(float));
+        float *cudaPenaltyOffsets = (float*)FastllmCudaMalloc(
+            batch * penaltyTokens * sizeof(float));
         int *cudaOutput = (int*)FastllmCudaMalloc(batch * sizeof(int));
         float *cudaFloatOutput =
             (float*)FastllmCudaMalloc(batch * sizeof(float));
         Expect(cudaLogits != nullptr && cudaProbs != nullptr &&
                    cudaTemperatures != nullptr && cudaTopKs != nullptr &&
                    cudaTopPs != nullptr && cudaPenaltyIds != nullptr &&
-                   cudaPenaltyFactors != nullptr && cudaOutput != nullptr &&
+                   cudaPenaltyFactors != nullptr &&
+                   cudaPenaltyOffsets != nullptr && cudaOutput != nullptr &&
                    cudaFloatOutput != nullptr,
                "failed to allocate CUDA handoff sampling buffers");
 
@@ -4665,11 +4673,15 @@ namespace {
         FastllmCudaCopyFromHostToDevice(
             cudaPenaltyFactors, penaltyFactors.data(),
             batch * penaltyTokens * sizeof(float));
+        FastllmCudaCopyFromHostToDevice(
+            cudaPenaltyOffsets, penaltyOffsets.data(),
+            batch * penaltyTokens * sizeof(float));
 
         Expect(FastllmCudaTopKTopPSamplingToDevice(
                    cudaLogits, cudaProbs,
                    cudaTemperatures, cudaTopKs, cudaTopPs,
-                   cudaPenaltyIds, cudaPenaltyFactors, penaltyTokens,
+                   cudaPenaltyIds, cudaPenaltyFactors, cudaPenaltyOffsets,
+                   penaltyTokens,
                    cudaOutput, cudaFloatOutput, batch, vocabSize),
                "CUDA handoff top-k/top-p launch failed");
         std::vector<int> output(batch, -1);
@@ -4685,13 +4697,42 @@ namespace {
                "CUDA handoff sampling ignored top-p or repetition penalty");
         Expect(floatOutput[0] == 7.0f && floatOutput[1] == 6.0f,
                "CUDA handoff sampling float tokens differ from int output");
-        Expect(std::fabs(penalizedLogits[vocabSize + 5] - 0.08f) <
+        // MTP exact/typical verify 使用另一条 CUDA 入口。相同 penalty 必须在
+        // posterior 与 acceptance 计算前生效,否则 draft/target 分布不一致。
+        std::vector<float> verifyLogits(vocabSize, -20.0f);
+        verifyLogits[5] = 10.0f;
+        verifyLogits[6] = 9.0f;
+        FastllmCudaCopyFromHostToDevice(
+            cudaLogits, verifyLogits.data(), vocabSize * sizeof(float));
+        float verifyTemperature = 1.0f;
+        int verifyTopK = 2;
+        float verifyTopP = 0.01f;
+        int verifyOutput = -1;
+        int candidate = 6;
+        int candidateRow = 0;
+        unsigned char accepted = 0;
+        int recovered = -1;
+        int verifyPenaltyId = 5;
+        float verifyPenaltyFactor = 1.0f;
+        float verifyPenaltyOffset = 2.0f;
+        Expect(FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
+                   cudaLogits, &verifyTemperature, &verifyTopK, &verifyTopP,
+                   &verifyOutput, 1, vocabSize,
+                   &candidate, &candidateRow, &accepted, &recovered, 1,
+                   0.09f, 0.3f,
+                   &verifyPenaltyId, &verifyPenaltyFactor,
+                   &verifyPenaltyOffset, 1),
+               "MTP typical-acceptance sampling launch failed");
+        Expect(verifyOutput == 6 && accepted == 1 && recovered == 6,
+               "MTP typical acceptance used the unpenalized posterior");
+        Expect(std::fabs(penalizedLogits[vocabSize + 5] + 1.42f) <
                    1.0e-6f,
-               "CUDA handoff repetition factor was not applied exactly once");
+               "CUDA handoff multiplicative and additive penalties were not both applied");
 
         FastllmCudaFree(cudaFloatOutput);
         FastllmCudaFree(cudaOutput);
         FastllmCudaFree(cudaPenaltyFactors);
+        FastllmCudaFree(cudaPenaltyOffsets);
         FastllmCudaFree(cudaPenaltyIds);
         FastllmCudaFree(cudaTopPs);
         FastllmCudaFree(cudaTopKs);
@@ -18072,6 +18113,21 @@ int main(int argc, char **argv) {
             return 0;
 #else
             throw std::runtime_error("gguf_dequant regression requires a CUDA build.");
+#endif
+        }
+        if (only != nullptr &&
+            std::string(only) == "cuda_sampling_penalties") {
+#ifdef USE_CUDA
+            if (!fastllm::HasDeviceType("cuda")) {
+                throw std::runtime_error(
+                    "cuda_sampling_penalties regression requires CUDA.");
+            }
+            RunQwen35MtpConstraintSupportRegression();
+            RunCudaHandoffSamplingRegression();
+            return 0;
+#else
+            throw std::runtime_error(
+                "cuda_sampling_penalties regression requires a CUDA build.");
 #endif
         }
         if (only != nullptr &&

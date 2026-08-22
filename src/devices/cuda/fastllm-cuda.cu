@@ -13799,10 +13799,10 @@ bool FastllmCudaApplyTokenMask(
 }
 // 前置声明: 定义在本文件后部, FastllmCudaTopKTopPSamplingWithTypicalAcceptance 要用
 template <int BLOCK_THREADS>
-__global__ void FastllmRepeatPenaltyFactorsKernel(
+__global__ void FastllmTokenPenaltiesKernel(
         float *logits, const int *penaltyIds,
-        const float *penaltyFactors, int penaltyTokens,
-        int vocabSize);
+        const float *penaltyFactors, const float *penaltyOffsets,
+        int penaltyTokens, int vocabSize);
 
 bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                                   float *logits, float *temperatures,
@@ -13818,11 +13818,14 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                                   float typicalPosteriorAlpha,
                                   const int *penaltyIds,
                                   const float *penaltyFactors,
+                                  const float *penaltyOffsets,
                                   int penaltyTokens) {
     // repeat_penalty 直接就地作用在 logits 上(softmax/typical posterior
     // 因此都基于惩罚后的分布), 与非投机 CPU 路径 LLMSampling 语义一致。
     if (penaltyTokens > 0 && penaltyIds != nullptr && penaltyFactors != nullptr) {
-        size_t penaltyBytes = (size_t)batch * penaltyTokens * (sizeof(int) + sizeof(float));
+        size_t rowCount = (size_t)batch * penaltyTokens;
+        size_t penaltyBytes =
+            rowCount * (sizeof(int) + 2 * sizeof(float));
         uint8_t *penaltyBuf = (uint8_t *)FastllmCudaMalloc(penaltyBytes);
         if (penaltyBuf == nullptr) {
             printf("FastllmCudaTopKTopPSampling: penalty buffer alloc failed.\n");
@@ -13830,13 +13833,24 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
             return false;
         }
         int *cudaPenaltyIds = (int *)penaltyBuf;
-        float *cudaPenaltyFactors = (float *)(penaltyBuf + (size_t)batch * penaltyTokens * sizeof(int));
-        FastllmCudaCopyFromHostToDevice(cudaPenaltyIds, (void *)penaltyIds,
-                                        (size_t)batch * penaltyTokens * sizeof(int));
-        FastllmCudaCopyFromHostToDevice(cudaPenaltyFactors, (void *)penaltyFactors,
-                                        (size_t)batch * penaltyTokens * sizeof(float));
-        FastllmRepeatPenaltyFactorsKernel<64><<<batch, 64>>>(
-            logits, cudaPenaltyIds, cudaPenaltyFactors, penaltyTokens, vocabSize);
+        float *cudaPenaltyFactors =
+            (float *)(penaltyBuf + rowCount * sizeof(int));
+        float *cudaPenaltyOffsets = cudaPenaltyFactors + rowCount;
+        FastllmCudaCopyFromHostToDevice(
+            cudaPenaltyIds, (void *)penaltyIds, rowCount * sizeof(int));
+        FastllmCudaCopyFromHostToDevice(
+            cudaPenaltyFactors, (void *)penaltyFactors,
+            rowCount * sizeof(float));
+        if (penaltyOffsets != nullptr) {
+            FastllmCudaCopyFromHostToDevice(
+                cudaPenaltyOffsets, (void *)penaltyOffsets,
+                rowCount * sizeof(float));
+        } else {
+            cudaMemset(cudaPenaltyOffsets, 0, rowCount * sizeof(float));
+        }
+        FastllmTokenPenaltiesKernel<64><<<batch, 64>>>(
+            logits, cudaPenaltyIds, cudaPenaltyFactors,
+            cudaPenaltyOffsets, penaltyTokens, vocabSize);
         DeviceSync();
         FastllmCudaFree(penaltyBuf);
     }
@@ -13956,21 +13970,24 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
 }
 
 template <int BLOCK_THREADS>
-__global__ void FastllmRepeatPenaltyFactorsKernel(
+__global__ void FastllmTokenPenaltiesKernel(
         float *logits, const int *penaltyIds,
-        const float *penaltyFactors, int penaltyTokens,
-        int vocabSize) {
+        const float *penaltyFactors, const float *penaltyOffsets,
+        int penaltyTokens, int vocabSize) {
     int row = blockIdx.x;
     float *rowLogits = logits + (long long)row * vocabSize;
     const int *rowIds = penaltyIds + (long long)row * penaltyTokens;
     const float *rowFactors =
         penaltyFactors + (long long)row * penaltyTokens;
+    const float *rowOffsets =
+        penaltyOffsets + (long long)row * penaltyTokens;
     for (int i = threadIdx.x; i < penaltyTokens; i += BLOCK_THREADS) {
         int token = rowIds[i];
         if (token >= 0 && token < vocabSize) {
             float factor = rowFactors[i];
             float value = rowLogits[token];
-            rowLogits[token] = value < 0.0f ? value * factor : value / factor;
+            value = value < 0.0f ? value * factor : value / factor;
+            rowLogits[token] = value - rowOffsets[i];
         }
     }
 }
@@ -13988,7 +14005,7 @@ bool FastllmCudaTopKTopPSamplingToDevice(
                                   float *temperatures, int *topKArr,
                                   float *topPArr,
                                   int *penaltyIds, float *penaltyFactors,
-                                  int penaltyTokens,
+                                  float *penaltyOffsets, int penaltyTokens,
                                   int *output, float *floatOutput,
                                   int batch, int vocabSize) {
     if (logits == nullptr || probs == nullptr || temperatures == nullptr ||
@@ -13996,13 +14013,14 @@ bool FastllmCudaTopKTopPSamplingToDevice(
         floatOutput == nullptr || batch <= 0 || vocabSize <= 0 ||
         penaltyTokens < 0 ||
         (penaltyTokens > 0 &&
-         (penaltyIds == nullptr || penaltyFactors == nullptr))) {
+         (penaltyIds == nullptr || penaltyFactors == nullptr ||
+          penaltyOffsets == nullptr))) {
         return false;
     }
 
     if (penaltyTokens > 0) {
-        FastllmRepeatPenaltyFactorsKernel<64><<<batch, 64>>>(
-            logits, penaltyIds, penaltyFactors,
+        FastllmTokenPenaltiesKernel<64><<<batch, 64>>>(
+            logits, penaltyIds, penaltyFactors, penaltyOffsets,
             penaltyTokens, vocabSize);
     }
     FastllmTemperatureSoftmaxKernel<1024><<<batch, 1024>>>(

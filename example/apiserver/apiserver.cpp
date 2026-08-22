@@ -2548,8 +2548,17 @@ struct WorkQueue {
                                          "invalid_max_tokens"));
                 return;
             }
+            if (node->config["repeat_penalty"].is_number()) {
+                config.repeat_penalty =
+                    node->config["repeat_penalty"].number_value();
+            }
+            if (node->config["presence_penalty"].is_number()) {
+                config.presence_penalty =
+                    node->config["presence_penalty"].number_value();
+            }
             if (node->config["frequency_penalty"].is_number()) {
-                config.repeat_penalty = node->config["frequency_penalty"].number_value();
+                config.frequency_penalty =
+                    node->config["frequency_penalty"].number_value();
             }
             if (node->config["temperature"].is_number()) {
                 config.temperature = node->config["temperature"].number_value();

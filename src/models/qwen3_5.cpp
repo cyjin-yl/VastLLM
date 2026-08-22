@@ -1469,9 +1469,29 @@ namespace fastllm {
         weight.weightSum.shrink_to_fit();
     }
 
-    static bool Qwen35NeedRepeatPenalty(const GenerationConfig &config) {
-        float diff = config.repeat_penalty - 1.0f;
-        return diff > 1e-6f || diff < -1e-6f;
+    struct Qwen35SamplingPenalty {
+        int token = -1;
+        float factor = 1.0f;
+        float offset = 0.0f;
+    };
+
+    static bool Qwen35NeedTokenPenalties(const GenerationConfig &config) {
+        return std::fabs(config.repeat_penalty - 1.0f) > 1e-6f ||
+               std::fabs(config.presence_penalty) > 1e-6f ||
+               std::fabs(config.frequency_penalty) > 1e-6f;
+    }
+
+    static Qwen35SamplingPenalty Qwen35MakeTokenPenalty(
+            const GenerationConfig &config, int token, int occurrences) {
+        Qwen35SamplingPenalty penalty;
+        penalty.token = token;
+        const int repeatOccurrences =
+            config.last_n <= 0 ? 1 : occurrences;
+        penalty.factor = std::pow(
+            config.repeat_penalty, repeatOccurrences);
+        penalty.offset = config.presence_penalty +
+                         config.frequency_penalty * occurrences;
+        return penalty;
     }
     static bool Qwen35ToolConstraintAllowsTokenLists(
             const std::vector<int> &allowed,
@@ -1511,7 +1531,9 @@ namespace fastllm {
                std::isfinite(config.top_p) &&
                config.top_p > 0.0f && config.top_p <= 1.0f &&
                std::isfinite(config.repeat_penalty) &&
-               config.repeat_penalty > 0.0f;
+               config.repeat_penalty > 0.0f &&
+               std::isfinite(config.presence_penalty) &&
+               std::isfinite(config.frequency_penalty);
     }
 
     static bool Qwen35GpuTokenHandoffSupportsGenerationConfig(
@@ -1529,7 +1551,9 @@ namespace fastllm {
                std::isfinite(config.top_p) &&
                config.top_p > 0.0f && config.top_p <= 1.0f &&
                std::isfinite(config.repeat_penalty) &&
-               config.repeat_penalty > 0.0f;
+               config.repeat_penalty > 0.0f &&
+               std::isfinite(config.presence_penalty) &&
+               std::isfinite(config.frequency_penalty);
     }
 
 #ifdef USE_CUDA
@@ -6506,7 +6530,7 @@ namespace fastllm {
                     b < (int)retLogits->size() && (*retLogits)[b] != nullptr) {
                     return false;
                 }
-                if (Qwen35NeedRepeatPenalty(config) &&
+                if (Qwen35NeedTokenPenalties(config) &&
                     qwen35GpuTokenHandoffControl == nullptr) {
                     return false;
                 }
@@ -7048,7 +7072,7 @@ namespace fastllm {
                 const std::vector<int> *typicalCandidateRows = nullptr,
                 std::vector<unsigned char> *typicalAccepted = nullptr,
                 std::vector<int> *typicalRecoveredIds = nullptr,
-                const std::vector<std::vector<std::pair<int, float> > > *rowPenalties = nullptr) {
+                const std::vector<std::vector<Qwen35SamplingPenalty> > *rowPenalties = nullptr) {
             FastllmCudaSetDevice(rootDevice);
             AssertInFastLLM(
                 Qwen35ApplyCudaTokenConstraints(
@@ -7078,12 +7102,12 @@ namespace fastllm {
                     typicalCandidateRows == nullptr;
                 if (handoffSampling) {
                     static thread_local std::vector<
-                        std::vector<std::pair<int, float> > > penalties;
+                        std::vector<Qwen35SamplingPenalty> > penalties;
                     penalties.clear();
                     penalties.resize(batch);
                     int maxPenaltyTokens = 0;
                     for (int b = 0; b < batch; b++) {
-                        if (!Qwen35NeedRepeatPenalty(generationConfigs[b]) ||
+                        if (!Qwen35NeedTokenPenalties(generationConfigs[b]) ||
                             lastTokens == nullptr ||
                             b >= (int)lastTokens->units.size()) {
                             continue;
@@ -7093,12 +7117,9 @@ namespace fastllm {
                             counts[token]++;
                         }
                         for (auto &entry : counts) {
-                            int repeats = generationConfigs[b].last_n <= 0 ?
-                                1 : entry.second;
-                            penalties[b].push_back(std::make_pair(
-                                entry.first,
-                                std::pow(generationConfigs[b].repeat_penalty,
-                                         repeats)));
+                            penalties[b].push_back(Qwen35MakeTokenPenalty(
+                                generationConfigs[b],
+                                entry.first, entry.second));
                         }
                         maxPenaltyTokens = std::max(
                             maxPenaltyTokens, (int)penalties[b].size());
@@ -7112,8 +7133,10 @@ namespace fastllm {
                         (size_t)batch * maxPenaltyTokens * sizeof(int);
                     size_t penaltyFactorsBytes =
                         (size_t)batch * maxPenaltyTokens * sizeof(float);
+                    size_t penaltyOffsetsBytes = penaltyFactorsBytes;
                     size_t paramsBytes = temperaturesBytes + topKBytes +
-                        topPBytes + penaltyIdsBytes + penaltyFactorsBytes;
+                        topPBytes + penaltyIdsBytes + penaltyFactorsBytes +
+                        penaltyOffsetsBytes;
                     int parameterSlot = handoff->outputTokenSlot;
                     uint8_t *hostParams = handoff->EnsureHostSamplingParams(
                         parameterSlot, paramsBytes);
@@ -7128,6 +7151,8 @@ namespace fastllm {
                     int *hostPenaltyIds = (int*)hostCursor;
                     hostCursor += penaltyIdsBytes;
                     float *hostPenaltyFactors = (float*)hostCursor;
+                    hostCursor += penaltyFactorsBytes;
+                    float *hostPenaltyOffsets = (float*)hostCursor;
                     if (maxPenaltyTokens > 0) {
                         std::fill(hostPenaltyIds,
                                   hostPenaltyIds +
@@ -7137,15 +7162,21 @@ namespace fastllm {
                                   hostPenaltyFactors +
                                       (size_t)batch * maxPenaltyTokens,
                                   1.0f);
+                        std::fill(hostPenaltyOffsets,
+                                  hostPenaltyOffsets +
+                                      (size_t)batch * maxPenaltyTokens,
+                                  0.0f);
                         for (int b = 0; b < batch; b++) {
                             for (int i = 0;
                                  i < (int)penalties[b].size(); i++) {
                                 size_t offset =
                                     (size_t)b * maxPenaltyTokens + i;
                                 hostPenaltyIds[offset] =
-                                    penalties[b][i].first;
+                                    penalties[b][i].token;
                                 hostPenaltyFactors[offset] =
-                                    penalties[b][i].second;
+                                    penalties[b][i].factor;
+                                hostPenaltyOffsets[offset] =
+                                    penalties[b][i].offset;
                             }
                         }
                     }
@@ -7174,6 +7205,9 @@ namespace fastllm {
                         (int*)cudaCursor : nullptr;
                     cudaCursor += penaltyIdsBytes;
                     float *cudaPenaltyFactors = maxPenaltyTokens > 0 ?
+                        (float*)cudaCursor : nullptr;
+                    cudaCursor += penaltyFactorsBytes;
+                    float *cudaPenaltyOffsets = maxPenaltyTokens > 0 ?
                         (float*)cudaCursor : nullptr;
 
                     int vocabSize = fullLogits.dims.back();
@@ -7207,7 +7241,7 @@ namespace fastllm {
                             (float*)cudaProbs.cudaData,
                             cudaTemperatures, cudaTopKs, cudaTopPs,
                             cudaPenaltyIds, cudaPenaltyFactors,
-                            maxPenaltyTokens,
+                            cudaPenaltyOffsets, maxPenaltyTokens,
                             (int*)cudaOutput.cudaData,
                             (float*)cudaFloatOutput.cudaData,
                             batch, vocabSize),
@@ -7231,6 +7265,7 @@ namespace fastllm {
                 // typical acceptance 的 posterior 是惩罚后的分布。
                 std::vector<int> flatPenaltyIds;
                 std::vector<float> flatPenaltyFactors;
+                std::vector<float> flatPenaltyOffsets;
                 int maxRowPenaltyTokens = 0;
                 if (rowPenalties != nullptr &&
                     (int)rowPenalties->size() >= batch) {
@@ -7239,14 +7274,18 @@ namespace fastllm {
                             maxRowPenaltyTokens, (int)(*rowPenalties)[b].size());
                     }
                     if (maxRowPenaltyTokens > 0) {
-                        flatPenaltyIds.resize((size_t)batch * maxRowPenaltyTokens, -1);
-                        flatPenaltyFactors.resize((size_t)batch * maxRowPenaltyTokens, 1.0f);
+                        const size_t flatCount =
+                            (size_t)batch * maxRowPenaltyTokens;
+                        flatPenaltyIds.resize(flatCount, -1);
+                        flatPenaltyFactors.resize(flatCount, 1.0f);
+                        flatPenaltyOffsets.resize(flatCount, 0.0f);
                         for (int b = 0; b < batch; b++) {
                             const auto &rp = (*rowPenalties)[b];
                             for (int i = 0; i < (int)rp.size(); i++) {
                                 size_t off = (size_t)b * maxRowPenaltyTokens + i;
-                                flatPenaltyIds[off] = rp[i].first;
-                                flatPenaltyFactors[off] = rp[i].second;
+                                flatPenaltyIds[off] = rp[i].token;
+                                flatPenaltyFactors[off] = rp[i].factor;
+                                flatPenaltyOffsets[off] = rp[i].offset;
                             }
                         }
                     }
@@ -7279,6 +7318,7 @@ namespace fastllm {
                     Qwen35MtpTypicalAlpha(),
                     flatPenaltyIds.empty() ? nullptr : flatPenaltyIds.data(),
                     flatPenaltyIds.empty() ? nullptr : flatPenaltyFactors.data(),
+                    flatPenaltyIds.empty() ? nullptr : flatPenaltyOffsets.data(),
                     maxRowPenaltyTokens);
                 AssertInFastLLM(sampled,
                                 "Qwen3.5 CUDA top-k/top-p sampling failed.\n");
@@ -15630,13 +15670,13 @@ namespace fastllm {
                             "Qwen3.5 speculative logits row mapping mismatch.\n");
             std::vector<GenerationConfig> rowConfigs;
             rowConfigs.reserve(logitRows);
-            std::vector<std::vector<std::pair<int, float> > > rowPenalties(logitRows);
+            std::vector<std::vector<Qwen35SamplingPenalty> > rowPenalties(logitRows);
             {
                 int rowCursor = 0;
                 for (int b = 0; b < batch; b++) {
                     // 每行都属于 request b; penalty 集合取该 request 的已生成历史
-                    std::vector<std::pair<int, float> > unitPenalty;
-                    if (Qwen35NeedRepeatPenalty(generationConfigs[b]) &&
+                    std::vector<Qwen35SamplingPenalty> unitPenalty;
+                    if (Qwen35NeedTokenPenalties(generationConfigs[b]) &&
                         b < (int)lastTokens.units.size()) {
                         std::map<int, int> penaltyCounts;
                         for (int token : lastTokens.units[b].tokenSet) {
@@ -15644,10 +15684,9 @@ namespace fastllm {
                         }
                         unitPenalty.reserve(penaltyCounts.size());
                         for (auto &entry : penaltyCounts) {
-                            int repeats = generationConfigs[b].last_n <= 0 ? 1 : entry.second;
-                            unitPenalty.push_back(
-                                {entry.first, (float)std::pow(
-                                    generationConfigs[b].repeat_penalty, repeats)});
+                            unitPenalty.push_back(Qwen35MakeTokenPenalty(
+                                generationConfigs[b],
+                                entry.first, entry.second));
                         }
                     }
                     for (int token = 0; token < seqLens[b]; token++) {
@@ -16951,7 +16990,7 @@ namespace fastllm {
         // 让 GPU 采样 kernel 的 repeat-penalty 作用在 verify 分布上
         // (否则 draft 提议无惩罚分布而 verify 无惩罚 -> 输出分布偏差)。
         LastTokensManager mtpLastTokens;
-        if (Qwen35NeedRepeatPenalty(generationConfigs[0]) &&
+        if (Qwen35NeedTokenPenalties(generationConfigs[0]) &&
             context != nullptr) {
             mtpLastTokens.units.push_back(context->tokens);
         }
@@ -19144,7 +19183,7 @@ namespace fastllm {
         // 让 GPU 采样 kernel 的 repeat-penalty 作用在 verify 分布上。
         LastTokensManager mtpLastTokens;
         for (int b = 0; b < batch; b++) {
-            if (Qwen35NeedRepeatPenalty(generationConfigs[b]) &&
+            if (Qwen35NeedTokenPenalties(generationConfigs[b]) &&
                 contexts[b] != nullptr) {
                 mtpLastTokens.units.push_back(contexts[b]->tokens);
             } else {
@@ -21081,7 +21120,7 @@ namespace fastllm {
             bool needsLastTokens = false;
             for (const GenerationConfig &config :
                  launchGenerationConfigs) {
-                needsLastTokens |= Qwen35NeedRepeatPenalty(config);
+                needsLastTokens |= Qwen35NeedTokenPenalties(config);
             }
             if (needsLastTokens) {
                 AssertInFastLLM(
@@ -21893,7 +21932,7 @@ namespace fastllm {
                     generationConfigs.push_back(ctx->generationConfig);
                     model->PrepareToolCallConstraint(ctx, generationConfigs.back());
                     logits.push_back(createPendingResultLogits(ctx->generationConfig));
-                    selectedNeedLastTokens |= Qwen35NeedRepeatPenalty(ctx->generationConfig) ||
+                    selectedNeedLastTokens |= Qwen35NeedTokenPenalties(ctx->generationConfig) ||
                                               ctx->generationConfig.output_logits ||
                                               !generationConfigs.back().tool_call_allowed_token_ids.empty() ||
                                               !generationConfigs.back().tool_call_blocked_token_ids.empty();
@@ -22176,7 +22215,7 @@ namespace fastllm {
                     for (const GenerationConfig &config :
                          generationConfigs) {
                         needsHandoffLastTokens |=
-                            Qwen35NeedRepeatPenalty(config);
+                            Qwen35NeedTokenPenalties(config);
                     }
                     if (oldCanChain && unchangedBatch &&
                         needsHandoffLastTokens && !oldTokensReady) {
@@ -23022,7 +23061,7 @@ namespace fastllm {
                         }
 
                         ctx->allTokens.push_back(curRet);
-                        if (Qwen35NeedRepeatPenalty(ctx->generationConfig)) {
+                        if (Qwen35NeedTokenPenalties(ctx->generationConfig)) {
                             ctx->tokens.Push(curRet);
                         }
                         ctx->curTokens++;

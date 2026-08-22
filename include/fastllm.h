@@ -176,6 +176,8 @@ namespace fastllm {
         int input_token_length = 0;
         int last_n = 64; // 末尾last_n个token计入重复惩罚
         float repeat_penalty = 1.0f; // 重复惩罚系数，1.0代表不惩罚
+        float presence_penalty = 0.0f; // 出现过即固定减去该值，OpenAI 语义
+        float frequency_penalty = 0.0f; // 按出现次数线性减去该值，OpenAI 语义
         bool do_sample = false; // false表示贪心解码，保留前端的采样语义
         int top_k = 1; // top_k采样
         float top_p = 1.0; // top_p采样
@@ -223,7 +225,9 @@ namespace fastllm {
                 !tool_call_blocked_token_ids.empty()) {
                 return false;
             }
-            if (fabs(repeat_penalty - 1) > 1e-8) {
+            if (fabs(repeat_penalty - 1) > 1e-8 ||
+                fabs(presence_penalty) > 1e-8 ||
+                fabs(frequency_penalty) > 1e-8) {
                 return false;
             }
             if (top_k > 1) {

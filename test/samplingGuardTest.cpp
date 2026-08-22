@@ -258,6 +258,59 @@ void TestToolCallMaskEmptyFallbackIsCounted() {
     Check(after - before == 1, "候选掩码为空时计数器恰好增加 1");
 }
 
+void TestPresencePenaltyUsesGeneratedHistory() {
+    printf("[10] presence penalty 对历史中出现过的 token 固定扣减\n");
+    fastllm::Data logits(
+        fastllm::DataType::FLOAT32, {1, 3}, {0.0f, 10.0f, 9.5f});
+    fastllm::GenerationConfig cfg;
+    cfg.temperature = 0.0f;
+    cfg.presence_penalty = 1.0f;
+    fastllm::LastTokensUnit history(16);
+    history.Push(1);
+
+    Check(fastllm::LLMSampling(logits, 0, cfg, history) == 2,
+          "出现过一次的最高 logit token 被固定惩罚后让位");
+}
+
+void TestFrequencyPenaltyScalesWithOccurrenceCount() {
+    printf("[11] frequency penalty 按历史出现次数线性扣减\n");
+    fastllm::GenerationConfig cfg;
+    cfg.temperature = 0.0f;
+    cfg.frequency_penalty = 0.3f;
+
+    fastllm::LastTokensUnit once(16);
+    once.Push(1);
+    fastllm::Data logitsOnce(
+        fastllm::DataType::FLOAT32, {1, 3}, {0.0f, 10.0f, 9.5f});
+    Check(fastllm::LLMSampling(logitsOnce, 0, cfg, once) == 1,
+          "出现一次仅扣 0.3, 原最高 token 仍胜出");
+
+    fastllm::LastTokensUnit twice(16);
+    twice.Push(1);
+    twice.Push(1);
+    fastllm::Data logitsTwice(
+        fastllm::DataType::FLOAT32, {1, 3}, {0.0f, 10.0f, 9.5f});
+    Check(fastllm::LLMSampling(logitsTwice, 0, cfg, twice) == 2,
+          "出现两次累计扣 0.6, 次高 token 胜出");
+}
+
+void TestRepeatPenaltyLastNZeroPreservesUniqueTokenSemantics() {
+    printf("[12] repeat penalty 在 last_n<=0 时每个历史 token 只作用一次\n");
+    fastllm::GenerationConfig cfg;
+    cfg.temperature = 0.0f;
+    cfg.repeat_penalty = 2.0f;
+    cfg.last_n = 0;
+    fastllm::LastTokensUnit history(16);
+    history.Push(1);
+    history.Push(1);
+    fastllm::Data logits(
+        fastllm::DataType::FLOAT32, {1, 3}, {0.0f, 10.0f, 4.0f});
+
+    Check(fastllm::LLMSampling(logits, 0, cfg, history) == 1,
+          "重复出现两次仍只除以 2, 不应错误除以 4");
+}
+
+
 }  // namespace
 
 
@@ -273,6 +326,9 @@ int main() {
     TestFullLogitsToolCallMaskEmptyFallbackIsCounted();
 
     TestToolCallMaskEmptyFallbackIsCounted();
+    TestPresencePenaltyUsesGeneratedHistory();
+    TestFrequencyPenaltyScalesWithOccurrenceCount();
+    TestRepeatPenaltyLastNZeroPreservesUniqueTokenSemantics();
 
     printf("\n%d/%d 通过\n", g_checks - g_failures, g_checks);
     if (g_failures > 0) {
