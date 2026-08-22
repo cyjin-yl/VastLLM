@@ -1006,7 +1006,8 @@ struct WorkQueue {
                                 "invalid_request_error", "method_not_allowed"),
                 {{"Allow", allowed}});
         };
-        // 从请求头读取 Bearer 控制令牌（与 checkpoint 端点一致）。
+        // 从请求头读取 Bearer 控制令牌。管理 WebUI 统一使用 .env 的
+        // AUTH_TOKEN; 若显式设置 FASTLLM_PREFIX_CACHE_CONTROL_TOKEN 则优先它。
         auto readControlAuthorization = [&]() -> std::string {
             std::string authorization;
             for (const auto &header : req->headers) {
@@ -1019,6 +1020,9 @@ struct WorkQueue {
             }
             const char *configured = std::getenv(
                 "FASTLLM_PREFIX_CACHE_CONTROL_TOKEN");
+            if (configured == nullptr || configured[0] == 0) {
+                configured = std::getenv("AUTH_TOKEN");
+            }
             const std::string expectedToken =
                 configured == nullptr ? std::string() :
                     std::string(configured);
@@ -1038,12 +1042,14 @@ struct WorkQueue {
             return presented;
         };
 
-        // suspend 后模型对象被释放，除 resume/health/suspend 外的路由一律 503，
-        // 防止对空模型解引用。
+        // suspend 后模型对象被释放；管理面本身必须继续可用，才能查看日志并
+        // 一键 resume。只有推理路由返回 503。
         if (suspended.load(std::memory_order_acquire) &&
             route != "/admin/resume" &&
             route != "/admin/suspend" &&
-            route != "/health") {
+            route != "/health" &&
+            route != "/admin" &&
+            route.rfind("/admin/api/", 0) != 0) {
             writeJsonAndClose(
                 503,
                 OpenAIHttpError(

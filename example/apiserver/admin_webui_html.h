@@ -112,8 +112,11 @@ th { color:var(--dim); font-weight:normal; font-size:11px; }
     <th>profile</th><th>mtime</th><th>状态</th><th></th></tr></thead>
     <tbody></tbody></table>
   <div class="row" style="margin-top:10px">
-    <button class="danger" onclick="doStop()">■ 停止服务 (proxy+backend)</button>
-    <span class="muted">停止后本页无法远程拉起, 需在服务器上运行 start_prod.sh</span>
+    <button onclick="doSuspend('memory')">暂停模型到 RAM</button>
+    <button onclick="doSuspend('disk')">暂停模型到磁盘</button>
+    <button class="primary" onclick="doResume()">恢复模型</button>
+    <button class="danger" onclick="doStop()">■ 彻底停止 proxy+backend</button>
+    <span class="muted">暂停态管理页保持在线；彻底停止后需在服务器运行 start_prod.sh。</span>
   </div>
 </div>
 
@@ -259,8 +262,25 @@ async function doSwitch(name) {
                                     body: JSON.stringify({profile: name})});
   $('#stateBadge').textContent = 'switching… 服务重启中, 页面将自动重连';
 }
+async function postControl(path, body={}) {
+  const r = await fetch(path, {
+    method:'POST', headers:{...authHeaders(),'Content-Type':'application/json'},
+    body:JSON.stringify(body)});
+  const j = await r.json();
+  if (!r.ok) throw new Error(j?.error?.message || JSON.stringify(j));
+  return j;
+}
+async function doSuspend(tier) {
+  if (!confirm(`确认暂停模型到 ${tier}? 管理页会保持在线。`)) return;
+  try { await postControl('/admin/suspend',{tier}); pollState(); }
+  catch(e) { alert('暂停失败: '+e.message); }
+}
+async function doResume() {
+  try { await postControl('/admin/resume'); pollState(); }
+  catch(e) { alert('恢复失败: '+e.message); }
+}
 async function doStop() {
-  if (!confirm('确认停止 proxy + backend?')) return;
+  if (!confirm('确认彻底停止 proxy + backend? 停止后 WebUI 也会离线。')) return;
   await fetch('/admin/api/stop', {method:'POST', headers:authHeaders()});
 }
 async function refreshLogs() {
