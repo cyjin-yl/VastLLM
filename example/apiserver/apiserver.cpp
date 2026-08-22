@@ -153,6 +153,8 @@ using socket_t = int;
 #include "checkpoint_control.h"
 #include "utils/stop_string_matcher.h"
 #include "host_offload.h"
+#include "admin_webui.h"
+#include "admin_webui_html.h"
 #include "fastllm-kernel-route.h"
 
 class MultimodalInputGuard {
@@ -573,16 +575,25 @@ static void CloseNodeClient(WorkNode *node) {
 //   maxActivateQueryNumber = min(256, --batch), 生产是 --batch 1 => 1。
 //   派发闸门 activateQueryNumber < maxActivateQueryNumber 对**所有**路由生效,
 //   于是只要有一个请求在生成, /health 和 /version 就一直排队, 客户端超时。
-//   后果: 上游代理无法区分"后端在忙"与"后端已僵死" —— 本次 MTPLoop 自死锁
-//   期间, 代理始终显示 backend=READY, 故障因此拖了一个小时才被发现。
-// 注意不能把 /admin/* 放进来: 它们会 suspend/resume 模型, 必须串行。
+//   后果: 上游代理无法区分"后端在忙"与"后端已僵死" —— 故障拖一小时才被发现。
 static bool IsLightweightRoute(const std::string &rawRoute) {
     std::string route = rawRoute;
     if (route.size() > 1 && route.back() == '/') {
         route.pop_back();
     }
-    return route == "/health" || route == "/version" ||
-           route == "/props" || route == "/config.json";
+    if (route == "/health" || route == "/version" ||
+        route == "/props" || route == "/config.json") {
+        return true;
+    }
+    // 管理 WebUI(/admin 与 /admin/api/*)必须始终可响应 —— 它是排障入口,
+    // 被推理队列挡住就失去意义。这些路由不触碰模型对象: state 只读引擎
+    // 计数器, switch/stop 只是 fork detached 脚本, 都是毫秒级。
+    // 真正会 suspend/resume 模型的 /admin/suspend、/admin/resume 仍然串行,
+    // 见本函数上方的原始注释。
+    if (route == "/admin" || route.rfind("/admin/api/", 0) == 0) {
+        return true;
+    }
+    return false;
 }
 
 struct WorkQueue {
@@ -941,6 +952,33 @@ struct WorkQueue {
         std::string route = req->route;
         if (route.size() > 1 && route.back() == '/') {
             route.pop_back();
+        }
+        // 管理端 API 用 query string 传参(?which=..&lines=..)。
+        // 其它路由历来不含 query, 拆分不影响它们。
+        std::map<std::string, std::string> queryParams;
+        {
+            const std::size_t qpos = route.find('?');
+            if (qpos != std::string::npos) {
+                const std::string query = route.substr(qpos + 1);
+                route = route.substr(0, qpos);
+                std::size_t cursor = 0;
+                while (cursor <= query.size()) {
+                    const std::size_t amp = query.find('&', cursor);
+                    const std::string pair = query.substr(
+                        cursor, amp == std::string::npos
+                            ? std::string::npos : amp - cursor);
+                    const std::size_t eq = pair.find('=');
+                    if (eq != std::string::npos) {
+                        queryParams[pair.substr(0, eq)] = pair.substr(eq + 1);
+                    } else if (!pair.empty()) {
+                        queryParams[pair] = "";
+                    }
+                    if (amp == std::string::npos) {
+                        break;
+                    }
+                    cursor = amp + 1;
+                }
+            }
         }
         // json11 的 dump() 在本仓库被定制为 pretty-print(\n\t 缩进,供 .tfdl
         // 模型文件用)。SSE 客户端(OpenAI 兼容)要求每个 chunk 是单行紧凑
@@ -1780,6 +1818,493 @@ struct WorkQueue {
             });
             return;
         }
+        // ─── 内嵌管理 WebUI ───────────────────────────────────────
+        // GET  /admin              管理页(HTML)
+        // GET  /admin/api/state    引擎状态聚合(轻量, 始终可响应)
+        // GET  /admin/api/logs     日志尾部
+        // GET  /admin/api/profiles profile 列表
+        // POST /admin/api/switch   切换 profile(detached 重启全套)
+        // POST /admin/api/stop     停止 proxy + backend
+        // 认证: 除 /admin 页面本身外, 所有 API 要求 Bearer AUTH_TOKEN。
+        // 页面先取不到数据会显示 token 输入框, 认证后正常使用。
+        if (route == "/admin" || route.rfind("/admin/api/", 0) == 0) {
+            const bool authOk =
+                fastllm::apiserver::AdminWebUiCheckAuth(req->headers);
+            auto authRequired = [&]() -> bool {
+                if (authOk) {
+                    return false;
+                }
+                writeJsonAndClose(
+                    401,
+                    OpenAIHttpError(
+                        "admin API requires Bearer AUTH_TOKEN",
+                        "authentication_error", "unauthorized"),
+                    {{"WWW-Authenticate", "Bearer"}});
+                return true;
+            };
+
+            // profile 目录: 供 state / profiles / profile 三个路由共用。
+            const char *profilesDirEnv =
+                std::getenv("FASTLLM_ADMIN_PROFILES_DIR");
+            const std::string profilesDir = [&]() -> std::string {
+                if (profilesDirEnv != nullptr && profilesDirEnv[0] != 0) {
+                    return profilesDirEnv;
+                }
+                const char *projectDir = std::getenv("PROJECT_DIR");
+                if (projectDir != nullptr && projectDir[0] != 0) {
+                    return std::string(projectDir) +
+                        "/runtime/fastllm-native-profiles";
+                }
+                return std::string();
+            }();
+            const auto profileNameValid = [](const std::string &name) {
+                static const std::string allowed =
+                    "abcdefghijklmnopqrstuvwxyz"
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                    "0123456789._-";
+                return name.size() > 4 && name.size() <= 128 &&
+                    name.compare(name.size() - 4, 4, ".env") == 0 &&
+                    name.find_first_not_of(allowed) == std::string::npos;
+            };
+            if (route == "/admin") {
+                if (req->method != "GET") {
+                    writeMethodNotAllowed("GET");
+                    return;
+                }
+                const std::string html(
+                    fastllm::apiserver::kAdminPageHtml);
+                WriteAllToSocket(
+                    node->client,
+                    BuildFixedHttpResponse(
+                        200, html, "text/html; charset=utf-8"));
+                CloseNodeClient(node);
+                return;
+            }
+
+            if (route == "/admin/api/state") {
+                if (req->method != "GET") {
+                    writeMethodNotAllowed("GET");
+                    return;
+                }
+                if (authRequired()) {
+                    return;
+                }
+                int activeRequests = 0;
+                int queuedRequests = 0;
+                {
+                    std::lock_guard<std::mutex> lock(locker);
+                    activeRequests = std::max(0, activateQueryNumber - 1);
+                    queuedRequests = static_cast<int>(q.size());
+                }
+                const bool suspendedNow =
+                    suspended.load(std::memory_order_acquire);
+
+                // 页池 + L1 trie
+                uint64_t totalPages = 0, usedPages = 0, triePages = 0;
+                uint64_t logicalMaxPages = 0;
+                int pageLen = 0;
+                if (!suspendedNow && model != nullptr) {
+                    model->GetPagedCachePoolStats(
+                        totalPages, usedPages, triePages, pageLen,
+                        &logicalMaxPages);
+                }
+                // 显存对账
+                fastllm::VramBreakdown vram;
+                fastllm::GetVramBreakdown(vram);
+                const long long otherBytes =
+                    (long long)vram.usedBytes -
+                    (long long)vram.pagedPoolBytes -
+                    (long long)vram.allocBusyBytes -
+                    (long long)vram.allocFreeBytes;
+                // 前缀缓存统计
+                const auto prefixStats =
+                    fastllm::GetPrefixCacheStatsSnapshot();
+                // 持久层状态
+                const auto persistentStatus =
+                    fastllm::GetPersistentPrefixCacheStatus();
+                // 工具调用约束统计
+                const auto toolCallStats =
+                    fastllm::GetToolCallGrammarStatsSnapshot();
+                // 日志路径
+                const char *backendLogEnv = std::getenv(
+                    "FASTLLM_BACKEND_LOG");
+                const char *proxyLogEnv = std::getenv(
+                    "PROXY_LOG_FILE");
+                const std::string proxyLogFile =
+                    proxyLogEnv == nullptr ? std::string() :
+                        std::string(proxyLogEnv);
+                json11::Json::array profileList;
+                for (const auto &profile :
+                     fastllm::apiserver::AdminWebUiListProfiles(
+                         proxyLogFile)) {
+                    profileList.push_back(json11::Json::object {
+                        {"name", profile.name},
+                        {"mtime", (double)profile.mtime},
+                        {"active", profile.active},
+                    });
+                }
+                const double hitRatio = prefixStats.queryTokens > 0
+                    ? 100.0 * (double)prefixStats.hitTokens /
+                          (double)prefixStats.queryTokens : 0.0;
+                const double poolPct = totalPages > 0
+                    ? 100.0 * (double)usedPages / (double)totalPages : 0.0;
+                const double vramPct = vram.totalBytes > 0
+                    ? 100.0 * (double)vram.usedBytes /
+                          (double)vram.totalBytes : 0.0;
+                writeJsonAndClose(200, json11::Json::object {
+                    {"model", ::config.modelName},
+                    {"ready", !suspendedNow},
+                    {"state", suspendedNow ? "suspended" : "ready"},
+                    {"active_requests", activeRequests},
+                    {"queued_requests", queuedRequests},
+                    {"token_pool", ::config.tokens},
+                    {"max_batch", ::config.batch},
+                    {"kv_dtype", ::config.kvCacheDtype ==
+                            fastllm::DataType::DATA_AUTO_NONE
+                        ? "auto"
+                        : fastllm::GetDataTypeName(::config.kvCacheDtype)},
+                    {"atype", fastllm::GetDataTypeName(::config.atype)},
+                    {"pool", json11::Json::object {
+                        {"used", (double)usedPages},
+                        {"total", (double)totalPages},
+                        {"budget", (double)logicalMaxPages},
+                        {"pct", poolPct},
+                    }},
+                    {"pool_trie", json11::Json::object {
+                        {"pages", (double)triePages},
+                        {"tokens", (double)(triePages *
+                            (uint64_t)std::max(0, pageLen))},
+                    }},
+                    {"vram", json11::Json::object {
+                        {"used_gb", (double)vram.usedBytes / 1073741824.0},
+                        {"total_gb", (double)vram.totalBytes / 1073741824.0},
+                        {"pct", vramPct},
+                        {"pool_mb", (double)vram.pagedPoolBytes / 1048576.0},
+                        {"busy_mb", (double)vram.allocBusyBytes / 1048576.0},
+                        {"free_mb", (double)vram.allocFreeBytes / 1048576.0},
+                        {"pin_mb", (double)vram.graphPinnedBytes / 1048576.0},
+                        {"other_mb", (double)(otherBytes / 1048576)},
+                    }},
+                    {"prefix_cache", json11::Json::object {
+                        {"requests", (double)prefixStats.requests},
+                        {"hit_requests", (double)prefixStats.hitRequests},
+                        {"hit_ratio", hitRatio},
+                        {"hit_tokens_gpu", (double)prefixStats.hitTokensMemTrie},
+                        {"hit_tokens_cpu", (double)prefixStats.hitTokensCpuTier},
+                        {"hit_tokens_disk", (double)prefixStats.hitTokensDisk},
+                        {"mem_resident", (double)prefixStats.memTrieResidentBytes},
+                        {"cpu_tier_bytes", (double)prefixStats.cpuTierResidentBytes},
+                        {"disk_bytes", (double)prefixStats.diskResidentBytes},
+                        {"q_no_child", (double)prefixStats.queryBreakNoChild},
+                        {"q_gen", (double)prefixStats.queryBreakGeneration},
+                        {"q_materialize", (double)prefixStats.queryBreakMaterialize},
+                        {"evict_trie", (double)prefixStats.evictTrieNodes},
+                        {"evict_cpu_calls", (double)prefixStats.evictCpuTierCalls},
+                        {"demote_pages", (double)prefixStats.evictDemotePages},
+                        {"hard_drop", (double)prefixStats.evictHardDropNodes},
+                    }},
+                    {"disk_persist", json11::Json::object {
+                        {"enabled", persistentStatus.enabled},
+                        {"generation", (double)persistentStatus.loadedGeneration},
+                        {"checkpoints", (double)persistentStatus.checkpointCount},
+                        {"restore_hits", (double)persistentStatus.restoreHitCount},
+                        {"bytes", (double)persistentStatus.payloadBytes},
+                        {"last_error", persistentStatus.lastError},
+                    }},
+                    {"toolcall", json11::Json::object {
+                        {"steps", (double)toolCallStats.constraintSteps},
+                        {"forced", (double)toolCallStats.forcedSteps},
+                        {"override", (double)toolCallStats.maskOverrodeArgmax},
+                        {"loopbreak", (double)toolCallStats.valueLoopBreaks},
+                        {"mask_empty", (double)fastllm::GetToolCallMaskEmptiedCount()},
+                        {"malformed", (double)toolCallStats.malformedTotal},
+                        {"blocks", (double)toolCallStats.blocksTotal},
+                    }},
+                    {"logs", json11::Json::object {
+                        {"backend", backendLogEnv == nullptr
+                            ? std::string() : std::string(backendLogEnv)},
+                        {"proxy", proxyLogFile},
+                    }},
+                    {"profiles_dir", profilesDir},
+                    {"profiles", profileList},
+                    {"backend", "fastllm"},
+                });
+                return;
+            }
+
+            if (route == "/admin/api/logs") {
+                if (req->method != "GET") {
+                    writeMethodNotAllowed("GET");
+                    return;
+                }
+                if (authRequired()) {
+                    return;
+                }
+                const std::string which = queryParams.count("which")
+                    ? queryParams["which"] : std::string("backend");
+                std::string path;
+                if (which == "proxy") {
+                    const char *v = std::getenv("PROXY_LOG_FILE");
+                    if (v != nullptr) {
+                        path = v;
+                    }
+                } else {
+                    const char *v = std::getenv("FASTLLM_BACKEND_LOG");
+                    if (v != nullptr) {
+                        path = v;
+                    }
+                }
+                if (path.empty()) {
+                    writeJsonAndClose(
+                        404,
+                        OpenAIHttpError(
+                            "log path not configured for `" + which + "`",
+                            "invalid_request_error", "log_unavailable"));
+                    return;
+                }
+                int lines = 120;
+                if (queryParams.count("lines")) {
+                    try {
+                        lines = std::max(1, std::min(2000,
+                            std::stoi(queryParams["lines"])));
+                    } catch (...) {
+                        lines = 120;
+                    }
+                }
+                std::string text;
+                const bool ok =
+                    fastllm::apiserver::AdminWebUiReadLogTail(
+                        path, (size_t)lines, 4 * 1024 * 1024, text);
+                writeJsonAndClose(200, json11::Json::object {
+                    {"which", which},
+                    {"path", path},
+                    {"ok", ok},
+                    {"text", ok ? text : std::string(
+                        "(log file unavailable: " + path + ")")},
+                });
+                return;
+            }
+
+            if (route == "/admin/api/profiles") {
+                if (req->method != "GET") {
+                    writeMethodNotAllowed("GET");
+                    return;
+                }
+                if (authRequired()) {
+                    return;
+                }
+                const char *proxyLogEnv = std::getenv(
+                    "PROXY_LOG_FILE");
+                json11::Json::array profileList;
+                for (const auto &profile :
+                     fastllm::apiserver::AdminWebUiListProfiles(
+                         proxyLogEnv == nullptr ? std::string()
+                                                : std::string(proxyLogEnv))) {
+                    profileList.push_back(json11::Json::object {
+                        {"name", profile.name},
+                        {"path", profile.path},
+                        {"mtime", (double)profile.mtime},
+                        {"active", profile.active},
+                    });
+                }
+                writeJsonAndClose(200, json11::Json::object {
+                    {"profiles", profileList},
+                });
+                return;
+            }
+            if (route == "/admin/api/profile") {
+                if (authRequired()) {
+                    return;
+                }
+                // GET  ?name=x.env  -> 解析出全部键(布尔标记 boolean=true)
+                // POST {name, updates:[{key, value}]} -> 原子写回
+                if (req->method == "GET") {
+                    const std::string name = queryParams.count("name")
+                        ? queryParams["name"] : std::string();
+                    const std::string path = profilesDir.empty()
+                        ? std::string() : profilesDir + "/" + name;
+                    if (path.empty() || !profileNameValid(name)) {
+                        writeJsonAndClose(
+                            400,
+                            OpenAIHttpError(
+                                "missing or invalid profile name",
+                                "invalid_request_error", "invalid_profile"));
+                        return;
+                    }
+                    std::vector<fastllm::apiserver::AdminProfileKey> keys;
+                    std::string error;
+                    if (!fastllm::apiserver::AdminWebUiParseProfile(
+                            path, keys, error)) {
+                        writeJsonAndClose(
+                            404,
+                            OpenAIHttpError(
+                                error, "invalid_request_error",
+                                "profile_unreadable"));
+                        return;
+                    }
+                    json11::Json::array keyList;
+                    for (const auto &key : keys) {
+                        keyList.push_back(json11::Json::object {
+                            {"key", key.key},
+                            {"value", key.value},
+                            {"boolean", key.boolean},
+                            {"comment", key.comment},
+                        });
+                    }
+                    writeJsonAndClose(200, json11::Json::object {
+                        {"name", name},
+                        {"keys", keyList},
+                    });
+                    return;
+                }
+                if (req->method == "POST") {
+                    const std::string name =
+                        node->config["name"].string_value();
+                    if (!profileNameValid(name)) {
+                        writeJsonAndClose(
+                            400,
+                            OpenAIHttpError(
+                                "invalid profile name",
+                                "invalid_request_error",
+                                "invalid_profile"));
+                        return;
+                    }
+                    const std::string path =
+                        profilesDir.empty() ? std::string()
+                                            : profilesDir + "/" + name;
+                    if (path.empty()) {
+                        writeJsonAndClose(
+                            500,
+                            OpenAIHttpError(
+                                "PROJECT_DIR is not set; cannot locate "
+                                "profile directory",
+                                "server_error", "missing_project_dir"));
+                        return;
+                    }
+                    std::vector<std::pair<std::string, std::string>> updates;
+                    for (const auto &item :
+                         node->config["updates"].array_items()) {
+                        const std::string key = item["key"].string_value();
+                        const std::string value = item["value"].string_value();
+                        if (key.empty()) {
+                            writeJsonAndClose(
+                                400,
+                                OpenAIHttpError(
+                                    "update entry missing key",
+                                    "invalid_request_error",
+                                    "invalid_update"));
+                            return;
+                        }
+                        updates.push_back({key, value});
+                    }
+                    std::string error;
+                    if (!fastllm::apiserver::AdminWebUiWriteProfileKeys(
+                            path, updates, error)) {
+                        writeJsonAndClose(
+                            500,
+                            OpenAIHttpError(
+                                error, "server_error", "profile_write_failed"));
+                        return;
+                    }
+                    writeJsonAndClose(200, json11::Json::object {
+                        {"status", "saved"},
+                        {"name", name},
+                        {"note", "changes apply on next restart "
+                                 "(switch profile to reload)"},
+                    });
+                    return;
+                }
+                writeMethodNotAllowed("GET, POST");
+                return;
+            }
+
+
+            if (route == "/admin/api/switch" ||
+                route == "/admin/api/stop") {
+                if (req->method != "POST") {
+                    writeMethodNotAllowed("POST");
+                    return;
+                }
+                if (authRequired()) {
+                    return;
+                }
+                // 校验 profile 名: 只允许 [A-Za-z0-9._-]+\.env,
+                // 杜绝命令注入(名字会被拼进 shell 命令)。
+                const std::string profileName =
+                    node->config["profile"].string_value();
+                std::string command;
+                if (route == "/admin/api/switch") {
+                    if (!profileNameValid(profileName)) {
+                        writeJsonAndClose(
+                            400,
+                            OpenAIHttpError(
+                                "invalid profile name",
+                                "invalid_request_error",
+                                "invalid_profile"));
+                        return;
+                    }
+                    const char *projectDir = std::getenv("PROJECT_DIR");
+                    if (projectDir == nullptr || projectDir[0] == 0) {
+                        writeJsonAndClose(
+                            500,
+                            OpenAIHttpError(
+                                "PROJECT_DIR is not set; cannot locate "
+                                "start_prod.sh",
+                                "server_error", "missing_project_dir"));
+                        return;
+                    }
+                    // sleep 2: 让本次 HTTP 响应先写回客户端, 再被
+                    // start_prod.sh 杀死。脚本自己杀旧 proxy/后端并重启。
+                    const std::string profilesPath =
+                        profilesDir + "/" + profileName;
+                    command =
+                        "sleep 2; exec '" + std::string(projectDir) +
+                        "/handoff/start_prod.sh' '" + profilesPath + "'";
+                    if (!fastllm::apiserver::AdminWebUiSpawnDetached(
+                            command)) {
+                        writeJsonAndClose(
+                            500,
+                            OpenAIHttpError(
+                                "failed to spawn switch script",
+                                "server_error", "spawn_failed"));
+                        return;
+                    }
+                    writeJsonAndClose(200, json11::Json::object {
+                        {"status", "switching"},
+                        {"profile", profileName},
+                        {"note", "proxy and backend will restart; "
+                                 "reconnect when the new instance is ready"},
+                    });
+                } else {
+                    // stop: 杀 proxy(它会带走自己 owned 的后端) + 补杀孤儿后端。
+                    command =
+                        "sleep 2; pkill -f 'thinking_proxy\\.py'; "
+                        "sleep 3; pkill -f 'build-rw/apiserver'";
+                    if (!fastllm::apiserver::AdminWebUiSpawnDetached(
+                            command)) {
+                        writeJsonAndClose(
+                            500,
+                            OpenAIHttpError(
+                                "failed to spawn stop script",
+                                "server_error", "spawn_failed"));
+                        return;
+                    }
+                    writeJsonAndClose(200, json11::Json::object {
+                        {"status", "stopping"},
+                        {"note", "service will be down shortly; start it "
+                                 "again from the server (start_prod.sh)"},
+                    });
+                }
+                return;
+            }
+
+            writeJsonAndClose(
+                404,
+                OpenAIHttpError("Route " + route + " was not found.",
+                                "invalid_request_error", "not_found"));
+            return;
+        }
+
 
         const bool generateRoute = route == "/generate";
         const bool chatRoute = route == "/v1/chat/completions";

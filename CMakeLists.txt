@@ -800,7 +800,8 @@ target_link_libraries(benchmark fastllm)
 add_executable(apiserver
     example/apiserver/apiserver.cpp
     example/apiserver/image_loader.cpp
-    example/apiserver/video_loader.cpp)
+    example/apiserver/video_loader.cpp
+    example/apiserver/admin_webui.cpp)
 target_compile_definitions(apiserver PRIVATE
     ${FASTLLM_APISERVER_IMAGE_DEFINITIONS})
 target_link_libraries(apiserver fastllm ${FASTLLM_APISERVER_IMAGE_LIBS})
