@@ -4410,19 +4410,78 @@ namespace fastllm {
                 Write((uint32_t)tensor.dataType);
                 WriteIntVector(tensor.dims);
                 Write((uint8_t)(tensor.isLinearAttentionTransposed ? 1 : 0));
-                const uint64_t tensorBytes = tensor.GetBytes();
+                // 【上游BUMP勿回退】必须写"紧凑化"后的字节。
+                //
+                // 原来是什么: 直接按 GetBytes() 写整段内存。为什么错: MTP cache
+                // 的 mtpKey/mtpValue 在 CUDA 侧按非紧凑 stride 分配(实测
+                // [4,32896,256] fp16, 行尾带 1 元素 padding), GetBytes() 含
+                // padding; 读侧 ReadTensor 用 prod(dims)*unitSize 校验字节数,
+                // 永远对不上 -> checkpoint 成功、restore 永远报 "persistent
+                // Qwen3.5 prefix snapshot is incompatible"。
+                // 正确做法: strides 为紧凑布局时零拷贝直写; 否则先把 GetBytes()
+                // 原始镜像 append 进缓冲, 再按 N 维索引从镜像 gather, 原地覆盖
+                // 成紧凑数据。dims <= 4, 循环深度有界。
+                const uint64_t unitBytes = tensor.unitSize /
+                    (size_t)std::max(1, tensor.unitSizeDiv);
+                uint64_t compactElements = 1;
+                bool dense = !tensor.strides.empty() &&
+                             tensor.strides.size() == tensor.dims.size();
+                if (dense) {
+                    for (int i = (int)tensor.dims.size() - 1; i >= 0; i--) {
+                        compactElements *= (uint64_t)tensor.dims[i];
+                        if ((uint64_t)tensor.strides[i] != compactElements) {
+                            dense = false;
+                            break;
+                        }
+                    }
+                }
+                const uint64_t tensorBytes = dense ?
+                    tensor.GetBytes() :
+                    unitBytes * compactElements;
                 Write(tensorBytes);
                 if (tensorBytes == 0) {
                     return true;
                 }
                 if (tensor.dataDevice != DataDevice::CPU ||
-                    tensor.cpuData == nullptr) {
-                    return false;
+                    tensor.cpuData == nullptr ||
+                    tensor.dims.empty() || tensor.strides.empty()) {
+                    // 无数据可写或布局未知: 只能原样写 GetBytes() 段。
+                    bytes.insert(
+                        bytes.end(),
+                        tensor.cpuData,
+                        tensor.cpuData + tensor.GetBytes());
+                    return true;
                 }
+                const size_t mirrorBegin = bytes.size();
                 bytes.insert(
                     bytes.end(),
                     tensor.cpuData,
-                    tensor.cpuData + tensorBytes);
+                    tensor.cpuData + tensor.GetBytes());
+                std::vector<size_t> index(tensor.dims.size(), 0);
+                const int rank = (int)tensor.dims.size();
+                size_t flat = 0;
+                while (flat < compactElements) {
+                    size_t srcElem = 0;
+                    for (int d = 0; d < rank; d++) {
+                        srcElem += (size_t)index[d] * tensor.strides[d];
+                    }
+                    std::memcpy(
+                        &bytes[mirrorBegin + flat * unitBytes],
+                        tensor.cpuData + srcElem * unitBytes,
+                        unitBytes);
+                    flat++;
+                    int d = rank - 1;
+                    for (; d >= 0; d--) {
+                        if (++index[d] < (size_t)tensor.dims[d]) {
+                            break;
+                        }
+                        index[d] = 0;
+                    }
+                    if (d < 0) {
+                        break;
+                    }
+                }
+                bytes.resize(mirrorBegin + tensorBytes);
                 return true;
             }
 
